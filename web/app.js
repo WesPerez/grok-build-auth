@@ -39,7 +39,8 @@ function renderBatches() {
   $("batches").innerHTML = state.batches.map(batch => {
     const [label, cls] = statusInfo(batch.status);
     const requested = batch.requested_attempts || batch.attempts.length;
-    return `<article class="batch"><div class="batch-head"><div><h3>${esc(batch.batch_id)}</h3><div class="batch-meta"><span>注册成功 ${batch.registered_count || 0}/${requested}</span><span>失败 ${batch.failed_count || 0}</span><span>导入 ${batch.imported_ids?.length || 0}</span><span>${batch.has_backup ? "已有备份" : "尚无备份"}</span></div></div><div><span class="badge ${cls}">${label}</span>${batch.resumable ? ` <button class="resume" data-batch="${esc(batch.batch_id)}">继续导入</button>` : ""}</div></div>${batch.error_summary ? `<p class="bad">${esc(batch.error_summary)}</p>` : ""}<div class="attempts">${batch.attempts.map(attemptRow).join("")}</div></article>`;
+    const probes = batch.preimport_auth_probes;
+    return `<article class="batch"><div class="batch-head"><div><h3>${esc(batch.batch_id)}</h3><div class="batch-meta"><span>注册成功 ${batch.registered_count || 0}/${requested}</span><span>失败 ${batch.failed_count || 0}</span><span>导入 ${batch.imported_ids?.length || 0}</span><span>${probes ? `上游预检 ${probes.http_200_completed}/${probes.tested}` : "上游未预检"}</span><span>${batch.has_backup ? "已有备份" : "尚无备份"}</span></div></div><div><span class="badge ${cls}">${label}</span>${batch.resumable ? ` <button class="resume" data-batch="${esc(batch.batch_id)}">继续导入</button>` : ""}</div></div>${batch.error_summary ? `<p class="bad">${esc(batch.error_summary)}</p>` : ""}<div class="attempts">${batch.attempts.map(attemptRow).join("")}</div></article>`;
   }).join("") || "<p>还没有批次记录。</p>";
   document.querySelectorAll(".resume").forEach(button => button.addEventListener("click", () => resumeBatch(button.dataset.batch)));
 }
