@@ -364,6 +364,12 @@ class XConsoleAuthClient:
             except Exception:
                 return (None, False)
 
+        if not ordered:
+            raise RuntimeError(
+                "Failed to extract next-action / next-router-state-tree from the live sign-up page.  "
+                "The x.ai deployment may have changed its page structure.  "
+                "Details: no JS chunks found on the sign-up page."
+            )
         with ThreadPoolExecutor(max_workers=min(8, len(ordered))) as ex:
             futures = {ex.submit(_fetch_and_search, url): url for url in ordered}
             for f in as_completed(futures):

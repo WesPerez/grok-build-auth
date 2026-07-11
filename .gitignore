@@ -11,6 +11,11 @@ venv/
 
 # Secrets & local env
 .env
+/private/
+/var/
+sub2api-bundle*.json
+*.dump
+*.backup
 .env.*
 !.env.example
 

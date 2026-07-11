@@ -77,7 +77,7 @@ SSO **不能**单独变成 CPA auth 文件；必须完成 OAuth 拿到 `access_t
 
 这不是「零配置即用」的产品。至少需要：
 
-- Python 3.9+
+- Python 3.10+（服务器批量流程使用 Python 3.12 验证）
 - YesCaptcha（或兼容 createTask 协议）的 API key，用于 Turnstile
 - 临时邮箱：Tempmail.lol API key，**或**你自建的 Cloudflare D1 别名邮箱
 - （可选）HTTP(S) 代理
@@ -101,7 +101,7 @@ python -m venv .venv
 # macOS / Linux
 # source .venv/bin/activate
 
-pip install -r requirements.txt
+pip install -r requirements-lock.txt
 cp .env.example .env
 # 编辑 .env：只填你自己的密钥，切勿提交 .env
 ```
@@ -116,10 +116,13 @@ cp .env.example .env
 | `CLOUDFLARE_ACCOUNT_ID` | 同上 | CF 账户 |
 | `CLOUDFLARE_D1_DB_ID` | 同上 | D1 库 ID |
 | `ALIAS_MAIL_DOMAINS` | 同上 | 你控制的邮箱域名（逗号分隔） |
+| `IMAP_SERVER` / `IMAP_USERNAME` / `IMAP_PASSWORD` / `IMAP_EMAIL` | `-e imap` 时 | 自建 IMAP 邮箱 |
 | `CLIPROXYAPI_AUTH_DIR` | 否 | 默认 `./cliproxyapi_auth` |
 | `HTTPS_PROXY` / `HTTP_PROXY` | 否 | 代理 |
 
-**永远不要**把 `.env`、token 目录提交进 Git。详见 [`SECURITY.md`](SECURITY.md)。
+**永远不要**把 `.env`、`private/` 或 token 目录提交进 Git。服务器批量部署见
+[`SERVER_DEPLOYMENT.zh-CN.md`](SERVER_DEPLOYMENT.zh-CN.md)，私有目录初始化见
+[`private.example/README.md`](private.example/README.md)。
 
 ### 运行（研究 / 自有账号场景）
 
@@ -127,11 +130,11 @@ cp .env.example .env
 # 单次完整链路：注册 + SSO + OAuth + 导出
 python run.py -n 1
 
-# 并发注册（OAuth 仍串行）
-python run.py -n 5 -t 3
-
 # 自建 Cloudflare 邮箱后端
 python run.py -n 1 -e cloudflare
+
+# 自建 IMAP 邮箱后端
+python run.py -n 1 -e imap
 
 # 仅注册 + SSO（不导出 CPA auth）
 python run.py -n 1 --no-oauth
@@ -139,8 +142,8 @@ python run.py -n 1 --no-oauth
 # 指定 CLIProxyAPI auth 目录
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
 
-# 协议 OAuth 调试日志
-python run.py -n 1 --oauth-debug
+# 将机器结果写入 0600 JSON，失败返回非零退出码
+python run.py -n 1 --result-json /secure/path/result.json
 ```
 
 ### 辅助脚本
@@ -206,6 +209,9 @@ python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
 ├── README.md / README.en.md
 ├── SECURITY.md
 ├── run.py                         # 主入口
+├── register_and_import.sh         # 服务器批量包装器
+├── scripts/register_and_import.py # 单批一次备份/导入的编排器
+├── private.example/               # 私有配置空模板
 ├── xai_oauth_login.py
 ├── xai_oauth_export_cliproxyapi.py
 ├── xai_build_quota_probe.py
@@ -220,7 +226,7 @@ python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
 ```
 
 
-运行产物（已 gitignore）：`sso_output/`、`oauth_output/`、`accounts_output/`、`cliproxyapi_auth/`。
+服务器运行产物集中保存在已忽略的 `private/`；旧输出目录仍保持 gitignore。
 
 ---
 
@@ -228,7 +234,7 @@ python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
 
 - 依赖第三方公开接口，**随时可能因部署变更而失效**
 - Turnstile / 邮箱服务稳定性影响成功率与耗时
-- 并发过高可能触发平台风控；研究用途请保持克制
+- 服务器版 `run.py` 固定为单账号单线程；批量由外层脚本顺序编排
 - SSO alone ≠ CPA auth；必须完成 OAuth
 - Playwright 回退为可选依赖，默认协议路径不需要
 

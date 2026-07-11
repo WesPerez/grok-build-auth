@@ -12,6 +12,7 @@
     YESCAPTCHA_API_KEY     YesCaptcha API key (Turnstile 打码)
     TEMPMAIL_API_KEY       Tempmail.lol API key (邮箱后端)
     CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
+    IMAP_SERVER / IMAP_USERNAME / IMAP_PASSWORD / IMAP_EMAIL  自建 IMAP 邮箱后端
     CLIPROXYAPI_AUTH_DIR   CLIProxyAPI data/auth 目录（可选）
     HTTPS_PROXY / HTTP_PROXY  代理（OAuth 换 token / Playwright 可选）
 """
@@ -53,6 +54,12 @@ from xconsole_client.security import mask_email, redact_text, set_restrictive_um
 # -- secrets from environment only ---------------------------------------
 YESCAPTCHA_KEY = os.environ.get("YESCAPTCHA_API_KEY", "")
 TEMPMAIL_KEY = os.environ.get("TEMPMAIL_API_KEY", "")
+IMAP_SERVER = os.environ.get("IMAP_SERVER", "")
+IMAP_USERNAME = os.environ.get("IMAP_USERNAME", "")
+IMAP_PASSWORD = os.environ.get("IMAP_PASSWORD", "")
+IMAP_EMAIL = os.environ.get("IMAP_EMAIL", "")
+IMAP_PORT = os.environ.get("IMAP_PORT", "")
+IMAP_SSL = os.environ.get("IMAP_SSL", "")  # "true" for IMAPS (port 993)
 SIGNUP_URL = "https://accounts.x.ai/sign-up?redirect=grok-com"
 PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or ""
 
@@ -63,6 +70,18 @@ _results: list[dict] = []
 _done = 0
 _total = 0
 _t0 = 0.0
+
+
+def _write_result_json(path: str | Path, payload: dict) -> None:
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temp = target.with_name(f".{target.name}.{secrets.token_hex(6)}.tmp")
+    try:
+        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.chmod(0o600)
+        os.replace(temp, target)
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def _log(i: int, msg: str):
@@ -88,6 +107,25 @@ def _make_email_provider(backend: str):
             address = alloc.create(prefix="xai")
         receiver = AliasMailCodeReceiver(cf, address=address, timeout=120, interval=3, since_now=True)
         return address, receiver
+    elif backend == "imap":
+        if not all([IMAP_SERVER, IMAP_USERNAME, IMAP_PASSWORD, IMAP_EMAIL]):
+            raise RuntimeError(
+                "IMAP 邮箱后端需要设置 IMAP_SERVER, IMAP_USERNAME, IMAP_PASSWORD, IMAP_EMAIL 环境变量"
+            )
+        from xconsole_client.imap_backend import ImapInbox
+        use_ssl = IMAP_SSL.strip().lower() in ("1", "true", "yes", "on")
+        port = int(IMAP_PORT) if IMAP_PORT else None
+        inbox = ImapInbox(
+            server=IMAP_SERVER,
+            username=IMAP_USERNAME,
+            password=IMAP_PASSWORD,
+            email=IMAP_EMAIL,
+            use_ssl=use_ssl,
+            port=port,
+            debug=False,
+        )
+        email = inbox.create()
+        return email, inbox
     else:
         raise ValueError(f"unknown email backend: {backend}")
 
@@ -119,6 +157,8 @@ def register_one(
     email = ""
     password = ""
     sso = None
+    receiver = None
+    account_created = False
 
     try:
         # 1. warm-up + scrape
@@ -157,27 +197,27 @@ def register_one(
                 "email": email,
                 "sso_ok": False,
                 "cliproxyapi_auth": None,
+                "password": password,
+                "account_created": False,
                 "error": f"HTTP {res.http_status}",
             }
+        account_created = True
         _log(index, "account created")
 
         # 5. SSO (retries + RSC chain + grok.com fallback inside client)
         sso = c.fetch_sso_token(email=email, password=password, save=False, retries=3)
         if not sso:
-            _log(index, "FAIL SSO extraction")
-            return {
-                "email": email,
-                "sso_ok": False,
-                "cliproxyapi_auth": None,
-                "error": "SSO failed",
-            }
-        _log(index, "SSO acquired in memory")
+            _log(index, "SSO extraction failed (x.ai may have changed); OAuth will use password login")
+        else:
+            _log(index, "SSO acquired in memory")
 
         result = {
             "email": email,
-            "sso_ok": True,
+            "sso_ok": bool(sso),
             "cliproxyapi_auth": None,
             "build_base_url": cliproxyapi_base_url,
+            "password": password,
+            "account_created": True,
             "error": None,
         }
 
@@ -205,11 +245,15 @@ def register_one(
                     auth_client=c,
                 )
             result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
+            if not result["cliproxyapi_auth"] or not Path(result["cliproxyapi_auth"]).is_file():
+                raise RuntimeError("OAuth completed without a CLIProxyAPI auth file")
             _log(
                 index,
                 "Build OAuth OK; CLIProxyAPI auth written",
             )
         else:
+            if not sso:
+                raise RuntimeError("SSO extraction failed")
             _log(index, "OAuth skipped (--no-oauth)")
 
         return result
@@ -220,16 +264,23 @@ def register_one(
             "email": email,
             "sso_ok": bool(sso),
             "cliproxyapi_auth": None,
-            "error": str(e),
+            "password": password,
+            "account_created": account_created,
+            "error": redact_text(e),
         }
     finally:
         c.close()
+        if receiver is not None:
+            try:
+                receiver.close() if hasattr(receiver, "close") else None
+            except Exception:
+                pass
         with _results_lock:
             global _done
             _done += 1
 
 
-def main():
+def main() -> int:
     set_restrictive_umask()
     global _total, _t0
     default_auth = str(default_cliproxyapi_auth_dir())
@@ -240,9 +291,14 @@ def main():
     p.add_argument("-t", "--threads", type=int, choices=[1], default=1, help="并发线程数（服务器版仅允许 1）")
     p.add_argument(
         "-e", "--email",
-        choices=["tempmail", "cloudflare"],
+        choices=["tempmail", "cloudflare", "imap"],
         default="tempmail",
-        help="邮箱后端: tempmail | cloudflare",
+        help="邮箱后端: tempmail | cloudflare | imap",
+    )
+    p.add_argument(
+        "--result-json",
+        default="",
+        help="将机器可读结果原子写入指定 JSON（包含账号密码，文件权限 0600）",
     )
     p.add_argument(
         "--no-oauth",
@@ -342,6 +398,17 @@ def main():
         else:
             print(f"  {email:40s}  FAIL: {r.get('error', '?')}")
 
+    payload = {
+        "ok": not fail,
+        "account_count": args.count,
+        "success_count": len(ok_build),
+        "failure_count": len(fail),
+        "results": _results,
+    }
+    if args.result_json:
+        _write_result_json(args.result_json, payload)
+    return 1 if fail else 0
+
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
