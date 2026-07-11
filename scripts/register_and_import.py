@@ -18,7 +18,9 @@ import secrets
 import sqlite3
 import subprocess
 import sys
+import time
 from typing import Any
+from urllib.parse import urlparse
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -59,21 +61,106 @@ def run(
     env: dict[str, str] | None = None,
     log: Path | None = None,
     input_text: str | None = None,
+    on_line: Any = None,
 ) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
-        command,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        input=input_text,
-        check=False,
-    )
+    if on_line is None:
+        proc = subprocess.run(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            input=input_text,
+            check=False,
+        )
+    else:
+        child = subprocess.Popen(
+            command,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.PIPE if input_text is not None else None,
+            bufsize=1,
+        )
+        if input_text is not None and child.stdin is not None:
+            child.stdin.write(input_text)
+            child.stdin.close()
+        output: list[str] = []
+        assert child.stdout is not None
+        for line in child.stdout:
+            output.append(line)
+            on_line(line.rstrip("\n"))
+        child.wait()
+        proc = subprocess.CompletedProcess(command, child.returncode, "".join(output), None)
     if log is not None:
         log.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         log.write_text(proc.stdout, encoding="utf-8")
         log.chmod(0o600)
     return proc
+
+
+def helper_env(config: dict[str, str]) -> dict[str, str]:
+    """Return a minimal environment for the loopback Sub2API helper."""
+    env = os.environ.copy()
+    parsed = urlparse(config["SUB2API_URL"])
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise BatchError("Sub2API URL must be loopback for this server workflow")
+    for key in (
+        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "all_proxy",
+    ):
+        env.pop(key, None)
+    env["NO_PROXY"] = "127.0.0.1,localhost,::1"
+    env["no_proxy"] = env["NO_PROXY"]
+    return env
+
+
+def latest_resumable_batch(private_dir: Path) -> Path:
+    runs = private_dir / "runs"
+    candidates: list[Path] = []
+    if runs.is_dir():
+        for path in runs.iterdir():
+            manifest_path = path / "manifest.json"
+            if not manifest_path.is_file():
+                continue
+            try:
+                status = json.loads(manifest_path.read_text(encoding="utf-8")).get("status")
+            except (OSError, json.JSONDecodeError):
+                continue
+            if status in {"import-failed", "import-verification-failed", "registered-not-imported"}:
+                candidates.append(path)
+    if not candidates:
+        raise BatchError("no resumable batch found")
+    return sorted(candidates, key=lambda item: item.name)[-1]
+
+
+def resolve_resume_batch(private_dir: Path, value: str) -> Path:
+    batch_dir = latest_resumable_batch(private_dir) if value == "latest" else private_dir / "runs" / value
+    batch_dir = batch_dir.resolve()
+    runs_root = (private_dir / "runs").resolve()
+    if batch_dir.parent != runs_root or not (batch_dir / "manifest.json").is_file():
+        raise BatchError(f"invalid batch to resume: {value}")
+    return batch_dir
+
+
+def load_resume_bundle(batch_dir: Path) -> tuple[dict[str, Any], Path, list[Path]]:
+    manifest_path = batch_dir / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("status") == "completed":
+        raise BatchError("batch is already completed")
+    bundle_path = Path(str(manifest.get("bundle") or "")).resolve()
+    expected = (batch_dir / "bundle" / "sub2api-bundle.json").resolve()
+    if bundle_path != expected or not bundle_path.is_file():
+        raise BatchError("resume bundle is missing or outside the batch directory")
+    digest = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+    if digest != manifest.get("bundle_sha256"):
+        raise BatchError("resume bundle hash does not match manifest")
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    auth_paths = [Path(str(item["auth_file"])).resolve() for item in manifest.get("attempts", []) if item.get("status") == "registered"]
+    if len(bundle.get("accounts", [])) != len(auth_paths) or not auth_paths:
+        raise BatchError("resume account count does not match registered attempts")
+    return manifest, bundle_path, auth_paths
 
 
 def require_config(config: dict[str, str], keys: list[str]) -> None:
@@ -284,6 +371,7 @@ order by a.id;
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch register accounts and import one combined bundle into Sub2API")
     parser.add_argument("--count", type=int, default=1, help="registration attempts in this batch")
+    parser.add_argument("--resume", nargs="?", const="latest", help="resume a failed import without registering again")
     parser.add_argument("--private-dir", default=str(PROJECT_DIR / "private"))
     parser.add_argument("--failure-policy", choices=["abort", "continue"], default="continue")
     parser.add_argument("--max-consecutive-failures", type=int, default=3)
@@ -321,98 +409,123 @@ def main() -> int:
     if runtime_file.stat().st_mode & 0o077:
         raise BatchError(f"runtime config permissions must be 0600: {runtime_file}")
 
-    batch_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
-    batch_dir = private_dir / "runs" / batch_id
-    for name in ("auth", "results", "logs", "bundle", "import", "backup"):
-        (batch_dir / name).mkdir(parents=True, exist_ok=True, mode=0o700)
-
-    manifest: dict[str, Any] = {
-        "batch_id": batch_id,
-        "requested_attempts": args.count,
-        "production_import_confirmed": bool(args.confirm_production_write and not args.no_import),
-        "attempts": [],
-        "status": "running",
-    }
-    manifest_path = batch_dir / "manifest.json"
-    atomic_json(manifest_path, manifest)
-
-    auth_paths: list[Path] = []
-    failures = 0
-    consecutive_failures = 0
-    base_env = os.environ.copy()
-    base_env.update(config)
-
-    for index in range(1, args.count + 1):
-        prefix = "xai" + secrets.token_hex(3)
-        email = f"{prefix}@{config['MAILU_DOMAIN']}"
-        attempt_auth_dir = batch_dir / "auth" / prefix
-        attempt_auth_dir.mkdir(mode=0o700)
-        result_path = batch_dir / "results" / f"{prefix}.json"
-        log_path = batch_dir / "logs" / f"{prefix}.log"
-        attempt: dict[str, Any] = {"index": index, "email": email, "status": "starting"}
-        manifest["attempts"].append(attempt)
+    if args.resume:
+        batch_dir = resolve_resume_batch(private_dir, args.resume)
+        manifest, bundle_path, auth_paths = load_resume_bundle(batch_dir)
+        manifest_path = batch_dir / "manifest.json"
+        failures = int(manifest.get("failed_registrations") or 0)
+        manifest.update({"status": "resuming-import", "current_stage": "import-preflight"})
         atomic_json(manifest_path, manifest)
-        print(f"[{index}/{args.count}] creating mailbox {email}")
+        print(f"Resuming {manifest['batch_id']}: {len(auth_paths)} accounts already registered", flush=True)
+    else:
+        batch_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
+        batch_dir = private_dir / "runs" / batch_id
+        for name in ("auth", "results", "logs", "bundle", "import", "backup"):
+            (batch_dir / name).mkdir(parents=True, exist_ok=True, mode=0o700)
+        manifest = {
+            "batch_id": batch_id, "requested_attempts": args.count,
+            "production_import_confirmed": bool(args.confirm_production_write and not args.no_import),
+            "attempts": [], "status": "running", "current_stage": "registration",
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        }
+        manifest_path = batch_dir / "manifest.json"
+        atomic_json(manifest_path, manifest)
+        auth_paths: list[Path] = []
+        failures = 0
+        consecutive_failures = 0
+        registration_env = os.environ.copy()
+        registration_env.update(config)
 
-        mailbox_created = False
-        try:
-            create_mailbox(config, email)
-            mailbox_created = True
-            attempt["mailbox_created"] = True
-            env = base_env.copy()
-            env.update({
-                "IMAP_EMAIL": email,
-                "IMAP_USERNAME": email,
-                "CLIPROXYAPI_AUTH_DIR": str(attempt_auth_dir),
-            })
-            proc = run([
-                sys.executable, str(PROJECT_DIR / "run.py"), "-e", "imap",
-                "--cliproxyapi-auth-dir", str(attempt_auth_dir),
-                "--result-json", str(result_path),
-            ], env=env, log=log_path)
-            if proc.returncode != 0:
-                raise BatchError(f"run.py failed with exit {proc.returncode}")
-            result = load_single_result(result_path, email, attempt_auth_dir)
-            auth_path = Path(result["cliproxyapi_auth"])
-            auth_paths.append(auth_path)
-            attempt.update({"status": "registered", "auth_file": str(auth_path), "result_file": str(result_path)})
-            consecutive_failures = 0
-            print(f"[{index}/{args.count}] registration succeeded")
-        except Exception as exc:
-            failures += 1
-            consecutive_failures += 1
-            attempt.update({"status": "failed", "error": str(exc)})
-            print(f"[{index}/{args.count}] FAILED: {exc}", file=sys.stderr)
-            if args.cleanup_failed_mailboxes and mailbox_created:
-                try:
-                    created_upstream = upstream_account_created(result_path)
-                    if created_upstream is False:
-                        delete_mailbox_exact(config, email)
-                        attempt["mailbox_rollback"] = "deleted"
-                    elif created_upstream is True:
-                        attempt["mailbox_rollback"] = "preserved-upstream-account-created"
-                    else:
-                        attempt["mailbox_rollback"] = "preserved-upstream-state-unknown"
-                except Exception as cleanup_exc:
-                    attempt["mailbox_rollback"] = f"failed: {cleanup_exc}"
-            if args.failure_policy == "abort" or consecutive_failures >= args.max_consecutive_failures:
-                atomic_json(manifest_path, manifest)
-                break
-        finally:
+        for index in range(1, args.count + 1):
+            prefix = "xai" + secrets.token_hex(3)
+            email = f"{prefix}@{config['MAILU_DOMAIN']}"
+            attempt_auth_dir = batch_dir / "auth" / prefix
+            attempt_auth_dir.mkdir(mode=0o700)
+            result_path = batch_dir / "results" / f"{prefix}.json"
+            log_path = batch_dir / "logs" / f"{prefix}.log"
+            attempt: dict[str, Any] = {
+                "index": index, "email": email, "status": "running", "stage": "mailbox",
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            }
+            manifest["attempts"].append(attempt)
             atomic_json(manifest_path, manifest)
+            print(f"[{index}/{args.count}] creating mailbox {email}", flush=True)
+            mailbox_created = False
+            started = time.monotonic()
+            try:
+                create_mailbox(config, email)
+                mailbox_created = True
+                attempt.update({"mailbox_created": True, "stage": "signup"})
+                atomic_json(manifest_path, manifest)
+                env = registration_env.copy()
+                env.update({"IMAP_EMAIL": email, "IMAP_USERNAME": email, "CLIPROXYAPI_AUTH_DIR": str(attempt_auth_dir)})
+                stage_map = {
+                    "cookie + scrape OK": "email-verification", "email verified": "turnstile",
+                    "Turnstile ": "account-creation", "account created": "sso",
+                    "SSO acquired": "oauth", "SSO extraction failed": "oauth",
+                    "OAuth Build path": "oauth", "Build OAuth OK": "completed",
+                }
 
-    manifest["successful_registrations"] = len(auth_paths)
-    manifest["failed_registrations"] = failures
-    if not auth_paths:
-        manifest["status"] = "failed-no-successes"
-        atomic_json(manifest_path, manifest)
-        return 1
+                def on_registration_line(line: str) -> None:
+                    for marker, stage in stage_map.items():
+                        if marker in line:
+                            attempt["stage"] = stage
+                            atomic_json(manifest_path, manifest)
+                            break
+                    if line.strip():
+                        print(f"  {line}", flush=True)
 
-    bundle_path = batch_dir / "bundle" / "sub2api-bundle.json"
-    bundle = build_bundle(auth_paths)
-    atomic_json(bundle_path, bundle)
-    manifest["bundle"] = str(bundle_path)
-    manifest["bundle_sha256"] = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+                proc = run([
+                    sys.executable, str(PROJECT_DIR / "run.py"), "-e", "imap",
+                    "--cliproxyapi-auth-dir", str(attempt_auth_dir), "--result-json", str(result_path),
+                ], env=env, log=log_path, on_line=on_registration_line)
+                if proc.returncode != 0:
+                    raise BatchError(f"registration process exited with code {proc.returncode}")
+                result = load_single_result(result_path, email, attempt_auth_dir)
+                auth_path = Path(result["cliproxyapi_auth"])
+                auth_paths.append(auth_path)
+                attempt.update({
+                    "status": "registered", "stage": "completed", "auth_file": str(auth_path),
+                    "result_file": str(result_path), "duration_seconds": round(time.monotonic() - started, 1),
+                })
+                consecutive_failures = 0
+                print(f"[{index}/{args.count}] succeeded | total {len(auth_paths)} success, {failures} failed", flush=True)
+            except Exception as exc:
+                failures += 1
+                consecutive_failures += 1
+                attempt.update({
+                    "status": "failed", "failed_stage": attempt.get("stage"), "error": str(exc),
+                    "duration_seconds": round(time.monotonic() - started, 1),
+                })
+                print(f"[{index}/{args.count}] FAILED at {attempt.get('failed_stage')}: {exc}", file=sys.stderr, flush=True)
+                if args.cleanup_failed_mailboxes and mailbox_created:
+                    try:
+                        created_upstream = upstream_account_created(result_path)
+                        if created_upstream is False:
+                            delete_mailbox_exact(config, email)
+                            attempt["mailbox_rollback"] = "deleted"
+                        elif created_upstream is True:
+                            attempt["mailbox_rollback"] = "preserved-upstream-account-created"
+                        else:
+                            attempt["mailbox_rollback"] = "preserved-upstream-state-unknown"
+                    except Exception as cleanup_exc:
+                        attempt["mailbox_rollback"] = f"failed: {cleanup_exc}"
+                if args.failure_policy == "abort" or consecutive_failures >= args.max_consecutive_failures:
+                    atomic_json(manifest_path, manifest)
+                    break
+            finally:
+                atomic_json(manifest_path, manifest)
+
+        manifest["successful_registrations"] = len(auth_paths)
+        manifest["failed_registrations"] = failures
+        if not auth_paths:
+            manifest["status"] = "failed-no-successes"
+            atomic_json(manifest_path, manifest)
+            return 1
+        bundle_path = batch_dir / "bundle" / "sub2api-bundle.json"
+        atomic_json(bundle_path, build_bundle(auth_paths))
+        manifest["bundle"] = str(bundle_path)
+        manifest["bundle_sha256"] = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
 
     if failures and not args.import_partial:
         manifest["status"] = "registration-failed-import-skipped"
@@ -438,13 +551,19 @@ def main() -> int:
         "--backup-dir", str(batch_dir / "backup"),
         "--group", config["SUB2API_GROUP"],
     ]
-    print(f"Importing {len(auth_paths)} accounts with one production backup")
-    proc = run(command, env=base_env, log=import_log_path)
+    manifest.update({"status": "importing", "current_stage": "sub2api-import"})
+    atomic_json(manifest_path, manifest)
+    print(f"Importing {len(auth_paths)} accounts into Sub2API", flush=True)
+    proc = run(command, env=helper_env(config), log=import_log_path)
     if proc.returncode != 0:
         manifest["status"] = "import-failed"
         manifest["import_exit_code"] = proc.returncode
+        manifest["error_summary"] = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "Sub2API helper failed"
         atomic_json(manifest_path, manifest)
-        raise BatchError(f"Sub2API helper failed with exit {proc.returncode}; inspect {import_log_path}")
+        raise BatchError(
+            f"Sub2API import failed: {manifest['error_summary']}. "
+            f"Resume this batch instead of registering again: --resume {manifest['batch_id']} --confirm-production-write"
+        )
     try:
         import_payload = json.loads(proc.stdout)
         validate_import_output(import_payload, len(auth_paths))
@@ -456,6 +575,8 @@ def main() -> int:
     atomic_json(import_result_path, import_payload)
     manifest.update({
         "status": "completed",
+        "current_stage": "completed",
+        "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "import_result": str(import_result_path),
         "imported_ids": import_payload.get("imported_ids", []),
         "backup": import_payload.get("backup", {}),

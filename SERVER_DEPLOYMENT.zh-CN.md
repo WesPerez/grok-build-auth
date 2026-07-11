@@ -127,6 +127,28 @@ python3 run.py -e imap \
 
 ## 6. 批量运行
 
+### 推荐：网页控制台
+
+日常运行不需要记命令参数。启动：
+
+```bash
+bash start_web_console.sh
+```
+
+在服务器桌面浏览器访问 `http://127.0.0.1:17860`。控制台只监听本机回环地址，
+提供以下功能：
+
+- 启动前自动检查私有配置、权限、Mailu、PostgreSQL、导入工具和 Sub2API 地址。
+- 只填写注册数量即可开始，生产写入前显示明确确认。
+- 显示每个账号当前处于邮箱、验证、Turnstile、账号创建、SSO、OAuth 或导入阶段。
+- 实时显示成功、失败、剩余、已导入数量及后台日志。
+- 保存并展示历史批次、失败步骤、异常摘要和备份状态。
+- 对 `import-failed` 批次提供“继续导入”，复用已有 auth 和 bundle，不重新注册。
+
+可选 systemd 服务模板位于 `deploy/grok-batch-console.service`。
+
+### 命令行备用入口
+
 生产导入一个账号：
 
 ```bash

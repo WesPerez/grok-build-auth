@@ -71,3 +71,35 @@ def test_explicit_false_upstream_state_can_be_identified(tmp_path):
     result = tmp_path / "result.json"
     result.write_text(json.dumps({"results": [{"account_created": False}]}), encoding="utf-8")
     assert MODULE.upstream_account_created(result) is False
+
+
+def test_helper_env_removes_proxy_for_loopback():
+    env = MODULE.helper_env({"SUB2API_URL": "http://127.0.0.1:13080"})
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        assert key not in env
+    assert "127.0.0.1" in env["NO_PROXY"]
+
+
+def test_helper_env_rejects_remote_sub2api():
+    with pytest.raises(MODULE.BatchError, match="loopback"):
+        MODULE.helper_env({"SUB2API_URL": "https://example.com"})
+
+
+def test_resume_bundle_requires_matching_hash_and_exact_path(tmp_path):
+    batch = tmp_path / "runs" / "batch-1"
+    auth_dir = batch / "auth" / "xaiabcdef"
+    bundle_dir = batch / "bundle"
+    auth_dir.mkdir(parents=True)
+    bundle_dir.mkdir()
+    auth = write_auth(auth_dir / "xaiabcdef@example.com.json")
+    bundle = bundle_dir / "sub2api-bundle.json"
+    MODULE.atomic_json(bundle, MODULE.build_bundle([auth]))
+    MODULE.atomic_json(batch / "manifest.json", {
+        "batch_id": "batch-1", "status": "import-failed", "bundle": str(bundle),
+        "bundle_sha256": MODULE.hashlib.sha256(bundle.read_bytes()).hexdigest(),
+        "attempts": [{"status": "registered", "auth_file": str(auth)}],
+    })
+    manifest, loaded_bundle, auth_paths = MODULE.load_resume_bundle(batch)
+    assert manifest["batch_id"] == "batch-1"
+    assert loaded_bundle == bundle.resolve()
+    assert auth_paths == [auth.resolve()]

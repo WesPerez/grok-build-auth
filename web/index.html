@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Grok 账号批处理</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Grok 账号批处理</h1>
+      <p id="systemLine">正在检查运行环境...</p>
+    </div>
+    <button class="icon-button" id="refreshButton" title="立即刷新" aria-label="立即刷新">↻</button>
+  </header>
+
+  <main>
+    <aside>
+      <section class="tool-panel">
+        <h2>新建批次</h2>
+        <label for="count">注册数量</label>
+        <div class="stepper">
+          <button type="button" id="minus" title="减少">−</button>
+          <input id="count" type="number" min="1" max="100" value="1">
+          <button type="button" id="plus" title="增加">＋</button>
+        </div>
+        <details>
+          <summary>高级策略</summary>
+          <label class="check"><input id="partial" type="checkbox"> 部分成功时也导入</label>
+          <label class="check"><input id="cleanup" type="checkbox"> 清理明确未创建上游账号的失败邮箱</label>
+        </details>
+        <button class="primary" id="startButton">开始注册并导入</button>
+        <p class="hint">整批只调用一次生产导入。失败后可直接续跑，不会重复注册。</p>
+      </section>
+
+      <section class="checks">
+        <div class="section-title"><h2>环境检查</h2><button id="doctorButton" class="text-button">重新检查</button></div>
+        <div id="checks"></div>
+      </section>
+    </aside>
+
+    <div class="workspace">
+      <section id="activeSection" class="active hidden">
+        <div class="section-title"><h2>正在执行</h2><span id="activeBadge" class="badge running">运行中</span></div>
+        <p id="activeTitle"></p>
+        <div class="progress"><span id="progressBar"></span></div>
+        <div id="activeMetrics" class="metrics"></div>
+        <pre id="liveLog"></pre>
+      </section>
+
+      <section>
+        <div class="section-title"><h2>批次记录</h2><span id="batchCount"></span></div>
+        <div id="batches" class="batch-list"></div>
+      </section>
+    </div>
+  </main>
+
+  <div id="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>

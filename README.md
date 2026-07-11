@@ -124,6 +124,15 @@ cp .env.example .env
 [`SERVER_DEPLOYMENT.zh-CN.md`](SERVER_DEPLOYMENT.zh-CN.md)，私有目录初始化见
 [`private.example/README.md`](private.example/README.md)。
 
+服务器日常操作推荐使用本机网页控制台：
+
+```bash
+bash start_web_console.sh
+```
+
+然后在服务器桌面浏览器打开 `http://127.0.0.1:17860`。页面提供环境检查、
+新建批次、实时进度、逐账号状态、日志、历史记录和失败导入续跑。
+
 ### 运行（研究 / 自有账号场景）
 
 ```bash
