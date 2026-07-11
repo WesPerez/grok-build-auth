@@ -13,7 +13,7 @@ function toast(message) {
 
 function statusInfo(status) {
   const map = {
-    completed: ["完成", "success"], "imported-not-probed": ["已导入 · 未探测", "success"], running: ["注册中", "running"], importing: ["导入中", "running"],
+    completed: ["完成", "success"], "imported-preprobed": ["已导入 · 上游预检通过", "success"], "imported-not-probed": ["已导入 · 未探测", "pending"], running: ["注册中", "running"], importing: ["导入中", "running"],
     "resuming-import": ["继续导入", "running"], "import-failed": ["导入失败", "failure"],
     "import-verification-failed": ["验证失败", "failure"], "registered-not-imported": ["待导入", "pending"],
     "registration-failed-import-skipped": ["部分失败", "failure"], "failed-no-successes": ["注册失败", "failure"],
@@ -57,7 +57,8 @@ function renderActive() {
   const latest = state.batches.find(batch => task.batch_id && batch.batch_id === task.batch_id) || state.batches.find(batch => ["running","importing","resuming-import"].includes(batch.status)) || state.batches[0] || {};
   const total = latest.requested_attempts || 0, success = latest.registered_count || 0, failed = latest.failed_count || 0;
   const done = success + failed;
-  $("progressBar").style.width = `${total ? Math.min(100, done / total * 85 + (latest.status === "completed" ? 15 : 0)) : 5}%`;
+  const importFinished = ["completed", "imported-preprobed", "imported-not-probed"].includes(latest.status);
+  $("progressBar").style.width = `${total ? Math.min(100, done / total * 85 + (importFinished ? 15 : 0)) : 5}%`;
   $("activeMetrics").innerHTML = [[success,"注册成功"],[failed,"注册失败"],[Math.max(0,total-done),"剩余"],[latest.imported_ids?.length || 0,"已导入"]].map(x => `<div class="metric"><strong>${x[0]}</strong><span>${x[1]}</span></div>`).join("");
 }
 

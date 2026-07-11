@@ -769,18 +769,24 @@ def main() -> int:
         raise BatchError(f"Sub2API Grok reconciliation failed: {exc}") from exc
     for key in ("error_summary", "import_exit_code"):
         manifest.pop(key, None)
+    preprobe = manifest.get("preimport_auth_probes") or {}
+    preprobe_ok = (
+        preprobe.get("tested") == len(auth_paths)
+        and preprobe.get("http_200_completed") == len(auth_paths)
+    )
     manifest.update({
-        "status": "imported-not-probed",
+        "status": "imported-preprobed" if preprobe_ok else "imported-not-probed",
         "current_stage": "completed",
         "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "import_result": str(import_result_path),
         "imported_ids": all_ids,
         "backup": import_payload.get("backup", {}),
         "exact_account_state": exact_state,
-        "upstream_usability_probes": "not-run",
+        "upstream_usability_probes": "preimport-passed; postimport-not-run" if preprobe_ok else "not-run",
     })
     atomic_json(manifest_path, manifest)
-    print(f"IMPORTED: {len(auth_paths)} accounts are ready in the Grok group; upstream probe not run")
+    probe_note = "pre-import upstream probes passed; post-import probe not repeated" if preprobe_ok else "upstream probe not run"
+    print(f"IMPORTED: {len(auth_paths)} accounts are ready in the Grok group; {probe_note}")
     return 0
 
 
