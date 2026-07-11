@@ -89,6 +89,19 @@ SSO **不能**单独变成 CPA auth 文件；必须完成 OAuth 拿到 `access_t
 
 ## 上手
 
+Web 控制台支持两种真实注册后端：
+
+- `protocol-yescaptcha`：协议注册 + YesCaptcha ProxylessM1，支持有界并发。
+- `browser-playwright-edge`：Playwright + 系统 Edge 完成整个注册页流程，固定 1 路并发。
+
+新 auth 在导入前会逐个请求 Grok CLI Responses，导入后再通过
+Sub2API Grok 分组做真实请求。探针失败的账号不会进入生产调度池。
+代理池配置参考 `private.example/proxies.example.json`。未配置节点池时，
+继续把 `runtime.env` 中现有 `HTTPS_PROXY/HTTP_PROXY` 作为单一 sticky 出口。
+运维与健康门禁见 [`PROXY_POOL_OPERATIONS.zh-CN.md`](PROXY_POOL_OPERATIONS.zh-CN.md)，
+外部项目与论坛调研依据见
+[`docs/research/GROK_RESEARCH_AND_IMPROVEMENTS.zh-CN.md`](docs/research/GROK_RESEARCH_AND_IMPROVEMENTS.zh-CN.md)。
+
 ### 安装
 
 ```bash

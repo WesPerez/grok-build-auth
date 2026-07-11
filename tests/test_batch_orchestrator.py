@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,12 @@ SPEC = importlib.util.spec_from_file_location("register_and_import", MODULE_PATH
 assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+
+WEB_MODULE_PATH = Path(__file__).resolve().parents[1] / "web_console.py"
+WEB_SPEC = importlib.util.spec_from_file_location("web_console_test", WEB_MODULE_PATH)
+assert WEB_SPEC and WEB_SPEC.loader
+WEB_MODULE = importlib.util.module_from_spec(WEB_SPEC)
+WEB_SPEC.loader.exec_module(WEB_MODULE)
 
 
 def write_auth(path: Path, email: str = "xaiabcdef@example.com") -> Path:
@@ -88,6 +95,29 @@ def test_helper_env_rejects_remote_sub2api():
         MODULE.helper_env({"SUB2API_URL": "https://example.com"})
 
 
+def test_batch_lock_rejects_second_process_lock(tmp_path):
+    first = MODULE.acquire_batch_lock(tmp_path / "batch.lock")
+    try:
+        with pytest.raises(MODULE.BatchError, match="already running"):
+            MODULE.acquire_batch_lock(tmp_path / "batch.lock")
+    finally:
+        first.close()
+
+
+def test_proxy_ids_are_validated_before_registration(monkeypatch):
+    pool = SimpleNamespace(
+        configured=True,
+        specs=(SimpleNamespace(sub2api_proxy_id=12), SimpleNamespace(sub2api_proxy_id=13)),
+    )
+    monkeypatch.setattr(MODULE, "run", lambda command: SimpleNamespace(returncode=0, stdout="12\n"))
+    with pytest.raises(MODULE.BatchError, match="13"):
+        MODULE.validate_sub2api_proxy_ids({
+            "SUB2API_POSTGRES_CONTAINER": "postgres",
+            "SUB2API_PG_USER": "sub2api",
+            "SUB2API_PG_DB": "sub2api",
+        }, pool)
+
+
 def test_resume_bundle_requires_matching_hash_and_exact_path(tmp_path):
     batch = tmp_path / "runs" / "batch-1"
     auth_dir = batch / "auth" / "xaiabcdef"
@@ -131,7 +161,7 @@ def test_reconcile_updates_exact_ids_through_admin_api(monkeypatch):
     monkeypatch.setattr(MODULE, "make_admin_token", lambda config: "short-lived-token")
     monkeypatch.setattr(
         MODULE, "update_account_via_admin_api",
-        lambda config, token, account_id, group_id: updated.append((token, account_id, group_id)),
+        lambda config, token, account_id, group_id, proxy_id=None: updated.append((token, account_id, group_id, proxy_id)),
     )
     MODULE.reconcile_imported_accounts({
         "SUB2API_POSTGRES_CONTAINER": "postgres",
@@ -140,7 +170,7 @@ def test_reconcile_updates_exact_ids_through_admin_api(monkeypatch):
         "SUB2API_GROUP": "grok",
         "GROK_ACCOUNT_BASE_URL": "http://grok-cli-proxy:8080/v1",
     }, [17, 23])
-    assert updated == [("short-lived-token", 17, 5), ("short-lived-token", 23, 5)]
+    assert updated == [("short-lived-token", 17, 5, None), ("short-lived-token", 23, 5, None)]
 
 
 def test_build_bundle_rejects_duplicate_auth_tokens(tmp_path):
@@ -148,3 +178,148 @@ def test_build_bundle_rejects_duplicate_auth_tokens(tmp_path):
     second = write_auth(tmp_path / "two.json", "xai222222@example.com")
     with pytest.raises(MODULE.BatchError, match="duplicate"):
         MODULE.build_bundle([first, second], "http://grok-cli-proxy:8080/v1")
+
+
+def test_manifest_stage_records_activity_and_stage_start(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    attempt = {"stage": "mailbox"}
+    manifest = {"current_stage": "registration", "attempts": [attempt]}
+    MODULE.set_manifest_stage(manifest, manifest_path, "signup", attempt=attempt)
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert saved["attempts"][0]["stage"] == "signup"
+    assert saved["attempts"][0]["stage_started_at"]
+    assert saved["attempts"][0]["last_activity_at"]
+    assert saved["last_activity_at"]
+    assert saved["updated_at"]
+
+
+def test_run_emits_heartbeat_while_child_is_quiet():
+    beats = []
+    proc = MODULE.run(
+        [MODULE.sys.executable, "-c", "import time; time.sleep(0.08); print('done')"],
+        on_line=lambda line: None,
+        on_heartbeat=lambda: beats.append(True),
+        heartbeat_interval=0.02,
+    )
+    assert proc.returncode == 0
+    assert beats
+
+
+def test_doctor_cache_avoids_repeated_probes(monkeypatch):
+    calls = []
+    monkeypatch.setattr(WEB_MODULE, "_DOCTOR_CACHE", (0.0, []))
+    monkeypatch.setattr(WEB_MODULE, "doctor", lambda: calls.append(True) or [{"name": "ok", "ok": True}])
+    assert WEB_MODULE.cached_doctor() == [{"name": "ok", "ok": True}]
+    assert WEB_MODULE.cached_doctor() == [{"name": "ok", "ok": True}]
+    assert len(calls) == 1
+    WEB_MODULE.cached_doctor(force=True)
+    assert len(calls) == 2
+
+
+def test_state_marks_active_batch_interrupted_without_process(monkeypatch):
+    monkeypatch.setattr(WEB_MODULE.MANAGER, "current", lambda: None)
+    monkeypatch.setattr(WEB_MODULE, "list_batches", lambda: [{"batch_id": "batch-1", "status": "running"}])
+    monkeypatch.setattr(WEB_MODULE, "cached_doctor", lambda: [])
+    payload = WEB_MODULE.state_payload()
+    assert payload["batches"][0]["runtime_state"] == "interrupted"
+    assert payload["batches"][0]["action_hint"]
+
+
+def test_task_manager_refuses_second_task_after_web_restart(monkeypatch):
+    manager = WEB_MODULE.TaskManager()
+    manager.process = None
+    manager.task = {"running": True, "pid": 123, "process_started_ticks": "7"}
+    monkeypatch.setattr(manager, "_restored_process_alive", lambda: True)
+    with pytest.raises(RuntimeError, match="restored task"):
+        manager.start(["true"], "test", "test")
+
+
+def test_preimport_auth_probes_require_every_account_http_200(tmp_path, monkeypatch):
+    paths = [write_auth(tmp_path / "one.json"), write_auth(tmp_path / "two.json", "xai222222@example.com")]
+    responses = iter([{"status": 200}, {"status": 403}])
+    monkeypatch.setattr(MODULE, "probe_grok_auth", lambda path, timeout, proxy="": next(responses))
+    result = MODULE.run_preimport_auth_probes(paths, timeout=1)
+    assert result["tested"] == 2
+    assert result["http_200_completed"] == 1
+    assert result["passed"] is False
+
+
+def test_group_probe_key_uses_active_target_group_key(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        MODULE,
+        "run",
+        lambda command: commands.append(command) or MODULE.subprocess.CompletedProcess(command, 0, "sk-probe\n", None),
+    )
+    config = {
+        "SUB2API_GROUP": "grok",
+        "SUB2API_POSTGRES_CONTAINER": "postgres",
+        "SUB2API_PG_USER": "user",
+        "SUB2API_PG_DB": "db",
+    }
+    assert MODULE.resolve_group_probe_key(config) == "sk-probe"
+    assert "g.name='grok'" in commands[0][-1]
+
+
+def test_proxy_pool_is_direct_when_not_configured():
+    pool = MODULE.load_proxy_pool("", {})
+    assert pool.configured is False
+    assert pool.acquire() is None
+
+
+def test_proxy_pool_leases_refs_without_exposing_urls(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [
+            {"ref": "node-a", "url_env": "NODE_A", "max_active_leases": 1, "sub2api_proxy_id": 11},
+            {"ref": "node-b", "url_env": "NODE_B", "max_active_leases": 1, "sub2api_proxy_id": 12},
+        ],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    pool = MODULE.load_proxy_pool(str(config), {
+        "NODE_A": "http://user:secret@proxy-a.example:8080",
+        "NODE_B": "socks5h://user:secret@proxy-b.example:1080",
+    })
+    first = pool.acquire()
+    second = pool.acquire()
+    assert {first.ref, second.ref} == {"node-a", "node-b"}
+    with pytest.raises(MODULE.ProxyPoolError, match="no available"):
+        pool.acquire()
+    pool.release(first)
+    assert pool.acquire().ref == first.ref
+
+
+def test_proxy_pool_configured_empty_fails_closed(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({"version": 1, "proxies": []}), encoding="utf-8")
+    config.chmod(0o600)
+    pool = MODULE.load_proxy_pool(str(config), {})
+    with pytest.raises(MODULE.ProxyPoolError, match="no enabled nodes"):
+        pool.acquire()
+
+
+def test_proxy_pool_rejects_group_readable_secret_file(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({"version": 1, "proxies": []}), encoding="utf-8")
+    config.chmod(0o640)
+    with pytest.raises(MODULE.ProxyPoolError, match="0600"):
+        MODULE.load_proxy_pool(str(config), {})
+
+
+def test_proxy_pool_rejects_unsafe_ref_and_url(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node\nsecret", "url_env": "NODE"}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    with pytest.raises(MODULE.ProxyPoolError, match="unique ref"):
+        MODULE.load_proxy_pool(str(config), {"NODE": "file:///etc/passwd"})
+
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-safe", "url_env": "NODE"}],
+    }), encoding="utf-8")
+    with pytest.raises(MODULE.ProxyPoolError, match="valid URL"):
+        MODULE.load_proxy_pool(str(config), {"NODE": "file:///etc/passwd"})

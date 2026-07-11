@@ -24,7 +24,7 @@ x-grok-client-identifier: grok-shell
 ```
 
 如果当前 Sub2API 版本没有原生发送这些请求头，同时又不允许修改 Sub2API
-源码，可以增加一个仅 Docker 内网可见的 Nginx sidecar：Sub2API 仍负责分组、
+源码，可以增加一个仅 Docker 内网可见的 compat-only sidecar：Sub2API 仍负责分组、
 鉴权、OAuth token 刷新、模型映射、计费和 Responses 协议；sidecar 只补请求头，
 然后把请求转发到固定的 Grok CLI 上游。
 
@@ -187,15 +187,15 @@ services:
       XAI_ALLOW_UNSAFE_URL_OVERRIDES: "true"
 
   grok-cli-proxy:
-    image: nginx:1.27-alpine
+    build:
+      context: ../CodexCont
+      dockerfile: Dockerfile
+    image: local/codexcont-grok-compat:20260712
     restart: unless-stopped
     volumes:
-      - ./grok-cli-proxy.conf:/etc/nginx/nginx.conf:ro
-    tmpfs:
-      - /var/cache/nginx
-      - /var/run
+      - ./grok-compat.toml:/app/config.toml:ro
     healthcheck:
-      test: ["CMD", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=5).read()"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -216,54 +216,33 @@ services:
 修改环境变量需要重建 Sub2API 容器。单实例部署会产生短暂连接中断，应先备份、
 验证 Compose，并选择可接受的发布窗口。
 
-## 8. Nginx 头注入配置
+## 8. CodexCont compat-only 配置
 
-`grok-cli-proxy.conf`：
+`grok-compat.toml` 固定上游为 `https://cli-chat-proxy.grok.com/v1/responses`，
+关闭 continue/fold 功能，透传 Authorization，并补齐四个 Grok CLI 请求头。
+兼容规则只对 `grok-4.5` 启用：
 
-```nginx
-events {}
+```toml
+[continue]
+enabled = false
 
-http {
-    resolver 127.0.0.11 ipv6=off valid=300s;
-
-    server {
-        listen 8080;
-
-        location = /healthz {
-            access_log off;
-            default_type text/plain;
-            return 200 "ok\n";
-        }
-
-        location / {
-            set $grok_upstream https://cli-chat-proxy.grok.com;
-
-            proxy_pass $grok_upstream$request_uri;
-            proxy_http_version 1.1;
-            proxy_ssl_server_name on;
-            proxy_ssl_name cli-chat-proxy.grok.com;
-            proxy_set_header Host cli-chat-proxy.grok.com;
-            proxy_set_header Authorization $http_authorization;
-            proxy_set_header User-Agent grok-cli/0.2.93;
-            proxy_set_header X-XAI-Token-Auth xai-grok-cli;
-            proxy_set_header x-grok-client-version 0.2.93;
-            proxy_set_header x-grok-client-identifier grok-shell;
-            proxy_buffering off;
-            proxy_read_timeout 600s;
-            proxy_send_timeout 600s;
-        }
-    }
-}
+[compat]
+drop_null_reasoning_fields = true
+drop_null_reasoning_field_names = ["content"]
+drop_null_reasoning_model_prefixes = ["grok-4.5"]
 ```
+
+该规则只删除历史 `input` 中 `type=reasoning` 且值为 JSON `null` 的
+`content` 键。它不改动 `encrypted_content`、`summary`、其他 item 或未命中
+模型。不指向该 sidecar 的账号和供应商完全不受影响。
 
 关键点：
 
 - 上游主机固定为 `cli-chat-proxy.grok.com`，客户端不能通过路径选择其他主机。
-- `$request_uri` 原样保留 `/v1/responses` 等路径。
-- `proxy_ssl_server_name` 和 `proxy_ssl_name` 保证上游 TLS SNI 正确。
-- `proxy_buffering off` 避免破坏 Responses SSE 流式输出。
-- 默认 access log 不记录 Authorization 和请求体，但会记录路径、状态和 UA。
-- `/healthz` 只验证 Nginx 本地可用，不验证上游 DNS、TLS、授权或额度。
+- 上游 URL 由配置固定，客户端不能通过路径或 Header 选择其他主机。
+- httpx 管理 Host、Content-Length、TLS SNI 和 SSE 流式转发。
+- 生产关闭 request body audit，不持久化 Authorization 或请求体。
+- `/healthz` 只验证 sidecar 进程可用，不验证上游授权或额度。
 
 本文已实际验证 `/v1/responses`。即使代理会转发其他路径，也不能据此声称
 Grok CLI 上游支持所有 Chat、图片、视频或管理端点；每个端点必须单独验证。
@@ -349,7 +328,7 @@ curl -sS -N https://<sub2api-domain>/v1/responses \
 | 403 | entitlement | `grok-cli:access`、账号资格、订阅或风控 |
 | 429 | 额度/限流 | quota headers、retry-after、账号冷却 |
 | 502 且日志显示 upstream 402/403 | Sub2API 错误包装 | 查看 ops error 的真实 upstream status |
-| 502/连接拒绝，只有该账号失败 | sidecar | 容器健康、Docker DNS、Nginx 日志 |
+| 502/连接拒绝，只有该账号失败 | sidecar | 容器健康、Docker DNS、sidecar 日志 |
 | 冷启动时 Sub2API 未启动 | Compose 依赖 | sidecar healthcheck 和 Nginx 配置 |
 
 ## 12. 备份和产物
@@ -358,8 +337,8 @@ curl -sS -N https://<sub2api-domain>/v1/responses \
 
 - 一个相关数据库表的发布前备份。
 - 一处 Compose 修改。
-- 一个 `grok-cli-proxy.conf`。
-- 一个 Nginx sidecar 容器。
+- 一个 `grok-compat.toml`。
+- 一个 compat-only CodexCont sidecar 容器。
 - 一个 Docker 镜像。
 - 一个 Grok 分组、账号绑定、用户分组权限和专用 API Key。
 
@@ -406,4 +385,3 @@ Chat Completions、quota、图片或视频路径，也要分别验证，不能�
 - 删除 `XAI_ALLOW_UNSAFE_URL_OVERRIDES`。
 - 删除 Compose 启动依赖。
 - 再做公网流式和非流式双验证。
-

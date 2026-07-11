@@ -659,6 +659,7 @@ def login_with_playwright(
 
     try:
         from playwright.sync_api import sync_playwright
+        from .registration_backends import _edge_executable, _playwright_proxy
     except ImportError as exc:
         raise RuntimeError(
             "playwright is required for automated OAuth. "
@@ -671,9 +672,12 @@ def login_with_playwright(
     )
     deadline = time.time() + max(30.0, float(timeout))
     try:
-        launch_kwargs: Dict[str, Any] = {"headless": headless}
+        launch_kwargs: Dict[str, Any] = {
+            "headless": headless,
+            "executable_path": _edge_executable(),
+        }
         if proxy:
-            launch_kwargs["proxy"] = {"server": proxy}
+            launch_kwargs["proxy"] = _playwright_proxy(proxy)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(**launch_kwargs)

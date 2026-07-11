@@ -7,7 +7,7 @@
 本机扩展流程由三部分组成：
 
 1. 通过 Mailu 官方 CLI 创建独立 IMAP 邮箱。
-2. 逐个运行 `run.py -e imap`，完成注册、OAuth 和 auth JSON 导出。
+2. 使用有界 worker 运行 `run.py -e imap`，完成注册、OAuth 和 auth JSON 导出；浏览器后端固定为 1 路。
 3. 将成功 auth 聚合为一个 Sub2API bundle，整批只调用一次导入工具。
 
 最后一步会写入生产 Sub2API。脚本要求显式传入
@@ -173,6 +173,8 @@ bash register_and_import.sh --count 100 --confirm-production-write
 
 ```text
 --failure-policy abort|continue
+--workers N
+--registration-backend protocol-yescaptcha|browser-playwright-edge
 --max-consecutive-failures N
 --import-partial
 --cleanup-failed-mailboxes
@@ -188,25 +190,26 @@ bash register_and_import.sh --count 100 --confirm-production-write
 
 ## 7. 批次执行顺序
 
-1. 校验 `private/runtime.env` 存在、权限为 `0600`、必需字段非空。
-2. 创建唯一批次目录和 `manifest.json`。
-3. 为每次尝试生成 `xai<随机值>@<MAILU_DOMAIN>`。
-4. 用 `flask mailu user` 创建邮箱，并通过只读 SQLite 查询确认唯一记录。
-5. 以独立 auth 目录和结果文件运行一次 `run.py`。
-6. 校验退出码、结果邮箱、auth 路径边界、auth 内邮箱及 access token。
-7. 将成功 auth 聚合成一个 bundle，`exported_at` 使用当前 UTC 时间。
-8. 根据失败策略决定是否导入。
-9. 按 token hash 区分已存在账号和缺失账号，只把缺失子集交给导入工具。
-10. 导入工具创建数据库备份、调用管理 API；已存在账号则创建收口前备份。
-11. 对本批精确 ID 统一设置内网 CLI 代理、移除非 Grok 绑定并绑定 Grok 组。
-12. 按精确 ID 验证 `platform=grok`、`type=oauth`、`status=active`、
+1. 校验 `private/runtime.env` 存在、权限为 `0600`、必需字段非空，并取得跨进程批次锁。
+2. 如配置代理池，先校验 Sub2API ProxyID，再检查 TLS、成功率、出口稳定性和重复出口；失败时在创建邮箱前终止。
+3. 创建唯一批次目录和 `manifest.json`。
+4. 为每次尝试生成 `xai<随机值>@<MAILU_DOMAIN>`。
+5. 用 `flask mailu user` 创建邮箱，并通过只读 SQLite 查询确认唯一记录。
+6. 以独立 auth 目录和结果文件运行一次 `run.py`。
+7. 校验退出码、结果邮箱、auth 路径边界、auth 内邮箱及 access token。
+8. 将成功 auth 聚合成一个 bundle，`exported_at` 使用当前 UTC 时间。
+9. 根据失败策略决定是否导入。
+10. 按 token hash 区分已存在账号和缺失账号，只把缺失子集交给导入工具。
+11. 导入工具创建数据库备份、调用管理 API；已存在账号则创建收口前备份。
+12. 对本批精确 ID 统一设置内网 CLI 代理、移除非 Grok 绑定并绑定 Grok 组。
+13. 导入前逐个执行 Grok CLI Responses auth probe；HTTP 403 或非 200 账号隔离，不进入生产调度。
+14. 按精确 ID 验证 `platform=grok`、`type=oauth`、`status=active`、
     `schedulable=true`、唯一 Grok 分组和 `credentials.base_url`，全部匹配时才
-    标记为“已导入 · 未探测”。
+    校验代理绑定和凭据完整性。
+15. 通过 Sub2API Grok 分组执行导入后 Responses probe，只有输出、分组和上游均通过时才标记完成。
 
-该验证证明数据库行和分组状态正常，不等于上游账号可用性验证。脚本不会
-自动调用额度、配额或模型探测接口，manifest 会明确记录 `not-run`。
-导入后如需通过 Sub2API/CC Switch 调用 Grok Responses，还必须核对分组平台、
-CLI 请求头和真实上游响应；完整流程见
+完整流程会同时验证数据库行、分组、单 auth 上游可用性和 Sub2API 实际 Responses 输出。代理池详见
+[`PROXY_POOL_OPERATIONS.zh-CN.md`](PROXY_POOL_OPERATIONS.zh-CN.md)；Grok Responses 完整流程见
 [`SUB2API_GROK_RESPONSES.zh-CN.md`](SUB2API_GROK_RESPONSES.zh-CN.md)。
 
 ## 8. 失败与恢复

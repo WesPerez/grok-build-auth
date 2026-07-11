@@ -42,6 +42,7 @@ import http.cookiejar
 import io
 import json
 import re
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -146,6 +147,21 @@ class XConsoleAuthClient:
     def _request(self, method, url, *, headers, body=None):
         return self._t.request(method, url, headers=headers, body=body)
 
+    def _request_retry(self, method, url, *, headers, body=None, attempts: int = 3):
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                result = self._request(method, url, headers=headers, body=body)
+                if result[0] not in {408, 425, 429} and result[0] < 500:
+                    return result
+                last_error = RuntimeError(f"temporary HTTP {result[0]}")
+            except Exception as exc:
+                last_error = exc
+            if attempt < attempts:
+                time.sleep(min(2.0 * attempt, 5.0))
+        assert last_error is not None
+        raise last_error
+
     def _base_headers(self) -> Dict[str, str]:
         return {
             "user-agent": C.USER_AGENT,
@@ -176,7 +192,7 @@ class XConsoleAuthClient:
         h.update({"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                   "sec-fetch-site": "none", "sec-fetch-mode": "navigate",
                   "sec-fetch-dest": "document", "upgrade-insecure-requests": "1"})
-        status, _, _, _ = self._request("GET", C.HOME_URL, headers=h)
+        status, _, _, _ = self._request_retry("GET", C.HOME_URL, headers=h)
         return status
 
     def load_signup_page(self) -> int:
@@ -190,7 +206,7 @@ class XConsoleAuthClient:
         h.update({"accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                   "sec-fetch-site": "same-site", "sec-fetch-mode": "navigate",
                   "sec-fetch-dest": "document", "referer": "https://console.x.ai/"})
-        status, _hdrs, _sc, raw = self._request("GET", self.signup_url, headers=h)
+        status, _hdrs, _sc, raw = self._request_retry("GET", self.signup_url, headers=h)
         html = raw.decode("utf-8", "replace")
 
         # ---- scrape Next.js build-specific values from the live page ----
@@ -446,7 +462,48 @@ class XConsoleAuthClient:
     def validate_password(self, email: str, password: str) -> PasswordStrength:
         # Field numbers 4 and 5 — observed in the capture, not 1/2.
         res = self._grpc_call(C.RPC_VALIDATE_PW, [(4, email), (5, password)], self.signup_url)
+        if not res.ok:
+            raise RuntimeError(self._grpc_failure_message("ValidatePassword", res))
         return PasswordStrength(raw_fields=res.first_message)
+
+    @staticmethod
+    def _grpc_failure_message(operation: str, result: GrpcResult) -> str:
+        grpc_message = result.trailers.get("grpc-message", "")
+        detail = f"HTTP {result.http_status}, gRPC {result.grpc_status}"
+        if grpc_message:
+            detail += f": {grpc_message}"
+        return f"{operation} failed ({detail})"
+
+    @staticmethod
+    def require_grpc_success(operation: str, result: GrpcResult) -> GrpcResult:
+        """Raise when a gRPC-web operation did not complete successfully."""
+        if not result.ok:
+            raise RuntimeError(XConsoleAuthClient._grpc_failure_message(operation, result))
+        return result
+
+    @staticmethod
+    def _signup_response_error_reason(rsc_body: str) -> str:
+        """Return a concrete Next.js server-action error, ignoring wire placeholders."""
+        text = rsc_body.strip()
+        if not text:
+            return ""
+        for match in re.finditer(
+            r'(?i)\"(?:error|errorMessage|error_message)\"\s*:\s*\"([^\"]*)\"',
+            text,
+        ):
+            value = match.group(1).strip()
+            if re.fullmatch(r"\$\d+", value):
+                continue
+            if value.lower() not in {"", "$undefined", "undefined", "null", "none"}:
+                return value[:240]
+        if re.search(r'(?i)\"(?:success|ok)\"\s*:\s*false\b', text):
+            return "success/ok=false"
+        match = re.search(r'(?i)\b(?:AccountCreationError|CreateUserError)\s*:\s*([^\r\n\"]+)', text)
+        return match.group(0)[:240] if match else ""
+
+    @staticmethod
+    def _signup_response_has_error(rsc_body: str) -> bool:
+        return bool(XConsoleAuthClient._signup_response_error_reason(rsc_body))
 
     # ----------------------------------------------------------------- account creation
     def create_account(self, *, email: str, given_name: str, family_name: str,
@@ -488,8 +545,10 @@ class XConsoleAuthClient:
         rsc_body = raw.decode("utf-8", "replace")
         self._last_rsc_body = rsc_body  # store for fetch_sso_token()
         self._last_create_set_cookies = list(set_cookies or [])
+        self._last_signup_error_reason = self._signup_response_error_reason(rsc_body)
+        explicit_error = bool(self._last_signup_error_reason)
         return SignupResult(
-            ok=(status == 200), http_status=status,
+            ok=(status == 200 and not explicit_error), http_status=status,
             set_cookies=set_cookies,
             rsc_body=rsc_body,
         )

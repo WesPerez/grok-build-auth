@@ -135,7 +135,7 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
     return out
 
 
-def probe(path: Path, timeout: float) -> dict[str, Any]:
+def probe(path: Path, timeout: float, proxy: str = "") -> dict[str, Any]:
     auth = json.loads(path.read_text(encoding="utf-8"))
     token = str(auth.get("access_token") or "").strip()
     if not token:
@@ -161,7 +161,13 @@ def probe(path: Path, timeout: float) -> dict[str, Any]:
     }
     # Build/CLI free quota lives on cli-chat-proxy.grok.com, not api.x.ai paid API.
     url = build_url(DEFAULT_BASE_URL)
-    resp = requests.post(url, headers=headers, json=body, timeout=timeout, allow_redirects=False)
+    session = requests.Session()
+    session.trust_env = False
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    resp = session.post(
+        url, headers=headers, json=body, timeout=timeout,
+        allow_redirects=False, proxies=proxies,
+    )
     if 300 <= resp.status_code < 400:
         raise RuntimeError("redirect refused for token-bearing request")
     summary = summarize_response(resp)

@@ -12,13 +12,20 @@ import secrets
 import socket
 import subprocess
 import threading
+import time
+import datetime as dt
 from urllib.parse import urlparse
+
+from xconsole_client.proxy_pool import ProxyPoolError, load_proxy_pool
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
 PRIVATE_DIR = PROJECT_DIR / "private"
 RUNS_DIR = PRIVATE_DIR / "runs"
 WEB_DIR = PROJECT_DIR / "web"
+TASK_STATE_PATH = PRIVATE_DIR / "web" / "current-task.json"
+ACTIVE_BATCH_STATUSES = {"running", "importing", "resuming-import"}
+DOCTOR_CACHE_TTL = 30.0
 
 
 def read_json(path: Path) -> dict:
@@ -46,6 +53,7 @@ def batch_summary(path: Path) -> dict:
         "registration-failed-import-skipped",
     }
     manifest["has_backup"] = any((path / "backup").glob("*.dump"))
+    manifest["runtime_state"] = manifest.get("status")
     return manifest
 
 
@@ -60,7 +68,34 @@ class TaskManager:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.process: subprocess.Popen | None = None
-        self.task: dict | None = None
+        self.task: dict | None = read_json(TASK_STATE_PATH) or None
+
+    @staticmethod
+    def _process_identity(pid: int) -> tuple[str, str]:
+        try:
+            started = Path(f"/proc/{pid}/stat").read_text().split()[21]
+            command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+            return started, command
+        except (OSError, IndexError):
+            return "", ""
+
+    def _save(self) -> None:
+        if not self.task:
+            return
+        TASK_STATE_PATH.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        temp = TASK_STATE_PATH.with_name(f".{TASK_STATE_PATH.name}.{secrets.token_hex(4)}.tmp")
+        temp.write_text(json.dumps(self.task, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp.chmod(0o600)
+        os.replace(temp, TASK_STATE_PATH)
+
+    def _restored_process_alive(self) -> bool:
+        if not self.task:
+            return False
+        started, command = self._process_identity(int(self.task.get("pid") or 0))
+        return bool(
+            started and started == self.task.get("process_started_ticks")
+            and str(PROJECT_DIR / "scripts/register_and_import.py") in command
+        )
 
     def current(self) -> dict | None:
         with self.lock:
@@ -68,12 +103,23 @@ class TaskManager:
                 code = self.process.poll()
                 self.task["running"] = code is None
                 self.task["exit_code"] = code
+                if code is not None and not self.task.get("ended_at"):
+                    self.task["ended_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                self._save()
+            elif self.task is not None and self.task.get("running"):
+                self.task["running"] = self._restored_process_alive()
+                if not self.task["running"]:
+                    self.task["interrupted"] = True
+                    self.task["ended_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                    self._save()
             return dict(self.task) if self.task else None
 
     def start(self, command: list[str], kind: str, subject: str, batch_id: str = "") -> dict:
         with self.lock:
             if self.process is not None and self.process.poll() is None:
                 raise RuntimeError("another task is already running")
+            if self.task is not None and self.task.get("running") and self._restored_process_alive():
+                raise RuntimeError("another restored task is already running")
             task_id = secrets.token_hex(6)
             task_dir = PRIVATE_DIR / "web" / "tasks"
             task_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -88,11 +134,17 @@ class TaskManager:
             self.task = {
                 "id": task_id, "kind": kind, "subject": subject, "pid": self.process.pid,
                 "running": True, "exit_code": None, "log_path": str(log_path), "batch_id": batch_id,
+                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
+            started, _ = self._process_identity(self.process.pid)
+            self.task["process_started_ticks"] = started
+            self._save()
             return dict(self.task)
 
 
 MANAGER = TaskManager()
+_DOCTOR_LOCK = threading.Lock()
+_DOCTOR_CACHE: tuple[float, list[dict]] = (0.0, [])
 
 
 def doctor() -> list[dict]:
@@ -120,6 +172,39 @@ def doctor() -> list[dict]:
         ]
         missing = [key for key in required if not values.get(key)]
         add("必要字段", not missing, "字段完整" if not missing else "缺少: " + ", ".join(missing))
+        try:
+            max_workers = int(values.get("GROK_MAX_REGISTRATION_WORKERS", "2") or "2")
+            workers_ok = 1 <= max_workers <= 16
+        except ValueError:
+            max_workers = 0
+            workers_ok = False
+        add("注册并发", workers_ok, f"最多 {max_workers} 路协议注册" if workers_ok else "GROK_MAX_REGISTRATION_WORKERS 必须为 1 到 16")
+        try:
+            pool = load_proxy_pool(values.get("GROK_PROXY_POOL_FILE", ""), values)
+            if pool.configured:
+                detail = f"已启用 {pool.enabled_count} 个节点，可用租约 {pool.capacity}"
+            elif values.get("HTTPS_PROXY") or values.get("HTTP_PROXY"):
+                detail = "未配置节点池，使用现有单一 sticky 代理"
+            else:
+                detail = "未配置代理，注册任务直连"
+            add("注册代理池", True, detail, blocking=False)
+        except ProxyPoolError as exc:
+            add("注册代理池", False, str(exc))
+        edge = next((Path(value) for value in (
+            "/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable",
+            "/usr/bin/microsoft-edge-dev",
+        ) if Path(value).is_file()), None)
+        try:
+            import playwright.sync_api  # noqa: F401
+            playwright_ok = True
+        except ImportError:
+            playwright_ok = False
+        add(
+            "浏览器注册",
+            bool(edge and playwright_ok),
+            f"Playwright + {edge}" if edge and playwright_ok else "需要 Playwright Python 和 Microsoft Edge",
+            blocking=False,
+        )
         parsed = urlparse(values.get("SUB2API_URL", ""))
         add("Sub2API 地址", parsed.hostname in {"127.0.0.1", "localhost", "::1"}, "本机回环地址，不使用外部代理" if parsed.hostname in {"127.0.0.1", "localhost", "::1"} else "必须使用本机回环地址")
         helper = Path(values.get("SUB2API_IMPORT_TOOL", ""))
@@ -191,6 +276,34 @@ def doctor() -> list[dict]:
     return checks
 
 
+def cached_doctor(*, force: bool = False) -> list[dict]:
+    global _DOCTOR_CACHE
+    with _DOCTOR_LOCK:
+        cached_at, checks = _DOCTOR_CACHE
+        if not force and checks and time.monotonic() - cached_at < DOCTOR_CACHE_TTL:
+            return [dict(item) for item in checks]
+        checks = doctor()
+        _DOCTOR_CACHE = (time.monotonic(), checks)
+        return [dict(item) for item in checks]
+
+
+def state_payload() -> dict:
+    task = MANAGER.current()
+    batches = list_batches()
+    active = [item for item in batches if item.get("status") in ACTIVE_BATCH_STATUSES]
+    if active:
+        batch = active[0]
+        if task and task.get("running"):
+            batch["runtime_state"] = "running"
+        elif task and task.get("interrupted"):
+            batch["runtime_state"] = "interrupted"
+            batch["action_hint"] = "任务进程已中断。检查日志后重新开始；已有 auth 的导入失败批次可直接续跑。"
+        else:
+            batch["runtime_state"] = "interrupted"
+            batch["action_hint"] = "没有检测到对应执行进程。请检查日志和批次产物后再决定是否重试。"
+    return {"task": task, "batches": batches, "checks": cached_doctor()}
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "GrokBatchConsole/1.0"
 
@@ -232,7 +345,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/styles.css":
             return self.serve_file(WEB_DIR / "styles.css", "text/css; charset=utf-8")
         if self.path == "/api/state":
-            return self.send_json({"task": MANAGER.current(), "batches": list_batches(), "checks": doctor()})
+            return self.send_json(state_payload())
         if self.path.startswith("/api/task-log"):
             task = MANAGER.current()
             log = Path(task["log_path"]).read_text(encoding="utf-8", errors="replace")[-30000:] if task and Path(task["log_path"]).is_file() else ""
@@ -249,15 +362,26 @@ class Handler(BaseHTTPRequestHandler):
                 count = int(payload.get("count", 1))
                 if count < 1 or count > 100:
                     raise ValueError("注册数量必须在 1 到 100 之间")
+                workers = int(payload.get("workers", 2))
+                if workers < 1 or workers > 16:
+                    raise ValueError("并发数必须在 1 到 16 之间")
+                registration_backend = str(payload.get("registration_backend") or "protocol-yescaptcha")
+                if registration_backend not in {"protocol-yescaptcha", "browser-playwright-edge"}:
+                    raise ValueError("未知注册方式")
+                if registration_backend == "browser-playwright-edge" and workers != 1:
+                    raise ValueError("浏览器注册必须使用 1 路并发")
                 command = [
                     "python3", str(PROJECT_DIR / "scripts/register_and_import.py"),
-                    "--count", str(count), "--confirm-production-write",
+                    "--count", str(count), "--workers", str(workers),
+                    "--registration-backend", registration_backend,
+                    "--confirm-production-write",
                 ]
                 if payload.get("import_partial"):
                     command.append("--import-partial")
                 if payload.get("cleanup_failed_mailboxes"):
                     command.append("--cleanup-failed-mailboxes")
-                task = MANAGER.start(command, "new-batch", f"注册并导入 {count} 个账号")
+                label = "浏览器" if registration_backend == "browser-playwright-edge" else "协议"
+                task = MANAGER.start(command, "new-batch", f"{label}注册并导入 {count} 个账号（{workers} 路）")
                 return self.send_json(task, HTTPStatus.ACCEPTED)
             if self.path.startswith("/api/resume/"):
                 batch_id = safe_batch_id(self.path.split("/")[3])
@@ -273,7 +397,7 @@ class Handler(BaseHTTPRequestHandler):
                 task = MANAGER.start(command, "resume-import", f"继续导入 {batch_id}", batch_id=batch_id)
                 return self.send_json(task, HTTPStatus.ACCEPTED)
             if self.path == "/api/doctor":
-                return self.send_json({"checks": doctor()})
+                return self.send_json({"checks": cached_doctor(force=True)})
             self.send_error(HTTPStatus.NOT_FOUND)
         except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)

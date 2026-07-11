@@ -25,6 +25,18 @@
           <input id="count" type="number" min="1" max="100" value="1">
           <button type="button" id="plus" title="增加">＋</button>
         </div>
+        <label for="workers">协议注册并发</label>
+        <select id="workers">
+          <option value="1">1 路</option>
+          <option value="2" selected>2 路</option>
+        </select>
+        <label for="registrationBackend">注册方式</label>
+        <select id="registrationBackend">
+          <option value="protocol-yescaptcha" selected>协议 + YesCaptcha（30-120 秒）</option>
+          <option value="browser-playwright-edge">浏览器 Edge + Turnstile（实验，2-5 分钟）</option>
+        </select>
+        <p class="hint">浏览器方式完成整个注册页流程，固定 1 路并发。</p>
+        <p id="proxyPoolLine" class="hint">正在读取代理池状态...</p>
         <details>
           <summary>高级策略</summary>
           <label class="check"><input id="partial" type="checkbox"> 部分成功时也导入</label>
@@ -44,6 +56,8 @@
       <section id="activeSection" class="active hidden">
         <div class="section-title"><h2>正在执行</h2><span id="activeBadge" class="badge running">运行中</span></div>
         <p id="activeTitle"></p>
+        <div id="activeStage" class="activity-line"></div>
+        <p id="activeAction" class="action-hint hidden"></p>
         <div class="progress"><span id="progressBar"></span></div>
         <div id="activeMetrics" class="metrics"></div>
         <pre id="liveLog"></pre>

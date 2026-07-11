@@ -25,7 +25,7 @@ class EntrypointTests(unittest.TestCase):
 
     def test_quota_probe_refuses_redirects(self):
         response = mock.Mock(status_code=302)
-        with mock.patch.object(quota.requests, "post", return_value=response) as post:
+        with mock.patch.object(quota.requests.Session, "post", return_value=response) as post:
             with mock.patch.object(Path, "read_text", return_value='{"access_token":"secret"}'):
                 with self.assertRaisesRegex(RuntimeError, "redirect refused"):
                     quota.probe(Path("xai-test.json"), timeout=1)

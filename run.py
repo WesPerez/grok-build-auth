@@ -42,13 +42,19 @@ try:
 except Exception:
     pass
 
-from xconsole_client import XConsoleAuthClient, YesCaptchaSolver, config as C
+from xconsole_client import XConsoleAuthClient, config as C
 from xconsole_client.xai_oauth import (
     CLIPROXYAPI_GROK_BASE_URL,
     complete_build_oauth,
     default_cliproxyapi_auth_dir,
 )
 from xconsole_client.oauth_protocol import extract_cookies_from_auth_client
+from xconsole_client.registration_backends import (
+    BrowserRegistrationRequest,
+    CaptchaChallenge,
+    YesCaptchaProvider,
+    create_registration_backend,
+)
 from xconsole_client.security import mask_email, redact_text, set_restrictive_umask, validate_cliproxyapi_base_url
 
 # -- secrets from environment only ---------------------------------------
@@ -142,9 +148,12 @@ def register_one(
     oauth_debug: bool = False,
     cliproxyapi_auth_dir: Optional[str | Path] = None,
     cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
+    proxy_url: str = "",
+    registration_backend: str = "protocol-yescaptcha",
+    browser_headless: bool = True,
 ) -> dict:
     """Run signup (+ optional Build OAuth export). Thread-safe."""
-    if not YESCAPTCHA_KEY:
+    if registration_backend == "protocol-yescaptcha" and not YESCAPTCHA_KEY:
         return {
             "email": "",
             "sso_ok": False,
@@ -153,7 +162,7 @@ def register_one(
         }
 
     # Per-client signup_url — never mutate global C.SIGNUP_URL under concurrency.
-    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL, proxy=PROXY or None)
+    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL, proxy=proxy_url or None)
     email = ""
     password = ""
     sso = None
@@ -161,6 +170,73 @@ def register_one(
     account_created = False
 
     try:
+        if registration_backend == "browser-playwright-edge":
+            email, receiver = _make_email_provider(email_backend)
+            password = f"Pw{secrets.token_urlsafe(24)}!a#A"
+            _log(index, f"email: {mask_email(email)}")
+            browser_proxy_url = os.environ.get("GROK_BROWSER_PROXY_URL", "").strip() or proxy_url
+            backend = create_registration_backend(
+                registration_backend,
+                require_proxy=bool(browser_proxy_url),
+            )
+
+            def browser_progress(stage: str, detail: str) -> None:
+                _log(index, f"browser-stage={stage}: {detail}")
+
+            browser_result = backend.register(BrowserRegistrationRequest(
+                email=email,
+                password=password,
+                wait_for_code=lambda timeout: receiver.wait_for_code(timeout=timeout),
+                signup_url=SIGNUP_URL,
+                proxy=browser_proxy_url,
+                timeout=max(oauth_timeout, 240.0),
+                headless=browser_headless,
+                progress=browser_progress,
+            ))
+            account_created = True
+            sso = browser_result.sso
+            session_cookies = {
+                str(item.get("name")): str(item.get("value"))
+                for item in browser_result.cookies
+                if item.get("name") and item.get("value")
+            }
+            _log(index, "account created")
+            _log(index, "SSO acquired in browser context")
+            result = {
+                "email": email,
+                "sso_ok": True,
+                "cliproxyapi_auth": None,
+                "build_base_url": cliproxyapi_base_url,
+                "password": password,
+                "account_created": True,
+                "registration_backend": registration_backend,
+                "error": None,
+            }
+            if do_oauth:
+                auth_dir = Path(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else default_cliproxyapi_auth_dir()
+                _log(index, f"OAuth Build path → {auth_dir}  (cookies={len(session_cookies)})")
+                oauth = complete_build_oauth(
+                    email,
+                    password,
+                    cliproxyapi_auth_dir=auth_dir,
+                    cliproxyapi_base_url=cliproxyapi_base_url,
+                    headless=oauth_headless,
+                    timeout=oauth_timeout,
+                    proxy=proxy_url,
+                    interactive_fallback=oauth_interactive_fallback,
+                    yescaptcha_key=YESCAPTCHA_KEY,
+                    protocol=oauth_protocol,
+                    playwright_fallback=False,
+                    debug=oauth_debug,
+                    session_cookies=session_cookies,
+                    auth_client=None,
+                )
+                result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
+                if not result["cliproxyapi_auth"] or not Path(result["cliproxyapi_auth"]).is_file():
+                    raise RuntimeError("OAuth completed without a CLIProxyAPI auth file")
+                _log(index, "Build OAuth OK; CLIProxyAPI auth written")
+            return result
+
         # 1. warm-up + scrape
         c.visit_home()
         c.load_signup_page()
@@ -171,17 +247,26 @@ def register_one(
         password = f"Pw{secrets.token_urlsafe(24)}!a#A"
         _log(index, f"email: {mask_email(email)}")
 
-        c.create_email_validation_code(email)
+        c.require_grpc_success(
+            "CreateEmailValidationCode",
+            c.create_email_validation_code(email),
+        )
         code = receiver.wait_for_code(timeout=120)
         _log(index, "email verification code received")
-        c.verify_email_validation_code(email, code)
+        c.require_grpc_success(
+            "VerifyEmailValidationCode",
+            c.verify_email_validation_code(email, code),
+        )
         c.validate_password(email, password)
         _log(index, "email verified")
 
         # 3. turnstile
-        solver = YesCaptchaSolver(YESCAPTCHA_KEY)
-        turnstile = solver.solve_turnstile(
-            website_url=SIGNUP_URL, website_key=C.TURNSTILE_SITEKEY, premium=True)
+        captcha = YesCaptchaProvider(YESCAPTCHA_KEY).solve_turnstile(CaptchaChallenge(
+            website_url=SIGNUP_URL,
+            website_key=C.TURNSTILE_SITEKEY,
+            premium=True,
+        ))
+        turnstile = captcha.token
         _log(index, f"Turnstile {len(turnstile)} chars")
 
         # 4. create account
@@ -192,14 +277,16 @@ def register_one(
             conversion_id=str(uuid.uuid4()),
         )
         if not res.ok:
-            _log(index, f"FAIL create_account HTTP {res.http_status}")
+            reason = getattr(c, "_last_signup_error_reason", "")
+            detail = f"RSC error: {redact_text(reason)}" if reason else f"HTTP {res.http_status}"
+            _log(index, f"FAIL create_account {detail}")
             return {
                 "email": email,
                 "sso_ok": False,
                 "cliproxyapi_auth": None,
                 "password": password,
                 "account_created": False,
-                "error": f"HTTP {res.http_status}",
+                "error": f"create_account rejected: {detail}",
             }
         account_created = True
         _log(index, "account created")
@@ -227,15 +314,15 @@ def register_one(
             # Reuse signup session cookies so OAuth can skip password login when possible.
             session_cookies = extract_cookies_from_auth_client(c)
             _log(index, f"OAuth Build path → {auth_dir}  (cookies={len(session_cookies)})")
-            with _oauth_lock:
-                oauth = complete_build_oauth(
+            def complete_oauth():
+                return complete_build_oauth(
                     email,
                     password,
                     cliproxyapi_auth_dir=auth_dir,
                     cliproxyapi_base_url=cliproxyapi_base_url,
                     headless=oauth_headless,
                     timeout=oauth_timeout,
-                    proxy=PROXY,
+                    proxy=proxy_url,
                     interactive_fallback=oauth_interactive_fallback,
                     yescaptcha_key=YESCAPTCHA_KEY,
                     protocol=oauth_protocol,
@@ -244,6 +331,26 @@ def register_one(
                     session_cookies=session_cookies,
                     auth_client=c,
                 )
+
+            if oauth_protocol:
+                oauth_error = None
+                for oauth_attempt in range(1, 4):
+                    try:
+                        oauth = complete_oauth()
+                        break
+                    except Exception as exc:
+                        oauth_error = exc
+                        if oauth_attempt < 3:
+                            _log(index, f"OAuth transient failure; retry {oauth_attempt}/2")
+                            time.sleep(2 * oauth_attempt)
+                else:
+                    assert oauth_error is not None
+                    raise oauth_error
+            else:
+                # Callback/browser automation remains serialized; protocol OAuth
+                # has no listening callback server and is safe to run concurrently.
+                with _oauth_lock:
+                    oauth = complete_oauth()
             result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
             if not result["cliproxyapi_auth"] or not Path(result["cliproxyapi_auth"]).is_file():
                 raise RuntimeError("OAuth completed without a CLIProxyAPI auth file")
@@ -289,6 +396,17 @@ def main() -> int:
     )
     p.add_argument("-n", "--count", type=int, choices=[1], default=1, help="账号数量（服务器版仅允许 1）")
     p.add_argument("-t", "--threads", type=int, choices=[1], default=1, help="并发线程数（服务器版仅允许 1）")
+    p.add_argument(
+        "--proxy-env",
+        default="",
+        help="从指定环境变量读取本次账号的 sticky proxy URL",
+    )
+    p.add_argument(
+        "--registration-backend",
+        choices=["protocol-yescaptcha", "browser-playwright-edge"],
+        default="protocol-yescaptcha",
+    )
+    p.add_argument("--browser-headed", action="store_true")
     p.add_argument(
         "-e", "--email",
         choices=["tempmail", "cloudflare", "imap"],
@@ -343,6 +461,7 @@ def main() -> int:
     _t0 = time.time()
     threads = min(args.threads, args.count)
     do_oauth = not args.no_oauth
+    proxy_url = os.environ.get(args.proxy_env, "") if args.proxy_env else PROXY
 
     print(
         f"grok-build-auth: {args.count} accounts, {threads} threads, email={args.email}, "
@@ -362,6 +481,9 @@ def main() -> int:
         oauth_debug=False,
         cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,
         cliproxyapi_base_url=args.cliproxyapi_base_url,
+        proxy_url=proxy_url,
+        registration_backend=args.registration_backend,
+        browser_headless=not args.browser_headed,
     )
 
     if args.count == 1:

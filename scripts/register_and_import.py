@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import importlib.util
 import json
@@ -16,23 +17,48 @@ import os
 from pathlib import Path
 import re
 import secrets
+import selectors
 import sqlite3
 import subprocess
 import sys
 import time
+import threading
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from xconsole_client.proxy_pool import ProxyPoolError, load_proxy_pool
+from xconsole_client.proxy_health import check_proxy_pool_health
+from xai_build_quota_probe import probe as probe_grok_auth
+
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 EMAIL_RE = re.compile(r"^(xai[a-f0-9]{6})@([A-Za-z0-9.-]+)$")
+BATCH_LOCK_PATH = PROJECT_DIR / "private" / "batch-orchestrator.lock"
 
 
 class BatchError(RuntimeError):
     pass
+
+
+def acquire_batch_lock(path: Path = BATCH_LOCK_PATH):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = path.open("a+", encoding="utf-8")
+    os.chmod(path, 0o600)
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        handle.close()
+        raise BatchError("another registration/import batch is already running") from exc
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f"pid={os.getpid()} started_at={utc_now()}\n")
+    handle.flush()
+    return handle
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -49,6 +75,8 @@ def load_env(path: Path) -> dict[str, str]:
 
 
 def atomic_json(path: Path, payload: Any) -> None:
+    if path.name == "manifest.json" and isinstance(payload, dict):
+        payload["updated_at"] = utc_now()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_name(f".{path.name}.{secrets.token_hex(6)}.tmp")
     try:
@@ -59,6 +87,38 @@ def atomic_json(path: Path, payload: Any) -> None:
         temp.unlink(missing_ok=True)
 
 
+def utc_now() -> str:
+    return dt.datetime.now(dt.timezone.utc).isoformat()
+
+
+def set_manifest_stage(
+    manifest: dict[str, Any], manifest_path: Path, stage: str, *,
+    attempt: dict[str, Any] | None = None,
+) -> None:
+    now = utc_now()
+    if attempt is not None:
+        if attempt.get("stage") != stage:
+            attempt["stage"] = stage
+            attempt["stage_started_at"] = now
+        attempt["last_activity_at"] = now
+    elif manifest.get("current_stage") != stage:
+        manifest["current_stage"] = stage
+        manifest["stage_started_at"] = now
+    manifest["last_activity_at"] = now
+    atomic_json(manifest_path, manifest)
+
+
+def heartbeat_manifest(
+    manifest: dict[str, Any], manifest_path: Path, *,
+    attempt: dict[str, Any] | None = None,
+) -> None:
+    now = utc_now()
+    manifest["last_activity_at"] = now
+    if attempt is not None:
+        attempt["last_activity_at"] = now
+    atomic_json(manifest_path, manifest)
+
+
 def run(
     command: list[str],
     *,
@@ -66,6 +126,8 @@ def run(
     log: Path | None = None,
     input_text: str | None = None,
     on_line: Any = None,
+    on_heartbeat: Any = None,
+    heartbeat_interval: float = 5.0,
 ) -> subprocess.CompletedProcess[str]:
     if on_line is None:
         proc = subprocess.run(
@@ -92,9 +154,27 @@ def run(
             child.stdin.close()
         output: list[str] = []
         assert child.stdout is not None
-        for line in child.stdout:
+        selector = selectors.DefaultSelector()
+        selector.register(child.stdout, selectors.EVENT_READ)
+        while True:
+            events = selector.select(timeout=heartbeat_interval)
+            if not events:
+                if child.poll() is None:
+                    if on_heartbeat is not None:
+                        on_heartbeat()
+                    continue
+                break
+            line = child.stdout.readline()
+            if not line:
+                break
             output.append(line)
             on_line(line.rstrip("\n"))
+        selector.close()
+        remainder = child.stdout.read()
+        if remainder:
+            output.append(remainder)
+            for line in remainder.splitlines():
+                on_line(line)
         child.wait()
         proc = subprocess.CompletedProcess(command, child.returncode, "".join(output), None)
     if log is not None:
@@ -162,6 +242,10 @@ def load_resume_bundle(batch_dir: Path) -> tuple[dict[str, Any], Path, list[Path
         raise BatchError("resume bundle hash does not match manifest")
     bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
     auth_paths = [Path(str(item["auth_file"])).resolve() for item in manifest.get("attempts", []) if item.get("status") == "registered"]
+    auth_root = (batch_dir / "auth").resolve()
+    for auth_path in auth_paths:
+        if not auth_path.is_file() or auth_root not in auth_path.parents:
+            raise BatchError("resume auth file is missing or outside the batch directory")
     if len(bundle.get("accounts", [])) != len(auth_paths) or not auth_paths:
         raise BatchError("resume account count does not match registered attempts")
     return manifest, bundle_path, auth_paths
@@ -287,6 +371,26 @@ def upstream_account_created(path: Path) -> bool | None:
         return None
 
 
+def credentials_from_auth(auth: dict[str, Any], account_base_url: str) -> dict[str, Any]:
+    expires_at = auth.get("expires_at")
+    if not expires_at and auth.get("last_refresh") and auth.get("expires_in"):
+        try:
+            refreshed = dt.datetime.fromisoformat(str(auth["last_refresh"]).replace("Z", "+00:00"))
+            expires_at = (refreshed + dt.timedelta(seconds=int(auth["expires_in"]))).isoformat()
+        except (TypeError, ValueError):
+            expires_at = None
+    return {
+        "access_token": str(auth.get("access_token") or ""),
+        "refresh_token": auth.get("refresh_token", ""),
+        "id_token": auth.get("id_token", ""),
+        "token_type": auth.get("token_type", "Bearer"),
+        "email": auth.get("email", ""),
+        "sub": auth.get("sub", ""),
+        "expires_at": expires_at,
+        "base_url": account_base_url,
+    }
+
+
 def account_from_auth(auth_path: Path, account_base_url: str) -> dict[str, Any]:
     auth = json.loads(auth_path.read_text(encoding="utf-8"))
     token = str(auth.get("access_token") or "")
@@ -296,16 +400,7 @@ def account_from_auth(auth_path: Path, account_base_url: str) -> dict[str, Any]:
         "name": auth.get("email", ""),
         "platform": "grok",
         "type": "oauth",
-        "credentials": {
-            "access_token": token,
-            "refresh_token": auth.get("refresh_token", ""),
-            "id_token": auth.get("id_token", ""),
-            "token_type": auth.get("token_type", "Bearer"),
-            "email": auth.get("email", ""),
-            "sub": auth.get("sub", ""),
-            "expires_at": auth.get("expires_at"),
-            "base_url": account_base_url,
-        },
+        "credentials": credentials_from_auth(auth, account_base_url),
         "extra": {
             "base_url": account_base_url,
             "oauth_source_base_url": auth.get("base_url", "https://cli-chat-proxy.grok.com/v1"),
@@ -413,13 +508,20 @@ def make_admin_token(config: dict[str, str]) -> str:
         raise BatchError("failed to create short-lived in-memory Sub2API admin token") from exc
 
 
-def update_account_via_admin_api(config: dict[str, str], token: str, account_id: int, group_id: int) -> None:
-    payload = json.dumps({
-        "credentials": {"base_url": config["GROK_ACCOUNT_BASE_URL"].rstrip("/")},
+def update_account_via_admin_api(
+    config: dict[str, str], token: str, account_id: int, group_id: int,
+    proxy_id: int | None = None, credentials: dict[str, Any] | None = None,
+) -> None:
+    body: dict[str, Any] = {
         "group_ids": [group_id],
         "priority": 5,
         "confirm_mixed_channel_risk": True,
-    }, separators=(",", ":")).encode()
+    }
+    if proxy_id is not None:
+        body["proxy_id"] = proxy_id
+    if credentials is not None:
+        body["credentials"] = credentials
+    payload = json.dumps(body, separators=(",", ":")).encode()
     request = urllib.request.Request(
         config["SUB2API_URL"].rstrip("/") + f"/api/v1/admin/accounts/{int(account_id)}",
         data=payload, method="PUT",
@@ -443,13 +545,19 @@ def update_account_via_admin_api(config: dict[str, str], token: str, account_id:
         raise BatchError(f"Sub2API account update was rejected for ID {account_id}")
 
 
-def reconcile_imported_accounts(config: dict[str, str], imported_ids: list[int]) -> None:
+def reconcile_imported_accounts(
+    config: dict[str, str], imported_ids: list[int],
+    proxy_ids: dict[int, int] | None = None,
+) -> None:
     if not imported_ids:
         raise BatchError("no imported account IDs to reconcile")
     group_id = grok_group_id(config)
     token = make_admin_token(config)
     for account_id in sorted(set(imported_ids)):
-        update_account_via_admin_api(config, token, account_id, group_id)
+        update_account_via_admin_api(
+            config, token, account_id, group_id,
+            (proxy_ids or {}).get(account_id),
+        )
 
 
 def validate_import_output(payload: dict[str, Any], expected: int) -> None:
@@ -469,7 +577,10 @@ def validate_import_output(payload: dict[str, Any], expected: int) -> None:
         raise BatchError("Sub2API group-binding verification failed")
 
 
-def validate_imported_account_state(config: dict[str, str], imported_ids: list[int]) -> list[dict[str, Any]]:
+def validate_imported_account_state(
+    config: dict[str, str], imported_ids: list[int],
+    expected_proxy_ids: dict[int, int] | None = None,
+) -> list[dict[str, Any]]:
     if not imported_ids or any(not isinstance(item, int) or item < 1 for item in imported_ids):
         raise BatchError("invalid imported account IDs")
     ids = ",".join(str(item) for item in sorted(set(imported_ids)))
@@ -480,7 +591,8 @@ select a.id, a.platform, a.type, a.status, a.schedulable,
          select 1 from account_groups ag join groups g on g.id=ag.group_id
          where ag.account_id=a.id and g.deleted_at is null and g.name='{group}'
        ), coalesce(a.credentials->>'base_url',''),
-       (select count(*) from account_groups all_ag where all_ag.account_id=a.id)
+       (select count(*) from account_groups all_ag where all_ag.account_id=a.id),
+       coalesce(a.proxy_id, 0)
 from accounts a
 where a.deleted_at is null and a.id in ({ids})
 order by a.id;
@@ -495,7 +607,7 @@ order by a.id;
     rows: list[dict[str, Any]] = []
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 8:
+        if len(parts) != 9:
             continue
         row = {
             "id": int(parts[0]),
@@ -506,6 +618,7 @@ order by a.id;
             "bound_group": parts[5] == "t",
             "base_url": parts[6],
             "group_count": int(parts[7]),
+            "proxy_id": int(parts[8]),
         }
         rows.append(row)
     if len(rows) != len(set(imported_ids)):
@@ -516,6 +629,10 @@ order by a.id;
         or row["status"] != "active" or not row["schedulable"] or not row["bound_group"]
         or row["base_url"] != config["GROK_ACCOUNT_BASE_URL"].rstrip("/")
         or row["group_count"] != 1
+        or (
+            row["id"] in (expected_proxy_ids or {})
+            and row["proxy_id"] != (expected_proxy_ids or {})[row["id"]]
+        )
     ]
     if invalid:
         raise BatchError("Sub2API imported accounts failed Grok group, scheduling, or CLI proxy base URL verification")
@@ -525,6 +642,12 @@ order by a.id;
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch register accounts and import one combined bundle into Sub2API")
     parser.add_argument("--count", type=int, default=1, help="registration attempts in this batch")
+    parser.add_argument("--workers", type=int, default=None, help="bounded concurrent registrations")
+    parser.add_argument(
+        "--registration-backend",
+        choices=["protocol-yescaptcha", "browser-playwright-edge"],
+        default="protocol-yescaptcha",
+    )
     parser.add_argument("--resume", nargs="?", const="latest", help="resume a failed import without registering again")
     parser.add_argument("--private-dir", default=str(PROJECT_DIR / "private"))
     parser.add_argument("--failure-policy", choices=["abort", "continue"], default="continue")
@@ -536,7 +659,104 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def run_preimport_auth_probes(
+    auth_paths: list[Path], timeout: float = 60.0,
+    proxy_by_file: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    results: list[dict[str, Any]] = []
+    for path in auth_paths:
+        try:
+            item = probe_grok_auth(
+                path,
+                timeout=timeout,
+                proxy=(proxy_by_file or {}).get(path.name, ""),
+            )
+        except Exception as exc:
+            item = {"file": path.name, "error": f"{type(exc).__name__}: {exc}"}
+        results.append(item)
+    passed = sum(1 for item in results if item.get("status") == 200 and not item.get("error"))
+    return {
+        "tested": len(results),
+        "http_200_completed": passed,
+        "passed": passed == len(results),
+        "results": results,
+    }
+
+
+def resolve_group_probe_key(config: dict[str, str]) -> str:
+    group = config["SUB2API_GROUP"].replace("'", "''")
+    proc = run([
+        "docker", "exec", config["SUB2API_POSTGRES_CONTAINER"],
+        "psql", "-U", config["SUB2API_PG_USER"], "-d", config["SUB2API_PG_DB"], "-Atc",
+        "select k.key from api_keys k join groups g on g.id=k.group_id "
+        f"where g.name='{group}' and k.status='active' and k.deleted_at is null "
+        "order by k.id desc limit 1;",
+    ])
+    key = proc.stdout.strip() if proc.returncode == 0 else ""
+    if not key:
+        raise BatchError(f"no active API key found for group {config['SUB2API_GROUP']}")
+    return key
+
+
+def validate_sub2api_proxy_ids(config: dict[str, str], proxy_pool: Any) -> None:
+    if not proxy_pool.configured:
+        return
+    expected = {int(spec.sub2api_proxy_id) for spec in proxy_pool.specs}
+    ids = ",".join(str(item) for item in sorted(expected))
+    proc = run([
+        "docker", "exec", config["SUB2API_POSTGRES_CONTAINER"],
+        "psql", "-U", config["SUB2API_PG_USER"], "-d", config["SUB2API_PG_DB"], "-Atc",
+        "select id from proxies "
+        f"where id in ({ids}) and status='active' and deleted_at is null "
+        "and (expires_at is null or expires_at > now()) order by id;",
+    ])
+    if proc.returncode != 0:
+        raise BatchError("failed to validate Sub2API proxy IDs before registration")
+    found = {int(line) for line in proc.stdout.splitlines() if line.strip().isdigit()}
+    missing = sorted(expected - found)
+    if missing:
+        raise BatchError(f"Sub2API proxy IDs are missing, inactive, deleted, or expired: {missing}")
+
+
+def run_postimport_group_probe(config: dict[str, str], timeout: float = 60.0) -> dict[str, Any]:
+    url = config["SUB2API_URL"].rstrip("/") + "/v1/responses"
+    request = urllib.request.Request(
+        url,
+        data=json.dumps({
+            "model": "grok-4.5",
+            "input": "Reply exactly: IMPORT_OK",
+            "max_output_tokens": 16,
+            "store": False,
+        }).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {resolve_group_probe_key(config)}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            raw = response.read()
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        status = exc.code
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    text = ""
+    for item in payload.get("output") or []:
+        for part in item.get("content") or []:
+            if part.get("type") == "output_text":
+                text += str(part.get("text") or "")
+    return {"status": status, "completed": payload.get("status") == "completed", "output_ok": "IMPORT_OK" in text}
+
+
 def main() -> int:
+    batch_lock = acquire_batch_lock()
     args = parse_args()
     if args.count < 1:
         raise BatchError("--count must be at least 1")
@@ -548,6 +768,25 @@ def main() -> int:
     private_dir = Path(args.private_dir).expanduser().resolve()
     runtime_file = private_dir / "runtime.env"
     config = load_env(runtime_file)
+    try:
+        configured_workers = int(config.get("GROK_MAX_REGISTRATION_WORKERS", "2") or "2")
+    except ValueError as exc:
+        raise BatchError("GROK_MAX_REGISTRATION_WORKERS must be an integer") from exc
+    workers = args.workers if args.workers is not None else configured_workers
+    if configured_workers < 1 or configured_workers > 16:
+        raise BatchError("GROK_MAX_REGISTRATION_WORKERS must be between 1 and 16")
+    if workers < 1 or workers > configured_workers:
+        raise BatchError(f"--workers must be between 1 and {configured_workers}")
+    if args.registration_backend == "browser-playwright-edge" and workers != 1:
+        raise BatchError("browser-playwright-edge requires --workers 1")
+    try:
+        proxy_pool = load_proxy_pool(config.get("GROK_PROXY_POOL_FILE", ""), config)
+    except ProxyPoolError as exc:
+        raise BatchError(str(exc)) from exc
+    if proxy_pool.configured:
+        workers = min(workers, proxy_pool.capacity)
+        if workers < 1:
+            raise BatchError("configured proxy pool has no lease capacity")
     common_keys = [
         "YESCAPTCHA_API_KEY", "IMAP_SERVER", "IMAP_PASSWORD", "MAILU_DOMAIN",
         "MAILU_DB", "MAILU_ADMIN_CONTAINER", "MAILU_FLASK_BIN",
@@ -561,6 +800,17 @@ def main() -> int:
             "SUB2API_POSTGRES_CONTAINER", "SUB2API_PG_USER", "SUB2API_PG_DB",
             "SUB2API_IMPORT_TOOL", "GROK_ACCOUNT_BASE_URL",
         ])
+        validate_sub2api_proxy_ids(config, proxy_pool)
+    proxy_health = None
+    if proxy_pool.configured:
+        try:
+            proxy_health = check_proxy_pool_health(
+                proxy_pool,
+                attempts=int(config.get("GROK_PROXY_HEALTH_ATTEMPTS", "3") or "3"),
+                timeout=float(config.get("GROK_PROXY_HEALTH_TIMEOUT", "10") or "10"),
+            )
+        except (ProxyPoolError, ValueError) as exc:
+            raise BatchError(f"proxy health preflight failed: {exc}") from exc
     if runtime_file.stat().st_mode & 0o077:
         raise BatchError(f"runtime config permissions must be 0600: {runtime_file}")
 
@@ -574,8 +824,8 @@ def main() -> int:
         manifest["bundle_normalized_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         manifest["target_group"] = config["SUB2API_GROUP"]
         manifest["target_base_url"] = config["GROK_ACCOUNT_BASE_URL"].rstrip("/")
-        manifest.update({"status": "resuming-import", "current_stage": "import-preflight"})
-        atomic_json(manifest_path, manifest)
+        manifest["status"] = "resuming-import"
+        set_manifest_stage(manifest, manifest_path, "import-preflight")
         print(f"Resuming {manifest['batch_id']}: {len(auth_paths)} accounts already registered", flush=True)
     else:
         batch_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
@@ -586,8 +836,26 @@ def main() -> int:
             "batch_id": batch_id, "requested_attempts": args.count,
             "production_import_confirmed": bool(args.confirm_production_write and not args.no_import),
             "attempts": [], "status": "running", "current_stage": "registration",
-            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "started_at": utc_now(), "last_activity_at": utc_now(),
+            "stage_started_at": utc_now(),
+            "workers": workers,
+            "registration_backend": args.registration_backend,
+            "proxy_pool": {
+                "configured": proxy_pool.configured,
+                "enabled_nodes": proxy_pool.enabled_count,
+                "mode": "pool" if proxy_pool.configured else (
+                    "legacy-single" if config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") else "direct"
+                ),
+            },
         }
+        if proxy_health is not None:
+            manifest["proxy_health"] = {
+                "checked_at": proxy_health.checked_at,
+                "healthy_refs": list(proxy_health.healthy_refs),
+                "results": list(proxy_health.results),
+                "snapshot_sha256": proxy_health.snapshot_sha256,
+                "policy": "fail-closed",
+            }
         manifest_path = batch_dir / "manifest.json"
         atomic_json(manifest_path, manifest)
         auth_paths: list[Path] = []
@@ -596,66 +864,95 @@ def main() -> int:
         registration_env = os.environ.copy()
         registration_env.update(config)
 
-        for index in range(1, args.count + 1):
-            prefix = "xai" + secrets.token_hex(3)
+        manifest_lock = threading.Lock()
+
+        def save_manifest() -> None:
+            with manifest_lock:
+                atomic_json(manifest_path, manifest)
+
+        def execute_attempt(index: int, attempt: dict[str, Any], prefix: str) -> dict[str, Any]:
             email = f"{prefix}@{config['MAILU_DOMAIN']}"
             attempt_auth_dir = batch_dir / "auth" / prefix
             attempt_auth_dir.mkdir(mode=0o700)
             result_path = batch_dir / "results" / f"{prefix}.json"
             log_path = batch_dir / "logs" / f"{prefix}.log"
-            attempt: dict[str, Any] = {
-                "index": index, "email": email, "status": "running", "stage": "mailbox",
-                "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            }
-            manifest["attempts"].append(attempt)
-            atomic_json(manifest_path, manifest)
+            attempt.update(status="running", last_activity_at=utc_now(), stage_started_at=utc_now())
             print(f"[{index}/{args.count}] creating mailbox {email}", flush=True)
             mailbox_created = False
             started = time.monotonic()
+            lease = None
             try:
+                lease = proxy_pool.acquire()
+                attempt["proxy_ref"] = lease.ref if lease else "direct"
+                if lease and lease.spec.sub2api_proxy_id is not None:
+                    attempt["sub2api_proxy_id"] = lease.spec.sub2api_proxy_id
+                save_manifest()
                 create_mailbox(config, email)
                 mailbox_created = True
-                attempt.update({"mailbox_created": True, "stage": "signup"})
-                atomic_json(manifest_path, manifest)
+                attempt["mailbox_created"] = True
+                with manifest_lock:
+                    set_manifest_stage(manifest, manifest_path, "signup", attempt=attempt)
                 env = registration_env.copy()
                 env.update({"IMAP_EMAIL": email, "IMAP_USERNAME": email, "CLIPROXYAPI_AUTH_DIR": str(attempt_auth_dir)})
+                if lease:
+                    env["GROK_ATTEMPT_PROXY_URL"] = lease.url
+                else:
+                    legacy_proxy = config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") or ""
+                    if legacy_proxy:
+                        env["GROK_ATTEMPT_PROXY_URL"] = legacy_proxy
                 stage_map = {
                     "cookie + scrape OK": "email-verification", "email verified": "turnstile",
                     "Turnstile ": "account-creation", "account created": "sso",
+                    "browser-stage=signup": "signup",
+                    "browser-stage=email-verification": "email-verification",
+                    "browser-stage=profile": "account-creation",
+                    "browser-stage=turnstile": "turnstile",
+                    "browser-stage=sso": "sso",
                     "SSO acquired": "oauth", "SSO extraction failed": "oauth",
                     "OAuth Build path": "oauth", "Build OAuth OK": "completed",
                 }
 
                 def on_registration_line(line: str) -> None:
-                    for marker, stage in stage_map.items():
-                        if marker in line:
-                            attempt["stage"] = stage
-                            atomic_json(manifest_path, manifest)
-                            break
+                    with manifest_lock:
+                        if line.strip():
+                            heartbeat_manifest(manifest, manifest_path, attempt=attempt)
+                        for marker, stage in stage_map.items():
+                            if marker in line:
+                                set_manifest_stage(manifest, manifest_path, stage, attempt=attempt)
+                                break
                     if line.strip():
                         print(f"  {line}", flush=True)
 
-                proc = run([
+                def on_registration_heartbeat() -> None:
+                    with manifest_lock:
+                        heartbeat_manifest(manifest, manifest_path, attempt=attempt)
+
+                registration_command = [
                     sys.executable, str(PROJECT_DIR / "run.py"), "-e", "imap",
                     "--cliproxyapi-auth-dir", str(attempt_auth_dir), "--result-json", str(result_path),
-                ], env=env, log=log_path, on_line=on_registration_line)
+                    "--proxy-env", "GROK_ATTEMPT_PROXY_URL",
+                    "--registration-backend", args.registration_backend,
+                ]
+                if args.registration_backend == "browser-playwright-edge" and config.get("GROK_BROWSER_HEADED", "true").lower() in {"1", "true", "yes", "on"}:
+                    registration_command.append("--browser-headed")
+                    registration_command = ["xvfb-run", "-a", *registration_command]
+                proc = run(registration_command, env=env, log=log_path, on_line=on_registration_line,
+                    on_heartbeat=on_registration_heartbeat)
                 if proc.returncode != 0:
                     raise BatchError(f"registration process exited with code {proc.returncode}")
                 result = load_single_result(result_path, email, attempt_auth_dir)
                 auth_path = Path(result["cliproxyapi_auth"])
-                auth_paths.append(auth_path)
                 attempt.update({
                     "status": "registered", "stage": "completed", "auth_file": str(auth_path),
                     "result_file": str(result_path), "duration_seconds": round(time.monotonic() - started, 1),
+                    "last_activity_at": utc_now(), "completed_at": utc_now(),
                 })
-                consecutive_failures = 0
-                print(f"[{index}/{args.count}] succeeded | total {len(auth_paths)} success, {failures} failed", flush=True)
+                return {"ok": True, "auth_path": auth_path, "index": index}
             except Exception as exc:
-                failures += 1
-                consecutive_failures += 1
                 attempt.update({
                     "status": "failed", "failed_stage": attempt.get("stage"), "error": str(exc),
                     "duration_seconds": round(time.monotonic() - started, 1),
+                    "last_activity_at": utc_now(), "completed_at": utc_now(),
                 })
                 print(f"[{index}/{args.count}] FAILED at {attempt.get('failed_stage')}: {exc}", file=sys.stderr, flush=True)
                 if args.cleanup_failed_mailboxes and mailbox_created:
@@ -670,16 +967,55 @@ def main() -> int:
                             attempt["mailbox_rollback"] = "preserved-upstream-state-unknown"
                     except Exception as cleanup_exc:
                         attempt["mailbox_rollback"] = f"failed: {cleanup_exc}"
-                if args.failure_policy == "abort" or consecutive_failures >= args.max_consecutive_failures:
-                    atomic_json(manifest_path, manifest)
-                    break
+                return {"ok": False, "index": index, "error": str(exc)}
             finally:
-                atomic_json(manifest_path, manifest)
+                proxy_pool.release(lease)
+                save_manifest()
+
+        next_index = 1
+        pending: dict[Any, int] = {}
+        aborted = False
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            while next_index <= args.count and len(pending) < workers:
+                prefix = "xai" + secrets.token_hex(3)
+                attempt = {"index": next_index, "email": f"{prefix}@{config['MAILU_DOMAIN']}", "status": "queued", "stage": "mailbox", "started_at": utc_now(), "last_activity_at": utc_now(), "stage_started_at": utc_now()}
+                manifest["attempts"].append(attempt)
+                pending[executor.submit(execute_attempt, next_index, attempt, prefix)] = next_index
+                next_index += 1
+            save_manifest()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in done:
+                    pending.pop(future)
+                    outcome = future.result()
+                    if outcome["ok"]:
+                        auth_paths.append(outcome["auth_path"])
+                        consecutive_failures = 0
+                    else:
+                        failures += 1
+                        consecutive_failures += 1
+                    if ((args.failure_policy == "abort" and not outcome["ok"])
+                            or consecutive_failures >= args.max_consecutive_failures):
+                        aborted = True
+                        manifest["abort_reason"] = "failure-policy-abort" if args.failure_policy == "abort" else "max-consecutive-failures"
+                    if not aborted and next_index <= args.count:
+                        prefix = "xai" + secrets.token_hex(3)
+                        attempt = {"index": next_index, "email": f"{prefix}@{config['MAILU_DOMAIN']}", "status": "queued", "stage": "mailbox", "started_at": utc_now(), "last_activity_at": utc_now(), "stage_started_at": utc_now()}
+                        manifest["attempts"].append(attempt)
+                        pending[executor.submit(execute_attempt, next_index, attempt, prefix)] = next_index
+                        next_index += 1
+                save_manifest()
+        if aborted:
+            manifest["unstarted_attempts"] = max(0, args.count - len(manifest["attempts"]))
 
         manifest["successful_registrations"] = len(auth_paths)
         manifest["failed_registrations"] = failures
         if not auth_paths:
             manifest["status"] = "failed-no-successes"
+            manifest.setdefault(
+                "error_summary",
+                f"No registrations succeeded; {manifest.get('unstarted_attempts', 0)} attempts were not started",
+            )
             atomic_json(manifest_path, manifest)
             return 1
         bundle_path = batch_dir / "bundle" / "sub2api-bundle.json"
@@ -700,17 +1036,70 @@ def main() -> int:
         print(f"DONE: {len(auth_paths)} registrations; bundle saved without production import")
         return 0 if not failures else 1
 
+    set_manifest_stage(manifest, manifest_path, "upstream-preprobe")
+    legacy_proxy = config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") or ""
+    proxy_by_file: dict[str, str] = {}
+    for attempt in manifest.get("attempts") or []:
+        auth_file = Path(str(attempt.get("auth_file") or ""))
+        if not auth_file.name:
+            continue
+        ref = str(attempt.get("proxy_ref") or "")
+        if proxy_pool.configured and ref and ref != "direct":
+            proxy_by_file[auth_file.name] = proxy_pool.url_for(ref)
+        elif legacy_proxy:
+            proxy_by_file[auth_file.name] = legacy_proxy
+    preprobe = run_preimport_auth_probes(auth_paths, proxy_by_file=proxy_by_file)
+    manifest["preimport_auth_probes"] = preprobe
+    atomic_json(manifest_path, manifest)
+    if not preprobe["passed"]:
+        failed_files = {
+            str(item.get("file") or "")
+            for item in preprobe["results"]
+            if item.get("status") != 200 or item.get("error")
+        }
+        if args.import_partial:
+            for attempt in manifest.get("attempts") or []:
+                auth_file = Path(str(attempt.get("auth_file") or ""))
+                if auth_file.name in failed_files:
+                    attempt.update({
+                        "status": "probe-failed",
+                        "failed_stage": "upstream-preprobe",
+                        "error": "Grok auth probe did not return HTTP 200",
+                    })
+            auth_paths = [path for path in auth_paths if path.name not in failed_files]
+            if not auth_paths:
+                manifest.update({"status": "preimport-probe-failed", "error_summary": "No auth probes passed"})
+                atomic_json(manifest_path, manifest)
+                raise BatchError(manifest["error_summary"])
+            bundle_path = batch_dir / "bundle" / "sub2api-bundle.json"
+            atomic_json(bundle_path, build_bundle(auth_paths, config["GROK_ACCOUNT_BASE_URL"].rstrip("/")))
+            manifest.update({
+                "bundle": str(bundle_path),
+                "bundle_sha256": hashlib.sha256(bundle_path.read_bytes()).hexdigest(),
+                "successful_registrations": len(auth_paths),
+                "failed_registrations": len(failed_files),
+                "probe_quarantined": sorted(failed_files),
+            })
+            atomic_json(manifest_path, manifest)
+        else:
+            manifest.update({
+                "status": "preimport-probe-failed",
+                "error_summary": f"Only {preprobe['http_200_completed']}/{preprobe['tested']} auth probes returned HTTP 200",
+            })
+            atomic_json(manifest_path, manifest)
+            raise BatchError(manifest["error_summary"])
+
     import_result_path = batch_dir / "import" / "result.json"
     import_log_path = batch_dir / "import" / "helper.log"
     existing = resolve_existing_account_ids(config, auth_paths)
     missing_auth_paths = [path for path in auth_paths if auth_token_hash(path) not in existing]
     manifest.update({
-        "status": "importing", "current_stage": "sub2api-preflight",
+        "status": "importing",
         "existing_account_count": len(existing), "missing_account_count": len(missing_auth_paths),
     })
     for key in ("error_summary", "import_exit_code", "completed_at"):
         manifest.pop(key, None)
-    atomic_json(manifest_path, manifest)
+    set_manifest_stage(manifest, manifest_path, "sub2api-preflight")
     import_payload: dict[str, Any]
     if missing_auth_paths:
         pending_bundle_path = batch_dir / "bundle" / "pending-sub2api-bundle.json"
@@ -726,10 +1115,13 @@ def main() -> int:
             "--backup-dir", str(batch_dir / "backup"),
             "--group", config["SUB2API_GROUP"],
         ]
-        manifest["current_stage"] = "sub2api-import"
-        atomic_json(manifest_path, manifest)
+        set_manifest_stage(manifest, manifest_path, "sub2api-import")
         print(f"Importing {len(missing_auth_paths)} missing accounts; {len(existing)} already exist", flush=True)
-        proc = run(command, env=helper_env(config), log=import_log_path)
+        proc = run(
+            command, env=helper_env(config), log=import_log_path,
+            on_line=lambda line: heartbeat_manifest(manifest, manifest_path),
+            on_heartbeat=lambda: heartbeat_manifest(manifest, manifest_path),
+        )
         if proc.returncode != 0:
             manifest["status"] = "import-failed"
             manifest["import_exit_code"] = proc.returncode
@@ -758,34 +1150,51 @@ def main() -> int:
         atomic_json(manifest_path, manifest)
         raise BatchError("not every auth token resolved to an active Sub2API account")
     all_ids = sorted(resolved.values())
-    manifest["current_stage"] = "grok-reconcile"
-    atomic_json(manifest_path, manifest)
+    proxy_ids_by_account: dict[int, int] = {}
+    for attempt in manifest.get("attempts") or []:
+        if attempt.get("status") != "registered" or not attempt.get("auth_file"):
+            continue
+        proxy_id = attempt.get("sub2api_proxy_id")
+        if not isinstance(proxy_id, int) or proxy_id < 1:
+            continue
+        digest = auth_token_hash(Path(str(attempt["auth_file"])))
+        account_id = resolved.get(digest)
+        if account_id is not None:
+            proxy_ids_by_account[account_id] = proxy_id
+    set_manifest_stage(manifest, manifest_path, "grok-reconcile")
     try:
-        reconcile_imported_accounts(config, all_ids)
-        exact_state = validate_imported_account_state(config, all_ids)
+        reconcile_imported_accounts(config, all_ids, proxy_ids_by_account)
+        exact_state = validate_imported_account_state(config, all_ids, proxy_ids_by_account)
     except Exception as exc:
         manifest.update({"status": "import-verification-failed", "error_summary": str(exc)})
         atomic_json(manifest_path, manifest)
         raise BatchError(f"Sub2API Grok reconciliation failed: {exc}") from exc
+    set_manifest_stage(manifest, manifest_path, "sub2api-postprobe")
+    postprobe = run_postimport_group_probe(config)
+    manifest["postimport_group_probe"] = postprobe
+    atomic_json(manifest_path, manifest)
+    if not (postprobe.get("status") == 200 and postprobe.get("completed") and postprobe.get("output_ok")):
+        manifest.update({"status": "postimport-probe-failed", "error_summary": f"Sub2API group probe failed: {postprobe}"})
+        atomic_json(manifest_path, manifest)
+        raise BatchError(manifest["error_summary"])
     for key in ("error_summary", "import_exit_code"):
         manifest.pop(key, None)
     preprobe = manifest.get("preimport_auth_probes") or {}
     preprobe_ok = (
-        preprobe.get("tested") == len(auth_paths)
-        and preprobe.get("http_200_completed") == len(auth_paths)
+        preprobe.get("http_200_completed") == len(auth_paths)
     )
     manifest.update({
         "status": "imported-preprobed" if preprobe_ok else "imported-not-probed",
         "current_stage": "completed",
-        "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "completed_at": utc_now(), "last_activity_at": utc_now(),
         "import_result": str(import_result_path),
         "imported_ids": all_ids,
         "backup": import_payload.get("backup", {}),
         "exact_account_state": exact_state,
-        "upstream_usability_probes": "preimport-passed; postimport-not-run" if preprobe_ok else "not-run",
+        "upstream_usability_probes": "preimport-passed; postimport-passed",
     })
     atomic_json(manifest_path, manifest)
-    probe_note = "pre-import upstream probes passed; post-import probe not repeated" if preprobe_ok else "upstream probe not run"
+    probe_note = "pre-import auth probes and post-import Sub2API probe passed"
     print(f"IMPORTED: {len(auth_paths)} accounts are ready in the Grok group; {probe_note}")
     return 0
 
