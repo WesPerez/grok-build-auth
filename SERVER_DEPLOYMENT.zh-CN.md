@@ -135,7 +135,8 @@ python3 run.py -e imap \
 bash start_web_console.sh
 ```
 
-在服务器桌面浏览器访问 `http://127.0.0.1:17860`。控制台只监听本机回环地址，
+本机访问 `http://127.0.0.1:17860`；当前服务器通过带 Basic Auth 的 Nginx
+入口 `https://weesai.com/grok/` 访问。控制台自身只监听本机回环地址，
 提供以下功能：
 
 - 启动前自动检查私有配置、权限、Mailu、PostgreSQL、导入工具和 Sub2API 地址。
@@ -146,6 +147,8 @@ bash start_web_console.sh
 - 对 `import-failed` 批次提供“继续导入”，复用已有 auth 和 bundle，不重新注册。
 
 可选 systemd 服务模板位于 `deploy/grok-batch-console.service`。
+Nginx 子路径反向代理模板位于 `deploy/nginx-grok-location.conf`，必须保留
+Basic Auth 或替换为等效的访问控制，不能将生产操作接口匿名暴露到公网。
 
 ### 命令行备用入口
 

@@ -1,4 +1,5 @@
 const $ = (id) => document.getElementById(id);
+const BASE = location.pathname.startsWith("/grok/") ? "/grok" : "";
 let state = { task: null, batches: [], checks: [] };
 
 function esc(value) {
@@ -59,10 +60,10 @@ function renderActive() {
 
 async function refresh() {
   try {
-    state = await (await fetch("/api/state", {cache:"no-store"})).json();
+    state = await (await fetch(`${BASE}/api/state`, {cache:"no-store"})).json();
     renderChecks(); renderBatches(); renderActive();
     if (state.task) {
-      const data = await (await fetch("/api/task-log", {cache:"no-store"})).json();
+      const data = await (await fetch(`${BASE}/api/task-log`, {cache:"no-store"})).json();
       $("liveLog").textContent = data.log || "任务已启动，等待输出...";
       $("liveLog").scrollTop = $("liveLog").scrollHeight;
     }
@@ -81,7 +82,7 @@ async function startBatch() {
   try {
     const count = Number($("count").value);
     if (!window.confirm(`将注册 ${count} 个外部账号，并在成功后写入生产 Sub2API。是否继续？`)) return;
-    await post("/api/start", {count, import_partial:$("partial").checked, cleanup_failed_mailboxes:$("cleanup").checked});
+    await post(`${BASE}/api/start`, {count, import_partial:$("partial").checked, cleanup_failed_mailboxes:$("cleanup").checked});
     toast(`已开始处理 ${count} 个账号`); await refresh();
   } catch (error) { toast(error.message); }
 }
@@ -89,7 +90,7 @@ async function startBatch() {
 async function resumeBatch(id) {
   try {
     if (!window.confirm(`将复用批次 ${id} 的现有账号继续写入生产 Sub2API，不会重新注册。是否继续？`)) return;
-    await post(`/api/resume/${id}`); toast("已继续导入，不会重新注册"); await refresh();
+    await post(`${BASE}/api/resume/${id}`); toast("已继续导入，不会重新注册"); await refresh();
   }
   catch (error) { toast(error.message); }
 }
