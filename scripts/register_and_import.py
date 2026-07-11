@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,8 +20,11 @@ import sqlite3
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlparse
+import urllib.error
+import urllib.request
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -169,6 +173,26 @@ def require_config(config: dict[str, str], keys: list[str]) -> None:
         raise BatchError("missing runtime config keys: " + ", ".join(missing))
 
 
+def validate_grok_target_config(config: dict[str, str]) -> str:
+    if config.get("SUB2API_GROUP") != "grok":
+        raise BatchError("SUB2API_GROUP must be grok for Grok OAuth accounts")
+    value = config.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/")
+    parsed = urlparse(value)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "grok-cli-proxy"
+        or parsed.port != 8080
+        or parsed.path != "/v1"
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise BatchError("GROK_ACCOUNT_BASE_URL must be http://grok-cli-proxy:8080/v1")
+    return value
+
+
 def mailbox_exists(db_path: Path, email: str) -> bool:
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         row = conn.execute("select count(*) from user where email = ?", (email,)).fetchone()
@@ -263,7 +287,7 @@ def upstream_account_created(path: Path) -> bool | None:
         return None
 
 
-def account_from_auth(auth_path: Path) -> dict[str, Any]:
+def account_from_auth(auth_path: Path, account_base_url: str) -> dict[str, Any]:
     auth = json.loads(auth_path.read_text(encoding="utf-8"))
     token = str(auth.get("access_token") or "")
     if not token:
@@ -280,9 +304,11 @@ def account_from_auth(auth_path: Path) -> dict[str, Any]:
             "email": auth.get("email", ""),
             "sub": auth.get("sub", ""),
             "expires_at": auth.get("expires_at"),
+            "base_url": account_base_url,
         },
         "extra": {
-            "base_url": auth.get("base_url", "https://cli-chat-proxy.grok.com/v1"),
+            "base_url": account_base_url,
+            "oauth_source_base_url": auth.get("base_url", "https://cli-chat-proxy.grok.com/v1"),
             "redirect_uri": auth.get("redirect_uri", ""),
             "token_endpoint": auth.get("token_endpoint", ""),
             "access_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
@@ -293,14 +319,137 @@ def account_from_auth(auth_path: Path) -> dict[str, Any]:
     }
 
 
-def build_bundle(auth_paths: list[Path]) -> dict[str, Any]:
+def build_bundle(auth_paths: list[Path], account_base_url: str) -> dict[str, Any]:
+    accounts = [account_from_auth(path, account_base_url) for path in auth_paths]
+    emails = [str(account.get("name") or "").lower() for account in accounts]
+    hashes = [str((account.get("extra") or {}).get("access_token_sha256") or "") for account in accounts]
+    if len(set(emails)) != len(emails) or len(set(hashes)) != len(hashes):
+        raise BatchError("duplicate email or access-token hash in batch auth files")
     return {
         "type": "sub2api-data",
         "version": 1,
         "exported_at": dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
         "proxies": [],
-        "accounts": [account_from_auth(path) for path in auth_paths],
+        "accounts": accounts,
     }
+
+
+def auth_token_hash(auth_path: Path) -> str:
+    auth = json.loads(auth_path.read_text(encoding="utf-8"))
+    token = str(auth.get("access_token") or "")
+    if not token:
+        raise BatchError(f"auth file has no access token: {auth_path}")
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def resolve_existing_account_ids(config: dict[str, str], auth_paths: list[Path]) -> dict[str, int]:
+    wanted = {auth_token_hash(path) for path in auth_paths}
+    proc = run([
+        "docker", "exec", config["SUB2API_POSTGRES_CONTAINER"],
+        "psql", "-U", config["SUB2API_PG_USER"], "-d", config["SUB2API_PG_DB"],
+        "-At", "-F", "\t", "-c",
+        "select id, coalesce(credentials->>'access_token','') from accounts where deleted_at is null and platform='grok' and type='oauth';",
+    ])
+    if proc.returncode != 0:
+        raise BatchError("failed to resolve existing Sub2API accounts")
+    found: dict[str, int] = {}
+    for line in proc.stdout.splitlines():
+        parts = line.split("\t", 1)
+        if len(parts) != 2 or not parts[1]:
+            continue
+        digest = hashlib.sha256(parts[1].encode()).hexdigest()
+        if digest in wanted:
+            if digest in found:
+                raise BatchError("duplicate active Sub2API access-token hash detected")
+            found[digest] = int(parts[0])
+    return found
+
+
+def backup_database(config: dict[str, str], backup_dir: Path) -> dict[str, Any]:
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = dt.datetime.now().strftime("%Y%m%d%H%M%S")
+    path = backup_dir / f"pre-grok-reconcile-{stamp}.dump"
+    with path.open("wb") as handle:
+        proc = subprocess.run([
+            "docker", "exec", config["SUB2API_POSTGRES_CONTAINER"],
+            "pg_dump", "-U", config["SUB2API_PG_USER"], "-d", config["SUB2API_PG_DB"],
+            "-Fc", "--no-owner", "--no-acl",
+        ], stdout=handle, stderr=subprocess.PIPE, check=False)
+    if proc.returncode != 0:
+        path.unlink(missing_ok=True)
+        raise BatchError("Sub2API backup failed before reconciliation")
+    path.chmod(0o600)
+    return {"path": str(path), "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def grok_group_id(config: dict[str, str]) -> int:
+    group = config["SUB2API_GROUP"].replace("'", "''")
+    proc = run([
+        "docker", "exec", config["SUB2API_POSTGRES_CONTAINER"],
+        "psql", "-U", config["SUB2API_PG_USER"], "-d", config["SUB2API_PG_DB"], "-Atc",
+        f"select id from groups where deleted_at is null and name='{group}' and platform='grok' and status='active' and is_exclusive and require_oauth_only order by id limit 1;",
+    ])
+    if proc.returncode != 0 or not proc.stdout.strip().isdigit():
+        raise BatchError("valid exclusive Grok group not found")
+    return int(proc.stdout.strip())
+
+
+def make_admin_token(config: dict[str, str]) -> str:
+    helper_path = Path(config["SUB2API_IMPORT_TOOL"])
+    spec = importlib.util.spec_from_file_location("sub2api_live_tool_runtime", helper_path)
+    if spec is None or spec.loader is None:
+        raise BatchError("cannot load Sub2API import helper for admin authentication")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    args = SimpleNamespace(
+        postgres_container=config["SUB2API_POSTGRES_CONTAINER"],
+        pg_user=config["SUB2API_PG_USER"], pg_db=config["SUB2API_PG_DB"], timeout=120,
+    )
+    try:
+        env = module.load_env(Path(config["SUB2API_ENV"]))
+        admin = module.get_admin(args)
+        return module.make_admin_jwt(env, admin, 600)
+    except Exception as exc:
+        raise BatchError("failed to create short-lived in-memory Sub2API admin token") from exc
+
+
+def update_account_via_admin_api(config: dict[str, str], token: str, account_id: int, group_id: int) -> None:
+    payload = json.dumps({
+        "credentials": {"base_url": config["GROK_ACCOUNT_BASE_URL"].rstrip("/")},
+        "group_ids": [group_id],
+        "priority": 5,
+        "confirm_mixed_channel_risk": True,
+    }, separators=(",", ":")).encode()
+    request = urllib.request.Request(
+        config["SUB2API_URL"].rstrip("/") + f"/api/v1/admin/accounts/{int(account_id)}",
+        data=payload, method="PUT",
+        headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+    )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=120) as response:
+            raw = response.read().decode("utf-8", "replace")
+            status = response.status
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        status = exc.code
+    if status >= 400:
+        raise BatchError(f"Sub2API account update failed for ID {account_id}: HTTP {status}")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise BatchError(f"Sub2API account update returned non-JSON for ID {account_id}") from exc
+    if parsed.get("code") not in (0, "0"):
+        raise BatchError(f"Sub2API account update was rejected for ID {account_id}")
+
+
+def reconcile_imported_accounts(config: dict[str, str], imported_ids: list[int]) -> None:
+    if not imported_ids:
+        raise BatchError("no imported account IDs to reconcile")
+    group_id = grok_group_id(config)
+    token = make_admin_token(config)
+    for account_id in sorted(set(imported_ids)):
+        update_account_via_admin_api(config, token, account_id, group_id)
 
 
 def validate_import_output(payload: dict[str, Any], expected: int) -> None:
@@ -330,7 +479,8 @@ select a.id, a.platform, a.type, a.status, a.schedulable,
        exists (
          select 1 from account_groups ag join groups g on g.id=ag.group_id
          where ag.account_id=a.id and g.deleted_at is null and g.name='{group}'
-       )
+       ), coalesce(a.credentials->>'base_url',''),
+       (select count(*) from account_groups all_ag where all_ag.account_id=a.id)
 from accounts a
 where a.deleted_at is null and a.id in ({ids})
 order by a.id;
@@ -345,7 +495,7 @@ order by a.id;
     rows: list[dict[str, Any]] = []
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 6:
+        if len(parts) != 8:
             continue
         row = {
             "id": int(parts[0]),
@@ -354,6 +504,8 @@ order by a.id;
             "status": parts[3],
             "schedulable": parts[4] == "t",
             "bound_group": parts[5] == "t",
+            "base_url": parts[6],
+            "group_count": int(parts[7]),
         }
         rows.append(row)
     if len(rows) != len(set(imported_ids)):
@@ -362,9 +514,11 @@ order by a.id;
         row for row in rows
         if row["platform"] != "grok" or row["type"] != "oauth"
         or row["status"] != "active" or not row["schedulable"] or not row["bound_group"]
+        or row["base_url"] != config["GROK_ACCOUNT_BASE_URL"].rstrip("/")
+        or row["group_count"] != 1
     ]
     if invalid:
-        raise BatchError("Sub2API imported accounts are not all active, schedulable grok/oauth rows in the target group")
+        raise BatchError("Sub2API imported accounts failed Grok group, scheduling, or CLI proxy base URL verification")
     return rows
 
 
@@ -397,14 +551,15 @@ def main() -> int:
     common_keys = [
         "YESCAPTCHA_API_KEY", "IMAP_SERVER", "IMAP_PASSWORD", "MAILU_DOMAIN",
         "MAILU_DB", "MAILU_ADMIN_CONTAINER", "MAILU_FLASK_BIN",
-        "MAILU_IMAP_CONTAINER", "MAILU_MAIL_ROOT",
+        "MAILU_IMAP_CONTAINER", "MAILU_MAIL_ROOT", "SUB2API_GROUP", "GROK_ACCOUNT_BASE_URL",
     ]
     require_config(config, common_keys)
+    validate_grok_target_config(config)
     if not args.no_import:
         require_config(config, [
             "SUB2API_ENV", "SUB2API_URL", "SUB2API_GROUP",
             "SUB2API_POSTGRES_CONTAINER", "SUB2API_PG_USER", "SUB2API_PG_DB",
-            "SUB2API_IMPORT_TOOL",
+            "SUB2API_IMPORT_TOOL", "GROK_ACCOUNT_BASE_URL",
         ])
     if runtime_file.stat().st_mode & 0o077:
         raise BatchError(f"runtime config permissions must be 0600: {runtime_file}")
@@ -414,6 +569,11 @@ def main() -> int:
         manifest, bundle_path, auth_paths = load_resume_bundle(batch_dir)
         manifest_path = batch_dir / "manifest.json"
         failures = int(manifest.get("failed_registrations") or 0)
+        atomic_json(bundle_path, build_bundle(auth_paths, config["GROK_ACCOUNT_BASE_URL"].rstrip("/")))
+        manifest["bundle_sha256"] = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        manifest["bundle_normalized_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        manifest["target_group"] = config["SUB2API_GROUP"]
+        manifest["target_base_url"] = config["GROK_ACCOUNT_BASE_URL"].rstrip("/")
         manifest.update({"status": "resuming-import", "current_stage": "import-preflight"})
         atomic_json(manifest_path, manifest)
         print(f"Resuming {manifest['batch_id']}: {len(auth_paths)} accounts already registered", flush=True)
@@ -523,9 +683,11 @@ def main() -> int:
             atomic_json(manifest_path, manifest)
             return 1
         bundle_path = batch_dir / "bundle" / "sub2api-bundle.json"
-        atomic_json(bundle_path, build_bundle(auth_paths))
+        atomic_json(bundle_path, build_bundle(auth_paths, config["GROK_ACCOUNT_BASE_URL"].rstrip("/")))
         manifest["bundle"] = str(bundle_path)
         manifest["bundle_sha256"] = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+        manifest["target_group"] = config["SUB2API_GROUP"]
+        manifest["target_base_url"] = config["GROK_ACCOUNT_BASE_URL"].rstrip("/")
 
     if failures and not args.import_partial:
         manifest["status"] = "registration-failed-import-skipped"
@@ -540,51 +702,85 @@ def main() -> int:
 
     import_result_path = batch_dir / "import" / "result.json"
     import_log_path = batch_dir / "import" / "helper.log"
-    command = [
-        sys.executable, config["SUB2API_IMPORT_TOOL"], "import",
-        "--bundle", str(bundle_path),
-        "--postgres-container", config["SUB2API_POSTGRES_CONTAINER"],
-        "--pg-user", config["SUB2API_PG_USER"],
-        "--pg-db", config["SUB2API_PG_DB"],
-        "--env-file", config["SUB2API_ENV"],
-        "--base-url", config["SUB2API_URL"],
-        "--backup-dir", str(batch_dir / "backup"),
-        "--group", config["SUB2API_GROUP"],
-    ]
-    manifest.update({"status": "importing", "current_stage": "sub2api-import"})
-    atomic_json(manifest_path, manifest)
-    print(f"Importing {len(auth_paths)} accounts into Sub2API", flush=True)
-    proc = run(command, env=helper_env(config), log=import_log_path)
-    if proc.returncode != 0:
-        manifest["status"] = "import-failed"
-        manifest["import_exit_code"] = proc.returncode
-        manifest["error_summary"] = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "Sub2API helper failed"
-        atomic_json(manifest_path, manifest)
-        raise BatchError(
-            f"Sub2API import failed: {manifest['error_summary']}. "
-            f"Resume this batch instead of registering again: --resume {manifest['batch_id']} --confirm-production-write"
-        )
-    try:
-        import_payload = json.loads(proc.stdout)
-        validate_import_output(import_payload, len(auth_paths))
-        exact_state = validate_imported_account_state(config, import_payload["imported_ids"])
-    except Exception as exc:
-        manifest["status"] = "import-verification-failed"
-        atomic_json(manifest_path, manifest)
-        raise BatchError(f"Sub2API import verification failed: {exc}") from exc
-    atomic_json(import_result_path, import_payload)
+    existing = resolve_existing_account_ids(config, auth_paths)
+    missing_auth_paths = [path for path in auth_paths if auth_token_hash(path) not in existing]
     manifest.update({
-        "status": "completed",
+        "status": "importing", "current_stage": "sub2api-preflight",
+        "existing_account_count": len(existing), "missing_account_count": len(missing_auth_paths),
+    })
+    for key in ("error_summary", "import_exit_code", "completed_at"):
+        manifest.pop(key, None)
+    atomic_json(manifest_path, manifest)
+    import_payload: dict[str, Any]
+    if missing_auth_paths:
+        pending_bundle_path = batch_dir / "bundle" / "pending-sub2api-bundle.json"
+        atomic_json(pending_bundle_path, build_bundle(missing_auth_paths, config["GROK_ACCOUNT_BASE_URL"].rstrip("/")))
+        command = [
+            sys.executable, config["SUB2API_IMPORT_TOOL"], "import",
+            "--bundle", str(pending_bundle_path),
+            "--postgres-container", config["SUB2API_POSTGRES_CONTAINER"],
+            "--pg-user", config["SUB2API_PG_USER"],
+            "--pg-db", config["SUB2API_PG_DB"],
+            "--env-file", config["SUB2API_ENV"],
+            "--base-url", config["SUB2API_URL"],
+            "--backup-dir", str(batch_dir / "backup"),
+            "--group", config["SUB2API_GROUP"],
+        ]
+        manifest["current_stage"] = "sub2api-import"
+        atomic_json(manifest_path, manifest)
+        print(f"Importing {len(missing_auth_paths)} missing accounts; {len(existing)} already exist", flush=True)
+        proc = run(command, env=helper_env(config), log=import_log_path)
+        if proc.returncode != 0:
+            manifest["status"] = "import-failed"
+            manifest["import_exit_code"] = proc.returncode
+            manifest["error_summary"] = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "Sub2API helper failed"
+            atomic_json(manifest_path, manifest)
+            raise BatchError(
+                f"Sub2API import failed: {manifest['error_summary']}. "
+                f"Resume this batch instead of registering again: --resume {manifest['batch_id']} --confirm-production-write"
+            )
+        try:
+            import_payload = json.loads(proc.stdout)
+            validate_import_output(import_payload, len(missing_auth_paths))
+        except Exception as exc:
+            manifest.update({"status": "import-verification-failed", "error_summary": str(exc)})
+            atomic_json(manifest_path, manifest)
+            raise BatchError(f"Sub2API helper result verification failed: {exc}") from exc
+    else:
+        print(f"All {len(auth_paths)} accounts already exist; reconciling the interrupted import", flush=True)
+        backup = backup_database(config, batch_dir / "backup")
+        import_payload = {"reconciled_existing": True, "backup": backup, "imported_ids": []}
+
+    atomic_json(import_result_path, import_payload)
+    resolved = resolve_existing_account_ids(config, auth_paths)
+    if len(resolved) != len(auth_paths):
+        manifest.update({"status": "import-verification-failed", "error_summary": "not every auth token resolved to an active account"})
+        atomic_json(manifest_path, manifest)
+        raise BatchError("not every auth token resolved to an active Sub2API account")
+    all_ids = sorted(resolved.values())
+    manifest["current_stage"] = "grok-reconcile"
+    atomic_json(manifest_path, manifest)
+    try:
+        reconcile_imported_accounts(config, all_ids)
+        exact_state = validate_imported_account_state(config, all_ids)
+    except Exception as exc:
+        manifest.update({"status": "import-verification-failed", "error_summary": str(exc)})
+        atomic_json(manifest_path, manifest)
+        raise BatchError(f"Sub2API Grok reconciliation failed: {exc}") from exc
+    for key in ("error_summary", "import_exit_code"):
+        manifest.pop(key, None)
+    manifest.update({
+        "status": "imported-not-probed",
         "current_stage": "completed",
         "completed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "import_result": str(import_result_path),
-        "imported_ids": import_payload.get("imported_ids", []),
+        "imported_ids": all_ids,
         "backup": import_payload.get("backup", {}),
         "exact_account_state": exact_state,
         "upstream_usability_probes": "not-run",
     })
     atomic_json(manifest_path, manifest)
-    print(f"DONE: {len(auth_paths)} accounts imported; one backup created")
+    print(f"IMPORTED: {len(auth_paths)} accounts are ready in the Grok group; upstream probe not run")
     return 0
 
 

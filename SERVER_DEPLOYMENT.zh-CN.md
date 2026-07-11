@@ -12,7 +12,8 @@
 
 最后一步会写入生产 Sub2API。脚本要求显式传入
 `--confirm-production-write`，并由导入工具在写入前创建一个 PostgreSQL
-备份。无论批次指定 1 次还是 100 次，每批只产生一个备份。
+备份。正常的一次生产导入尝试只产生一个备份；导入中断后再次续跑时会基于
+当时最新数据库状态再创建一个恢复点。
 
 ## 2. 文件布局
 
@@ -96,7 +97,8 @@ MAILU_MAIL_ROOT=/mail
 
 SUB2API_ENV=<sub2api-deployment-env>
 SUB2API_URL=<local-admin-api-url>
-SUB2API_GROUP=openai
+SUB2API_GROUP=grok
+GROK_ACCOUNT_BASE_URL=http://grok-cli-proxy:8080/v1
 SUB2API_POSTGRES_CONTAINER=<postgres-container>
 SUB2API_PG_USER=<postgres-user>
 SUB2API_PG_DB=<postgres-database>
@@ -140,11 +142,13 @@ bash start_web_console.sh
 提供以下功能：
 
 - 启动前自动检查私有配置、权限、Mailu、PostgreSQL、导入工具和 Sub2API 地址。
+- 区分阻塞异常和非阻塞告警；例如失效的 Responses 备用链路会显示告警但不误报为核心配置正常。
 - 只填写注册数量即可开始，生产写入前显示明确确认。
-- 显示每个账号当前处于邮箱、验证、Turnstile、账号创建、SSO、OAuth 或导入阶段。
+- 显示每个账号当前处于邮箱、验证、Turnstile、账号创建、SSO、OAuth、导入或 Grok 收口阶段。
 - 实时显示成功、失败、剩余、已导入数量及后台日志。
 - 保存并展示历史批次、失败步骤、异常摘要和备份状态。
-- 对 `import-failed` 批次提供“继续导入”，复用已有 auth 和 bundle，不重新注册。
+- 对失败批次提供“继续导入”，复用已有 auth，不重新注册；旧 bundle 会按当前
+  `grok` 分组和内网 CLI 头代理配置重新生成。
 
 可选 systemd 服务模板位于 `deploy/grok-batch-console.service`。
 Nginx 子路径反向代理模板位于 `deploy/nginx-grok-location.conf`，必须保留
@@ -192,13 +196,18 @@ bash register_and_import.sh --count 100 --confirm-production-write
 6. 校验退出码、结果邮箱、auth 路径边界、auth 内邮箱及 access token。
 7. 将成功 auth 聚合成一个 bundle，`exported_at` 使用当前 UTC 时间。
 8. 根据失败策略决定是否导入。
-9. 只调用一次 `sub2api_live_tool.py import`。
-10. 导入工具创建一次数据库备份、调用管理 API、绑定目标组并验证。
-11. 按精确导入 ID 验证 `platform=grok`、`type=oauth`、`status=active`、
-    `schedulable=true` 且已绑定目标组，全部匹配时才打印 `DONE`。
+9. 按 token hash 区分已存在账号和缺失账号，只把缺失子集交给导入工具。
+10. 导入工具创建数据库备份、调用管理 API；已存在账号则创建收口前备份。
+11. 对本批精确 ID 统一设置内网 CLI 代理、移除非 Grok 绑定并绑定 Grok 组。
+12. 按精确 ID 验证 `platform=grok`、`type=oauth`、`status=active`、
+    `schedulable=true`、唯一 Grok 分组和 `credentials.base_url`，全部匹配时才
+    标记为“已导入 · 未探测”。
 
 该验证证明数据库行和分组状态正常，不等于上游账号可用性验证。脚本不会
 自动调用额度、配额或模型探测接口，manifest 会明确记录 `not-run`。
+导入后如需通过 Sub2API/CC Switch 调用 Grok Responses，还必须核对分组平台、
+CLI 请求头和真实上游响应；完整流程见
+[`SUB2API_GROK_RESPONSES.zh-CN.md`](SUB2API_GROK_RESPONSES.zh-CN.md)。
 
 ## 8. 失败与恢复
 
@@ -212,9 +221,9 @@ bash register_and_import.sh --count 100 --confirm-production-write
 | 备份失败 | 导入工具在写入前退出 | 修复磁盘/数据库后重试 |
 | 导入返回部分失败 | 不打印 `DONE`，保留整批前备份 | 按 manifest 和 token hash 精确核对 |
 
-Sub2API API 导入不是跨服务事务。发生部分写入时，脚本不会自动恢复生产
-数据库。恢复必须由用户明确指定备份、目标容器和允许的数据丢失窗口后，
-再按照受控发布流程执行。
+Sub2API API 导入不是跨服务事务。发生部分写入时，续跑会按 token hash 识别
+已存在账号，只导入缺失子集，再对本批精确 ID 收口分组和 base URL。数据库
+整库恢复仍必须由用户明确指定备份、目标容器和允许的数据丢失窗口后执行。
 
 ## 9. 幂等与重复项
 
@@ -232,7 +241,7 @@ Sub2API API 导入不是跨服务事务。发生部分写入时，脚本不会�
 - `manifest.json`
 - 原始 auth JSON
 - 导入结果
-- 每批唯一数据库备份，至少保留到导入验收完成
+- 每次生产导入或恢复尝试对应的数据库备份，至少保留到导入验收完成
 
 可在确认不再需要后归档：
 

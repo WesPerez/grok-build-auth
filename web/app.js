@@ -13,7 +13,7 @@ function toast(message) {
 
 function statusInfo(status) {
   const map = {
-    completed: ["完成", "success"], running: ["注册中", "running"], importing: ["导入中", "running"],
+    completed: ["完成", "success"], "imported-not-probed": ["已导入 · 未探测", "success"], running: ["注册中", "running"], importing: ["导入中", "running"],
     "resuming-import": ["继续导入", "running"], "import-failed": ["导入失败", "failure"],
     "import-verification-failed": ["验证失败", "failure"], "registered-not-imported": ["待导入", "pending"],
     "registration-failed-import-skipped": ["部分失败", "failure"], "failed-no-successes": ["注册失败", "failure"],
@@ -22,13 +22,15 @@ function statusInfo(status) {
 }
 
 function renderChecks() {
-  $("checks").innerHTML = state.checks.map(item => `<div class="check-row"><span class="${item.ok ? "ok" : "bad"}">${item.ok ? "✓" : "×"}</span><div><strong>${esc(item.name)}</strong><span>${esc(item.detail)}</span></div></div>`).join("");
+  $("checks").innerHTML = state.checks.map(item => `<div class="check-row"><span class="${item.warning ? "warn" : item.ok ? "ok" : "bad"}">${item.warning ? "!" : item.ok ? "✓" : "×"}</span><div><strong>${esc(item.name)}</strong><span>${esc(item.detail)}</span></div></div>`).join("");
   const good = state.checks.filter(x => x.ok).length;
-  $("systemLine").textContent = state.checks.length && good === state.checks.length ? "运行环境正常，可开始新批次" : `${good}/${state.checks.length} 项检查通过，请先处理异常`;
+  const warnings = state.checks.filter(x => x.warning).length;
+  const blocking = state.checks.filter(x => !x.ok && x.blocking !== false).length;
+  $("systemLine").textContent = blocking ? `${good}/${state.checks.length} 项检查通过，请先处理阻塞异常` : warnings ? `核心环境正常，可操作；另有 ${warnings} 项非阻塞告警` : "运行环境正常，可开始新批次";
 }
 
 function attemptRow(item) {
-  const stage = item.failed_stage || item.stage || "等待";
+  const stage = item.failed_stage || item.stage || (item.status === "registered" ? "已注册" : "等待");
   return `<div class="attempt"><span>${esc(item.email || "正在分配邮箱")}</span><span>${esc(item.status || "等待")}</span><span>${esc(stage)}</span>${item.error ? `<span class="error">${esc(item.error)}</span>` : ""}</div>`;
 }
 
@@ -51,7 +53,7 @@ function renderActive() {
   const badge = $("activeBadge");
   badge.textContent = task.running ? "运行中" : task.exit_code === 0 ? "已完成" : "执行失败";
   badge.className = `badge ${task.running ? "running" : task.exit_code === 0 ? "success" : "failure"}`;
-  const latest = state.batches[0] || {};
+  const latest = state.batches.find(batch => task.batch_id && batch.batch_id === task.batch_id) || state.batches.find(batch => ["running","importing","resuming-import"].includes(batch.status)) || state.batches[0] || {};
   const total = latest.requested_attempts || 0, success = latest.registered_count || 0, failed = latest.failed_count || 0;
   const done = success + failed;
   $("progressBar").style.width = `${total ? Math.min(100, done / total * 85 + (latest.status === "completed" ? 15 : 0)) : 5}%`;
@@ -67,7 +69,7 @@ async function refresh() {
       $("liveLog").textContent = data.log || "任务已启动，等待输出...";
       $("liveLog").scrollTop = $("liveLog").scrollHeight;
     }
-    $("startButton").disabled = Boolean(state.task?.running) || state.checks.some(x => !x.ok);
+    $("startButton").disabled = Boolean(state.task?.running) || state.checks.some(x => !x.ok && x.blocking !== false);
   } catch (error) { toast(`刷新失败：${error.message}`); }
 }
 

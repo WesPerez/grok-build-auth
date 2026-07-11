@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import subprocess
 import threading
 from urllib.parse import urlparse
@@ -42,6 +43,7 @@ def batch_summary(path: Path) -> dict:
     manifest["running_count"] = sum(item.get("status") == "running" for item in attempts)
     manifest["resumable"] = manifest.get("status") in {
         "import-failed", "import-verification-failed", "registered-not-imported",
+        "registration-failed-import-skipped",
     }
     manifest["has_backup"] = any((path / "backup").glob("*.dump"))
     return manifest
@@ -68,7 +70,7 @@ class TaskManager:
                 self.task["exit_code"] = code
             return dict(self.task) if self.task else None
 
-    def start(self, command: list[str], kind: str, subject: str) -> dict:
+    def start(self, command: list[str], kind: str, subject: str, batch_id: str = "") -> dict:
         with self.lock:
             if self.process is not None and self.process.poll() is None:
                 raise RuntimeError("another task is already running")
@@ -85,7 +87,7 @@ class TaskManager:
             log_file.close()
             self.task = {
                 "id": task_id, "kind": kind, "subject": subject, "pid": self.process.pid,
-                "running": True, "exit_code": None, "log_path": str(log_path),
+                "running": True, "exit_code": None, "log_path": str(log_path), "batch_id": batch_id,
             }
             return dict(self.task)
 
@@ -96,8 +98,8 @@ MANAGER = TaskManager()
 def doctor() -> list[dict]:
     checks: list[dict] = []
 
-    def add(name: str, ok: bool, detail: str) -> None:
-        checks.append({"name": name, "ok": ok, "detail": detail})
+    def add(name: str, ok: bool, detail: str, *, blocking: bool = True, warning: bool = False) -> None:
+        checks.append({"name": name, "ok": ok, "detail": detail, "blocking": blocking, "warning": warning})
 
     runtime = PRIVATE_DIR / "runtime.env"
     add("私有配置", runtime.is_file(), "private/runtime.env 已找到" if runtime.is_file() else "缺少 private/runtime.env")
@@ -114,6 +116,7 @@ def doctor() -> list[dict]:
             "MAILU_IMAP_CONTAINER", "MAILU_MAIL_ROOT", "SUB2API_ENV",
             "SUB2API_URL", "SUB2API_GROUP", "SUB2API_POSTGRES_CONTAINER",
             "SUB2API_PG_USER", "SUB2API_PG_DB", "SUB2API_IMPORT_TOOL",
+            "GROK_ACCOUNT_BASE_URL",
         ]
         missing = [key for key in required if not values.get(key)]
         add("必要字段", not missing, "字段完整" if not missing else "缺少: " + ", ".join(missing))
@@ -121,6 +124,14 @@ def doctor() -> list[dict]:
         add("Sub2API 地址", parsed.hostname in {"127.0.0.1", "localhost", "::1"}, "本机回环地址，不使用外部代理" if parsed.hostname in {"127.0.0.1", "localhost", "::1"} else "必须使用本机回环地址")
         helper = Path(values.get("SUB2API_IMPORT_TOOL", ""))
         add("导入工具", helper.is_file(), str(helper) if helper.is_file() else "导入工具路径无效")
+        grok_target_ok = (
+            values.get("SUB2API_GROUP") == "grok"
+            and values.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/") == "http://grok-cli-proxy:8080/v1"
+        )
+        add(
+            "Grok 导入目标", grok_target_ok,
+            "grok 组 → Docker 内网 CLI 头代理" if grok_target_ok else "必须配置 grok 组和 http://grok-cli-proxy:8080/v1",
+        )
         mailu_db = Path(values.get("MAILU_DB", ""))
         add("Mailu 数据库", mailu_db.is_file(), str(mailu_db) if mailu_db.is_file() else "Mailu 数据库路径无效")
         sub2api_env = Path(values.get("SUB2API_ENV", ""))
@@ -134,10 +145,49 @@ def doctor() -> list[dict]:
             proc = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", container], text=True, capture_output=True) if container else None
             ok = bool(proc and proc.returncode == 0 and proc.stdout.strip() == "true")
             add(label, ok, f"容器 {container} 正常" if ok else f"容器 {container or '(未配置)'} 不可用")
+        proxy = subprocess.run(
+            ["docker", "inspect", "-f", "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", "sub2api-prod-grok-cli-proxy"],
+            text=True, capture_output=True,
+        )
+        proxy_ok = proxy.returncode == 0 and proxy.stdout.strip() == "true healthy"
+        add("Grok CLI 头代理", proxy_ok, "容器 healthy" if proxy_ok else "sub2api-prod-grok-cli-proxy 不健康")
+        override = subprocess.run(
+            ["docker", "exec", "sub2api-prod", "sh", "-lc", "test \"$XAI_ALLOW_UNSAFE_URL_OVERRIDES\" = true"],
+            capture_output=True,
+        )
+        add("内网上游许可", override.returncode == 0, "Sub2API 允许受控内网 Grok 上游" if override.returncode == 0 else "XAI_ALLOW_UNSAFE_URL_OVERRIDES 未启用")
+        connectivity = subprocess.run(
+            ["docker", "exec", "sub2api-prod", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://grok-cli-proxy:8080/healthz"],
+            capture_output=True,
+        )
+        add("容器内连通性", connectivity.returncode == 0, "Sub2API 可访问 Grok CLI 头代理" if connectivity.returncode == 0 else "Sub2API 无法访问 grok-cli-proxy")
+        pg_container = values.get("SUB2API_POSTGRES_CONTAINER", "")
+        pg_user = values.get("SUB2API_PG_USER", "")
+        pg_db = values.get("SUB2API_PG_DB", "")
+        group_check = subprocess.run([
+            "docker", "exec", pg_container, "psql", "-U", pg_user, "-d", pg_db, "-Atc",
+            "select count(*) from groups where deleted_at is null and name='grok' and platform='grok' and status='active' and is_exclusive and require_oauth_only;",
+        ], text=True, capture_output=True) if pg_container and pg_user and pg_db else None
+        group_ok = bool(group_check and group_check.returncode == 0 and group_check.stdout.strip() == "1")
+        add("Grok 生产分组", group_ok, "独占且仅 OAuth 的 grok 分组已就绪" if group_ok else "grok 生产分组缺失或配置不正确")
         admin = values.get("MAILU_ADMIN_CONTAINER", "")
         flask_bin = values.get("MAILU_FLASK_BIN", "")
         proc = subprocess.run(["docker", "exec", admin, "test", "-x", flask_bin], capture_output=True) if admin and flask_bin else None
         add("Mailu CLI", bool(proc and proc.returncode == 0), flask_bin if proc and proc.returncode == 0 else "Mailu Flask CLI 不可执行")
+        wooai_config = Path("/etc/nginx/sites-available/wooai")
+        config_text = wooai_config.read_text(encoding="utf-8", errors="replace") if wooai_config.is_file() else ""
+        configured_8787 = "127.0.0.1:8787" in config_text
+        with socket.socket() as probe:
+            probe.settimeout(0.3)
+            port_8787_up = probe.connect_ex(("127.0.0.1", 8787)) == 0
+        if configured_8787 and not port_8787_up:
+            add(
+                "Responses 网关", False,
+                "主上游 127.0.0.1:8787 未监听；当前会回退 13080，但会产生连接拒绝日志",
+                blocking=False, warning=True,
+            )
+        else:
+            add("Responses 网关", True, "Responses 主上游可用或未配置失效端口")
     return checks
 
 
@@ -218,7 +268,9 @@ class Handler(BaseHTTPRequestHandler):
                     "python3", str(PROJECT_DIR / "scripts/register_and_import.py"),
                     "--resume", batch_id, "--confirm-production-write",
                 ]
-                task = MANAGER.start(command, "resume-import", f"继续导入 {batch_id}")
+                if manifest.get("failed_registrations"):
+                    command.append("--import-partial")
+                task = MANAGER.start(command, "resume-import", f"继续导入 {batch_id}", batch_id=batch_id)
                 return self.send_json(task, HTTPStatus.ACCEPTED)
             if self.path == "/api/doctor":
                 return self.send_json({"checks": doctor()})

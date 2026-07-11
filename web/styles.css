@@ -29,7 +29,7 @@ summary { cursor: pointer; font-size: 13px; color: #45515d; }
 .section-title { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .check-row { display: grid; grid-template-columns: 20px 1fr; gap: 8px; padding: 8px 0; border-bottom: 1px solid #edf0f2; font-size: 12px; }
 .check-row strong { display: block; font-size: 13px; }
-.ok { color: #14734f; } .bad { color: #b43838; }
+.ok { color: #14734f; } .bad { color: #b43838; } .warn { color: #a86800; }
 .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }
 .badge.running { background: #e9f3ff; color: #175b91; }
 .badge.success { background: #e3f5ec; color: #176844; }

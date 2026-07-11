@@ -122,7 +122,9 @@ cp .env.example .env
 
 **永远不要**把 `.env`、`private/` 或 token 目录提交进 Git。服务器批量部署见
 [`SERVER_DEPLOYMENT.zh-CN.md`](SERVER_DEPLOYMENT.zh-CN.md)，私有目录初始化见
-[`private.example/README.md`](private.example/README.md)。
+[`private.example/README.md`](private.example/README.md)。Sub2API 的 Grok 分组、
+Responses 路由、CLI 请求头兼容代理、验证和回滚见
+[`SUB2API_GROK_RESPONSES.zh-CN.md`](SUB2API_GROK_RESPONSES.zh-CN.md)。
 
 服务器日常操作推荐使用本机网页控制台：
 
@@ -217,10 +219,11 @@ python xai_build_quota_probe.py --auth-dir ./cliproxyapi_auth
 ├── NOTICE                         # 具有约束力的使用须知（必读）
 ├── LICENSE                        # MIT
 ├── README.md / README.en.md
+├── SUB2API_GROK_RESPONSES.zh-CN.md # Sub2API Grok Responses 接入与兼容代理
 ├── SECURITY.md
 ├── run.py                         # 主入口
 ├── register_and_import.sh         # 服务器批量包装器
-├── scripts/register_and_import.py # 单批一次备份/导入的编排器
+├── scripts/register_and_import.py # 批量注册、导入和中断恢复编排器
 ├── private.example/               # 私有配置空模板
 ├── xai_oauth_login.py
 ├── xai_oauth_export_cliproxyapi.py
