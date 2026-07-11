@@ -6,10 +6,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-import xai_build_quota_probe as quota
-
-
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import xai_build_quota_probe as quota
 
 
 class EntrypointTests(unittest.TestCase):
