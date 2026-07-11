@@ -29,6 +29,7 @@ from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 from . import grpcweb
 from .solver import YesCaptchaSolver
+from .security import redact_text, sanitize_url
 from .xai_oauth import (
     AUTHORIZATION_ENDPOINT,
     CLIPROXYAPI_GROK_BASE_URL,
@@ -188,6 +189,8 @@ class ProtocolOAuthClient:
         if not cookies:
             return
         for name, value in cookies.items():
+            if name != "sso":
+                continue
             try:
                 # Prefer domain-scoped cookies for accounts.x.ai
                 self._s.cookies.set(name, value, domain="accounts.x.ai")
@@ -196,11 +199,11 @@ class ProtocolOAuthClient:
                     self._s.cookies.set(name, value)
                 except Exception:
                     pass
-        self._log(f"loaded {len(cookies)} cookies into OAuth session")
+        self._log("loaded allowlisted cookies into OAuth session")
 
     def _log(self, msg: str) -> None:
         if self.debug:
-            print(f"  [oauth-protocol] {msg}")
+            print(f"  [oauth-protocol] {redact_text(msg)}")
 
     def _get(self, url: str, *, allow_redirects: bool = True, headers: Optional[Dict[str, str]] = None):
         h = {
@@ -327,7 +330,7 @@ class ProtocolOAuthClient:
             }
 
         self._set_sso_cookie(session_jwt)
-        self._log(f"CreateSession OK session_jwt={session_jwt[:24]}...")
+        self._log("CreateSession OK")
         return {
             "ok": True,
             "error": None,
@@ -534,7 +537,7 @@ class ProtocolOAuthClient:
                 success = str(cfg.get("success_url") or "")
             if token:
                 self._set_sso_cookie(token)
-                self._log(f"applied set-cookie token as sso ({token[:16]}...)")
+                self._log("applied allowlisted set-cookie token")
             # Hit the set-cookie endpoint so domain cookies are written.
             resp = self._get(setter_url, allow_redirects=False)
             loc = resp.headers.get("location") or resp.headers.get("Location") or ""

@@ -32,6 +32,15 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
+from .security import (
+    format_loopback_host,
+    mask_email,
+    redact_text,
+    secure_json_write,
+    set_restrictive_umask,
+    validate_cliproxyapi_base_url,
+    validate_loopback_host,
+)
 
 
 ISSUER = "https://auth.x.ai"
@@ -216,7 +225,7 @@ def exchange_code_for_token(
         proxies=proxies,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"token exchange failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"token exchange failed: HTTP {resp.status_code}")
     token = resp.json()
     now = int(time.time())
     if "expires_in" in token and "expires_at" not in token:
@@ -248,7 +257,7 @@ def refresh_access_token(
         proxies=proxies,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"refresh failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"refresh failed: HTTP {resp.status_code}")
     token = resp.json()
     now = int(time.time())
     if "expires_in" in token and "expires_at" not in token:
@@ -272,7 +281,7 @@ def fetch_userinfo(access_token: str, *, timeout: float = 30.0, proxy: str = "")
         proxies=proxies,
     )
     if resp.status_code != 200:
-        return {"_error": f"HTTP {resp.status_code}", "_body": resp.text[:300]}
+        return {"_error": f"HTTP {resp.status_code}"}
     return resp.json()
 
 
@@ -284,7 +293,7 @@ def save_oauth_record(
     output_dir: Optional[str | Path] = None,
 ) -> Path:
     target = Path(output_dir) if output_dir else default_output_dir()
-    target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     id_payload = parse_jwt_payload(str(token.get("id_token") or ""))
     email = ""
@@ -311,8 +320,7 @@ def save_oauth_record(
         "expires_at": token.get("expires_at", None),
         "scope": token.get("scope", ""),
     }
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    return secure_json_write(path, record)
 
 
 def _safe_email_for_filename(email: str) -> str:
@@ -344,6 +352,7 @@ def build_cliproxyapi_auth_record(
     to xAI API-credit billing and can return 402 even when Grok CLI works.
     """
 
+    base_url = validate_cliproxyapi_base_url(base_url)
     id_payload = parse_jwt_payload(str(token.get("id_token") or "")) or {}
     email = ""
     if userinfo:
@@ -404,7 +413,7 @@ def save_cliproxyapi_auth_record(
         headers=headers,
     )
     target = Path(auth_dir)
-    target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
     email = str(record.get("email") or "")
     safe = _safe_email_for_filename(email)
     # Avoid "xai-xai..." when the address local-part already starts with "xai".
@@ -414,8 +423,7 @@ def save_cliproxyapi_auth_record(
     else:
         fname = f"xai-{safe}"
     path = target / f"{fname}.json"
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    return secure_json_write(path, record)
 
 
 def _start_pkce_callback_server(
@@ -426,6 +434,7 @@ def _start_pkce_callback_server(
     port: int,
 ) -> tuple[ThreadingHTTPServer, _CallbackState, str, str, str, str]:
     """Start local callback server and return (server, sink, auth_url, redirect_uri, state, verifier)."""
+    host = validate_loopback_host(host)
     state = secrets.token_hex(16)
     nonce = secrets.token_hex(16)
     verifier = generate_code_verifier()
@@ -433,7 +442,7 @@ def _start_pkce_callback_server(
     sink = _CallbackState()
     server = ThreadingHTTPServer((host, int(port)), _make_callback_handler(state, sink))
     actual_port = int(server.server_address[1])
-    redirect_uri = f"http://{host}:{actual_port}/callback"
+    redirect_uri = f"http://{format_loopback_host(host)}:{actual_port}/callback"
     auth_url = build_authorization_url(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -467,7 +476,7 @@ def _finalize_oauth_code(
         proxy=proxy,
     )
     userinfo = fetch_userinfo(str(token.get("access_token") or ""), proxy=proxy)
-    path = save_oauth_record(token, userinfo=userinfo, client_id=client_id, output_dir=output_dir)
+    path = None
     cliproxy_path: Optional[Path] = None
     if cliproxyapi_auth_dir:
         cliproxy_path = save_cliproxyapi_auth_record(
@@ -681,23 +690,15 @@ def login_with_playwright(
                 if session_cookies:
                     cookie_list = []
                     for name, value in session_cookies.items():
-                        if not name or value is None:
+                        if name != "sso" or value is None:
                             continue
-                        cookie_list.append(
-                            {
-                                "name": str(name),
-                                "value": str(value),
-                                "domain": ".x.ai",
-                                "path": "/",
-                            }
-                        )
-                        # also accounts host
                         cookie_list.append(
                             {
                                 "name": str(name),
                                 "value": str(value),
                                 "domain": "accounts.x.ai",
                                 "path": "/",
+                                "secure": True,
                             }
                         )
                     if cookie_list:
@@ -765,6 +766,7 @@ def complete_build_oauth(
     interactive_fallback: bool = False,
     yescaptcha_key: Optional[str] = None,
     protocol: bool = True,
+    playwright_fallback: bool = False,
     debug: bool = False,
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
@@ -796,7 +798,12 @@ def complete_build_oauth(
             )
         except Exception as exc:
             errors.append(f"protocol OAuth failed: {exc}")
-            print(f"Protocol OAuth failed ({exc})")
+            print(f"Protocol OAuth failed ({redact_text(exc)})")
+            if not playwright_fallback:
+                raise RuntimeError("protocol OAuth failed; Playwright fallback is disabled") from exc
+
+    if not playwright_fallback:
+        raise RuntimeError("Playwright fallback is disabled")
 
     try:
         return login_with_playwright(
@@ -838,6 +845,7 @@ def default_cliproxyapi_auth_dir() -> Path:
 
 
 def main() -> None:
+    set_restrictive_umask()
     import argparse
 
     p = argparse.ArgumentParser(description="xAI/Grok OAuth PKCE login")
@@ -884,10 +892,7 @@ def main() -> None:
     )
     print("xAI OAuth login successful")
     if result.email:
-        print(f"email: {result.email}")
-    print(f"access_token: {result.access_token[:24]}...")
-    if result.refresh_token:
-        print(f"refresh_token: {result.refresh_token[:24]}...")
+        print(f"email: {mask_email(result.email)}")
     if result.path:
         print(f"saved: {result.path}")
     if result.cliproxyapi_path:

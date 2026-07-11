@@ -1,0 +1,22 @@
+请接手部署并加固 grok-build-auth。先完整阅读仓库中的 README.md、SECURITY.md、NOTICE、SERVER_AGENT_HANDOFF.zh-CN.md，再开始操作。
+
+目标：在我的 Linux 服务器上建立一个可审计、最小权限、仅用于我自有账号的 Grok Build OAuth/CLIProxyAPI auth 生成流程。
+
+硬性要求：
+1. 不要直接运行上游真实注册/OAuth 链路。先固定上游 commit 9f94e5b4c78272b06bd1899d648854db279924d2，建立 hardening 分支并完成手册第 3 节全部安全修改。
+2. 不把密码、SSO、验证码、access/refresh/id token、cookie、OAuth code 或代理凭据打印到日志或提交 Git。
+3. 敏感目录 0700、文件 0600，使用 umask 077 和原子写入；只保留 CLIProxyAPI 实际需要的一份 auth JSON。
+4. OAuth callback 只能绑定 loopback；所有携带 token 的目标必须精确 allowlist 到 https://cli-chat-proxy.grok.com。
+5. 生成依赖锁文件并固定部署 commit；不要自动跟随 upstream/main。
+6. 默认使用已有、归我所有的账号完成 OAuth。不要批量注册、不要定时运行、不要使用 count>1 或 threads>1。
+7. 任何账号创建、验证码求解、浏览器授权、模型额度探测、GitHub 建仓/推送等外部副作用，在执行前说明目标、影响和所需授权。环境或账号归属不清时停止。
+8. 不开放公网端口，不安装反向代理；CLIProxyAPI 若另行部署，单独审计其绑定地址和鉴权。
+
+交付物：
+- 加固补丁和逐项说明；
+- requirements-lock.txt；
+- 无秘密的环境变量模板；
+- 安装/升级/回滚命令；
+- 测试结果与 git diff；
+- 首次真实运行前的最终确认清单；
+- 若需要我的输入，只列出无法从服务器现状确定的密钥、账号授权和仓库权限，不要求我做可由 Agent 自动完成的普通操作。

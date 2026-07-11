@@ -25,6 +25,7 @@ import base64
 import time
 import threading
 import argparse
+import secrets
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -47,6 +48,7 @@ from xconsole_client.xai_oauth import (
     default_cliproxyapi_auth_dir,
 )
 from xconsole_client.oauth_protocol import extract_cookies_from_auth_client
+from xconsole_client.security import mask_email, redact_text, set_restrictive_umask, validate_cliproxyapi_base_url
 
 # -- secrets from environment only ---------------------------------------
 YESCAPTCHA_KEY = os.environ.get("YESCAPTCHA_API_KEY", "")
@@ -90,17 +92,6 @@ def _make_email_provider(backend: str):
         raise ValueError(f"unknown email backend: {backend}")
 
 
-def _save_account_bundle(result: dict, output_dir: Path) -> Path:
-    """Persist a combined signup+oauth record for later tooling."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    email = str(result.get("email") or "unknown")
-    safe = "".join(ch if ch.isalnum() or ch in "._-@" else "_" for ch in email) or "unknown"
-    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    path = output_dir / f"account_{safe}_{ts}.json"
-    path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
-
-
 def register_one(
     index: int,
     email_backend: str = "tempmail",
@@ -113,21 +104,18 @@ def register_one(
     oauth_debug: bool = False,
     cliproxyapi_auth_dir: Optional[str | Path] = None,
     cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
-    accounts_output_dir: Optional[str | Path] = None,
 ) -> dict:
     """Run signup (+ optional Build OAuth export). Thread-safe."""
     if not YESCAPTCHA_KEY:
         return {
             "email": "",
-            "password": "",
-            "sso": None,
-            "oauth_access_token": None,
+            "sso_ok": False,
             "cliproxyapi_auth": None,
             "error": "YESCAPTCHA_API_KEY 环境变量未设置",
         }
 
     # Per-client signup_url — never mutate global C.SIGNUP_URL under concurrency.
-    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL)
+    c = XConsoleAuthClient(debug=False, signup_url=SIGNUP_URL, proxy=PROXY or None)
     email = ""
     password = ""
     sso = None
@@ -140,12 +128,12 @@ def register_one(
 
         # 2. email
         email, receiver = _make_email_provider(email_backend)
-        password = f"Pw{os.urandom(6).hex()}!a#A"
-        _log(index, f"email: {email}")
+        password = f"Pw{secrets.token_urlsafe(24)}!a#A"
+        _log(index, f"email: {mask_email(email)}")
 
         c.create_email_validation_code(email)
         code = receiver.wait_for_code(timeout=120)
-        _log(index, f"code: {code}")
+        _log(index, "email verification code received")
         c.verify_email_validation_code(email, code)
         c.validate_password(email, password)
         _log(index, "email verified")
@@ -167,36 +155,27 @@ def register_one(
             _log(index, f"FAIL create_account HTTP {res.http_status}")
             return {
                 "email": email,
-                "password": password,
-                "sso": None,
-                "oauth_access_token": None,
+                "sso_ok": False,
                 "cliproxyapi_auth": None,
                 "error": f"HTTP {res.http_status}",
             }
         _log(index, "account created")
 
         # 5. SSO (retries + RSC chain + grok.com fallback inside client)
-        sso = c.fetch_sso_token(email=email, password=password, save=True, retries=3)
+        sso = c.fetch_sso_token(email=email, password=password, save=False, retries=3)
         if not sso:
             _log(index, "FAIL SSO extraction")
             return {
                 "email": email,
-                "password": password,
-                "sso": None,
-                "oauth_access_token": None,
+                "sso_ok": False,
                 "cliproxyapi_auth": None,
                 "error": "SSO failed",
             }
-        payload = json.loads(base64.urlsafe_b64decode(sso.split(".")[1] + "=="))
-        _log(index, f"SSO saved  session_id={payload.get('session_id', '?')[:12]}...")
+        _log(index, "SSO acquired in memory")
 
         result = {
             "email": email,
-            "password": password,
-            "sso": sso,
-            "oauth_access_token": None,
-            "oauth_refresh_token": None,
-            "oauth_record": None,
+            "sso_ok": True,
             "cliproxyapi_auth": None,
             "build_base_url": cliproxyapi_base_url,
             "error": None,
@@ -207,10 +186,6 @@ def register_one(
             auth_dir = Path(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else default_cliproxyapi_auth_dir()
             # Reuse signup session cookies so OAuth can skip password login when possible.
             session_cookies = extract_cookies_from_auth_client(c)
-            # Grok SSO JWT (from fetch_sso_token) also works as accounts.x.ai `sso` cookie.
-            if sso:
-                session_cookies = dict(session_cookies or {})
-                session_cookies.setdefault("sso", sso)
             _log(index, f"OAuth Build path → {auth_dir}  (cookies={len(session_cookies)})")
             with _oauth_lock:
                 oauth = complete_build_oauth(
@@ -224,35 +199,26 @@ def register_one(
                     interactive_fallback=oauth_interactive_fallback,
                     yescaptcha_key=YESCAPTCHA_KEY,
                     protocol=oauth_protocol,
+                    playwright_fallback=False,
                     debug=oauth_debug,
                     session_cookies=session_cookies,
                     auth_client=c,
                 )
-            result["oauth_access_token"] = oauth.access_token
-            result["oauth_refresh_token"] = oauth.refresh_token
-            result["oauth_record"] = str(oauth.path) if oauth.path else None
             result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
             _log(
                 index,
-                f"Build OAuth OK  access={oauth.access_token[:20]}...  "
-                f"cliproxy={oauth.cliproxyapi_path.name if oauth.cliproxyapi_path else '?'}",
+                "Build OAuth OK; CLIProxyAPI auth written",
             )
         else:
             _log(index, "OAuth skipped (--no-oauth)")
 
-        if accounts_output_dir:
-            bundle = _save_account_bundle(result, Path(accounts_output_dir))
-            result["account_bundle"] = str(bundle)
-
         return result
 
     except Exception as e:
-        _log(index, f"ERROR: {e}")
+        _log(index, f"ERROR: {redact_text(e)}")
         return {
             "email": email,
-            "password": password,
-            "sso": sso,
-            "oauth_access_token": None,
+            "sso_ok": bool(sso),
             "cliproxyapi_auth": None,
             "error": str(e),
         }
@@ -264,13 +230,14 @@ def register_one(
 
 
 def main():
+    set_restrictive_umask()
     global _total, _t0
     default_auth = str(default_cliproxyapi_auth_dir())
     p = argparse.ArgumentParser(
         description="grok-build-auth: x.ai register + SSO + Grok Build OAuth (CLIProxyAPI-ready)",
     )
-    p.add_argument("-n", "--count", type=int, default=1, help="账号数量")
-    p.add_argument("-t", "--threads", type=int, default=1, help="并发线程数（注册阶段；OAuth 串行）")
+    p.add_argument("-n", "--count", type=int, choices=[1], default=1, help="账号数量（服务器版仅允许 1）")
+    p.add_argument("-t", "--threads", type=int, choices=[1], default=1, help="并发线程数（服务器版仅允许 1）")
     p.add_argument(
         "-e", "--email",
         choices=["tempmail", "cloudflare"],
@@ -313,17 +280,8 @@ def main():
         action="store_true",
         help="协议/Playwright 失败时回退到系统浏览器手动登录",
     )
-    p.add_argument(
-        "--oauth-debug",
-        action="store_true",
-        help="打印协议 OAuth 调试日志",
-    )
-    p.add_argument(
-        "--accounts-output-dir",
-        default=str(Path(__file__).resolve().parent / "accounts_output"),
-        help="合并账号记录输出目录",
-    )
     args = p.parse_args()
+    args.cliproxyapi_base_url = validate_cliproxyapi_base_url(args.cliproxyapi_base_url)
 
     _total = args.count
     _t0 = time.time()
@@ -345,10 +303,9 @@ def main():
         oauth_timeout=args.oauth_timeout,
         oauth_interactive_fallback=args.oauth_interactive_fallback,
         oauth_protocol=not args.no_oauth_protocol,
-        oauth_debug=args.oauth_debug,
+        oauth_debug=False,
         cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,
         cliproxyapi_base_url=args.cliproxyapi_base_url,
-        accounts_output_dir=args.accounts_output_dir,
     )
 
     if args.count == 1:
@@ -364,8 +321,8 @@ def main():
                 _results.append(f.result())
 
     # summary
-    ok_build = [r for r in _results if r.get("cliproxyapi_auth") or (r.get("sso") and not do_oauth)]
-    ok_sso = [r for r in _results if r.get("sso")]
+    ok_build = [r for r in _results if r.get("cliproxyapi_auth") or (r.get("sso_ok") and not do_oauth)]
+    ok_sso = [r for r in _results if r.get("sso_ok")]
     fail = [r for r in _results if r.get("error")]
     print(f"\n{'=' * 50}")
     print(
@@ -375,12 +332,12 @@ def main():
     )
     print(f"{'=' * 50}")
     for r in _results:
-        email = r.get("email") or "?"
+        email = mask_email(r.get("email") or "")
         if r.get("cliproxyapi_auth"):
             print(f"  {email:40s}  BUILD  {r['cliproxyapi_auth']}")
-        elif r.get("sso") and not do_oauth:
-            print(f"  {email:40s}  SSO    {r['sso'][:36]}...")
-        elif r.get("sso") and r.get("error"):
+        elif r.get("sso_ok") and not do_oauth:
+            print(f"  {email:40s}  SSO OK")
+        elif r.get("sso_ok") and r.get("error"):
             print(f"  {email:40s}  SSO-ok OAuth-FAIL: {r.get('error')}")
         else:
             print(f"  {email:40s}  FAIL: {r.get('error', '?')}")
