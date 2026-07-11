@@ -77,7 +77,7 @@ flowchart LR
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+ (the server batch workflow is verified on Python 3.12)
 - YesCaptcha (or createTask-compatible) API key for Turnstile  
 - Tempmail.lol API key **or** your own Cloudflare D1 alias mailbox  
 - Optional HTTP(S) proxy  
@@ -96,7 +96,7 @@ git clone https://github.com/<you>/grok-build-auth.git
 cd grok-build-auth
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install --require-hashes -r requirements-lock.txt
 cp .env.example .env
 # put only your own secrets in .env — never commit it
 ```
@@ -109,11 +109,11 @@ See [`.env.example`](.env.example). Never commit `.env` or runtime token directo
 
 ```bash
 python run.py -n 1
-python run.py -n 5 -t 3
 python run.py -n 1 -e cloudflare
+python run.py -n 1 -e imap
 python run.py -n 1 --no-oauth
 python run.py -n 1 --cliproxyapi-auth-dir /path/to/CLIProxyAPI/data/auth
-python run.py -n 1 --oauth-debug
+python run.py -n 1 --result-json /secure/path/result.json
 ```
 
 Helpers: `xai_oauth_login.py`, `xai_oauth_export_cliproxyapi.py`, `xai_build_quota_probe.py`.

@@ -20,6 +20,7 @@ from xconsole_client.security import (
     validate_loopback_host,
 )
 from xconsole_client.xai_oauth import build_cliproxyapi_auth_record
+from xconsole_client.client import XConsoleAuthClient
 
 
 class SecurityTests(unittest.TestCase):
@@ -72,6 +73,20 @@ class SecurityTests(unittest.TestCase):
         for value in ("abc123", "hunter2", "user:pass", "?code=abc", secret):
             self.assertNotIn(value, text)
         self.assertEqual(mask_email("alice@example.com"), "a***@example.com")
+
+    def test_sso_is_not_persisted_when_save_is_false(self):
+        client = object.__new__(XConsoleAuthClient)
+        client.debug = False
+        client._last_create_set_cookies = []
+        client._last_rsc_body = ""
+        client._fetch_sso_via_grok_home = lambda: "memory-only-token"
+        client._read_sso_from_jar = lambda: None
+        with mock.patch("xconsole_client.sso.save_sso") as save_sso:
+            token = client.fetch_sso_token(
+                email="owner@example.com", password="secret", save=False, retries=1
+            )
+        self.assertEqual(token, "memory-only-token")
+        save_sso.assert_not_called()
 
 
 if __name__ == "__main__":

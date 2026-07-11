@@ -556,8 +556,9 @@ class XConsoleAuthClient:
           2. Follow RSC JWT set-cookie chain via :class:`SSOExtractor`.
           3. Fallback: GET grok.com and re-read cookie jar.
 
-        If *save* is ``True`` (or *email* is provided), the token is persisted
-        to ``<xconsole>/sso_output/sso_<timestamp>.json``.
+        If *save* is ``True``, the token is persisted to
+        ``<xconsole>/sso_output/sso_<timestamp>.json``.  Email/password may be
+        supplied for metadata or fallback login without enabling persistence.
 
         Call this AFTER ``create_account()`` returned ``ok=True``.
         """
@@ -597,7 +598,7 @@ class XConsoleAuthClient:
                     print(f"  [sso] attempt {attempt}/{attempts} failed, retrying...")
                 _time.sleep(0.6 * attempt)
 
-        if token and (save or email):
+        if token and save:
             save_sso(token, email=email, password=password, output_dir=output_dir)
         return token
 

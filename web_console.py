@@ -110,7 +110,10 @@ def doctor() -> list[dict]:
                 values[key.strip()] = value.strip()
         required = [
             "YESCAPTCHA_API_KEY", "IMAP_SERVER", "IMAP_PASSWORD", "MAILU_DOMAIN",
-            "SUB2API_URL", "SUB2API_POSTGRES_CONTAINER", "SUB2API_IMPORT_TOOL",
+            "MAILU_DB", "MAILU_ADMIN_CONTAINER", "MAILU_FLASK_BIN",
+            "MAILU_IMAP_CONTAINER", "MAILU_MAIL_ROOT", "SUB2API_ENV",
+            "SUB2API_URL", "SUB2API_GROUP", "SUB2API_POSTGRES_CONTAINER",
+            "SUB2API_PG_USER", "SUB2API_PG_DB", "SUB2API_IMPORT_TOOL",
         ]
         missing = [key for key in required if not values.get(key)]
         add("必要字段", not missing, "字段完整" if not missing else "缺少: " + ", ".join(missing))
@@ -118,11 +121,23 @@ def doctor() -> list[dict]:
         add("Sub2API 地址", parsed.hostname in {"127.0.0.1", "localhost", "::1"}, "本机回环地址，不使用外部代理" if parsed.hostname in {"127.0.0.1", "localhost", "::1"} else "必须使用本机回环地址")
         helper = Path(values.get("SUB2API_IMPORT_TOOL", ""))
         add("导入工具", helper.is_file(), str(helper) if helper.is_file() else "导入工具路径无效")
-        for label, key in (("Mailu", "MAILU_ADMIN_CONTAINER"), ("PostgreSQL", "SUB2API_POSTGRES_CONTAINER")):
+        mailu_db = Path(values.get("MAILU_DB", ""))
+        add("Mailu 数据库", mailu_db.is_file(), str(mailu_db) if mailu_db.is_file() else "Mailu 数据库路径无效")
+        sub2api_env = Path(values.get("SUB2API_ENV", ""))
+        add("Sub2API 配置", sub2api_env.is_file(), str(sub2api_env) if sub2api_env.is_file() else "Sub2API 环境文件无效")
+        for label, key in (
+            ("Mailu Admin", "MAILU_ADMIN_CONTAINER"),
+            ("Mailu IMAP", "MAILU_IMAP_CONTAINER"),
+            ("PostgreSQL", "SUB2API_POSTGRES_CONTAINER"),
+        ):
             container = values.get(key, "")
             proc = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", container], text=True, capture_output=True) if container else None
             ok = bool(proc and proc.returncode == 0 and proc.stdout.strip() == "true")
             add(label, ok, f"容器 {container} 正常" if ok else f"容器 {container or '(未配置)'} 不可用")
+        admin = values.get("MAILU_ADMIN_CONTAINER", "")
+        flask_bin = values.get("MAILU_FLASK_BIN", "")
+        proc = subprocess.run(["docker", "exec", admin, "test", "-x", flask_bin], capture_output=True) if admin and flask_bin else None
+        add("Mailu CLI", bool(proc and proc.returncode == 0), flask_bin if proc and proc.returncode == 0 else "Mailu Flask CLI 不可执行")
     return checks
 
 
