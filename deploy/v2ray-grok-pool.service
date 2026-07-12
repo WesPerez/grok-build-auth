@@ -1,9 +1,12 @@
 [Unit]
 Description=V2Ray Grok Registration Proxy Pool
-After=network.target
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ip -4 addr show | grep -q "inet 172.18.0.1/16" && exit 0; sleep 1; done; exit 1'
 ExecStart=/usr/bin/v2ray/v2ray run -config /etc/v2ray/grok_pool.json
 Restart=on-failure
 RestartSec=5

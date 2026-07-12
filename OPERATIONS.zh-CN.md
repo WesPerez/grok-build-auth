@@ -125,6 +125,7 @@ GROK_MAX_REGISTRATION_WORKERS=2
 GROK_PREIMPORT_PROBE_MAX_WAIT_SECONDS=900
 GROK_PREIMPORT_PROBE_RETRY_INTERVAL_SECONDS=60
 GROK_PROXY_POOL_FILE=
+GROK_PROXY_ROTATION_STATE_FILE=
 GROK_ALLOW_MISSING_SUB2API_PROXY_IDS=false
 GROK_PROXY_HEALTH_ATTEMPTS=3
 GROK_PROXY_HEALTH_TIMEOUT=10
@@ -166,10 +167,13 @@ chmod 600 private/proxies.json
 
 ```dotenv
 GROK_PROXY_POOL_FILE=/absolute/path/private/proxies.json
+GROK_PROXY_ROTATION_STATE_FILE=/absolute/path/private/proxy-rotation.json
 GROK_PROXY_NODE_1=socks5://127.0.0.1:<port>
 ```
 
-支持 `http`、`https`、`socks5`、`socks5h`。每个启用节点默认必须有有效的 `sub2api_proxy_id`，这样注册、OAuth、preprobe 和导入后的业务请求才能保持同一代理绑定。
+支持 `http`、`https`、`socks5`、`socks5h`。每个启用节点默认必须有有效的 `sub2api_proxy_id`，这样注册、OAuth、preprobe 和导入后的业务请求才能保持同一代理绑定。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
+
+跨进程状态文件只持久化轮询游标；`max_active_leases` 是单进程并发上限。生产入口依靠全局 batch lock 阻止多个 `register_and_import.py` 批次同时运行，不要绕过该锁并行启动多个注册进程。
 
 只有明确接受导入后不保证同出口时，才设置：
 
@@ -197,7 +201,7 @@ python3 scripts/check_proxy_pool.py \
 | 服务 | 配置 | 监听范围 | 用途 |
 |---|---|---|---|
 | `v2ray.service` | `/etc/v2ray/config.json` | 公网 VMess/mKCP UDP 31535；共享 SOCKS 10808/10810 | 其他客户端和服务器日常代理 |
-| `v2ray-grok-pool.service` | `/etc/v2ray/grok_pool.json` | 仅 `127.0.0.1:10900-10907` | GROKAUTH 注册代理池 |
+| `v2ray-grok-pool.service` | `/etc/v2ray/grok_pool.json` | 本机 `127.0.0.1:10900-10907`；认证的 Docker 网关入口 `172.18.0.1:10900-10907` | GROKAUTH 注册及 Sub2API 账号粘性代理池 |
 
 严禁在 `v2ray.service.d/*.conf` 中把主服务 `ExecStart` 覆盖为 `grok_pool.json`。这会让公网 UDP 31535、10808 和 10810 全部消失，其他客户端立即断线。
 
@@ -212,7 +216,9 @@ python3 scripts/check_v2ray_isolation.py
 - `v2ray.service` 的 `ExecStart` 指向 `/etc/v2ray/config.json`。
 - `v2ray-grok-pool.service` 指向 `/etc/v2ray/grok_pool.json`。
 - 主服务 UDP 31535、TCP 10808/10810 存在。
-- 代理池 10900–10907 只绑定 `127.0.0.1`。
+- 代理池 10900–10907 只能绑定 `127.0.0.1` 和指定 Docker 网关；禁止 `0.0.0.0` 或公网监听。
+- Docker 网关入口必须启用 SOCKS 密码认证，并按端口严格路由到对应 `proxy-01` 至 `proxy-08`。
+- Sub2API 中每个启用节点必须建立对应代理记录，并把实际返回的 ID 写入 `sub2api_proxy_id`。
 - 两份配置均通过 `v2ray test`。
 
 如发现主服务 drop-in 指向 `grok_pool.json`，先保存现场并确认配置有效，再删除该精确 drop-in、执行 `systemctl daemon-reload`，分别重启两个服务。不要删除 `/etc/v2ray/config.json`，也不要把代理池合并进公共服务。
@@ -276,8 +282,9 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 9. 按 access token hash 查询已存在账号，只导入缺失项；写入前创建数据库恢复点。
 10. 对本批精确账号统一收口 Grok 分组、官方 CLI base URL、凭据、调度状态和可选 ProxyID。
 11. 验证数据库精确状态。
-12. 使用 Grok 分组 API Key 调用 Sub2API `/v1/responses` 做 postprobe。
-13. 全部成功后 manifest 进入 `imported-preprobed`。
+12. 对每个导入账号 ID 调用 Sub2API 指定账号 SSE test，验证绑定后的代理和 OAuth。
+13. 使用 Grok 分组 API Key 调用 Sub2API `/v1/responses` 做 postprobe。
+14. 全部成功后 manifest 进入 `imported-preprobed`。
 
 新账号资格可能需要传播。preprobe 首次 403、等待后变 200，不代表 token 只有几分钟有效；默认最多等待 900 秒，每 60 秒重试。
 
@@ -286,7 +293,7 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 不要只看进程退出码。检查：
 
 ```bash
-jq '{status, imported_ids, preimport_auth_probes, exact_account_state, postimport_group_probe}' \
+jq '{status, imported_ids, preimport_auth_probes, exact_account_state, postimport_account_probes, postimport_group_probe}' \
   private/runs/<batch-id>/manifest.json
 ```
 
@@ -296,6 +303,7 @@ jq '{status, imported_ids, preimport_auth_probes, exact_account_state, postimpor
 - 预探针通过数量等于实际导入 auth 数量
 - `imported_ids` 数量匹配
 - `exact_account_state` 通过平台、类型、状态、分组、base URL、凭据和代理检查
+- `postimport_account_probes.passed=true`，且每个导入账号都出现 SSE `test_complete success=true`
 - `postimport_group_probe.status=200`
 - postprobe 为 completed 且输出匹配
 

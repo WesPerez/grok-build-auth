@@ -789,6 +789,58 @@ def run_postimport_group_probe(config: dict[str, str], timeout: float = 60.0) ->
     return {"status": status, "completed": payload.get("status") == "completed", "output_ok": "IMPORT_OK" in text}
 
 
+def run_postimport_account_probes(
+    config: dict[str, str], account_ids: list[int], timeout: float = 90.0,
+) -> dict[str, Any]:
+    token = make_admin_token(config)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    results: list[dict[str, Any]] = []
+    for account_id in account_ids:
+        request = urllib.request.Request(
+            config["SUB2API_URL"].rstrip("/") + f"/api/v1/admin/accounts/{account_id}/test",
+            data=json.dumps({
+                "model_id": "grok-4.5",
+                "prompt": "Reply exactly: ACCOUNT_IMPORT_OK",
+                "mode": "responses",
+            }).encode(),
+            method="POST",
+            headers={
+                "Authorization": "Bearer " + token,
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                status = int(response.status)
+                raw = response.read(1024 * 1024).decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+            raw = exc.read(4096).decode("utf-8", "replace")
+        completed = False
+        error = ""
+        for line in raw.splitlines():
+            if not line.startswith("data:"):
+                continue
+            try:
+                event = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "test_complete" and event.get("success") is True:
+                completed = True
+            if event.get("type") in {"error", "test_error"}:
+                error = str(event.get("error") or event.get("message") or "")[:300]
+        results.append({
+            "account_id": account_id,
+            "status": status,
+            "completed": completed,
+            "error": error,
+        })
+    passed = all(item["status"] == 200 and item["completed"] for item in results)
+    return {"tested": len(results), "passed": passed, "results": results}
+
+
 def main() -> int:
     batch_lock = acquire_batch_lock()
     args = parse_args()
@@ -1220,6 +1272,17 @@ def main() -> int:
         manifest.update({"status": "import-verification-failed", "error_summary": str(exc)})
         atomic_json(manifest_path, manifest)
         raise BatchError(f"Sub2API Grok reconciliation failed: {exc}") from exc
+    set_manifest_stage(manifest, manifest_path, "sub2api-account-postprobe")
+    account_postprobes = run_postimport_account_probes(config, all_ids)
+    manifest["postimport_account_probes"] = account_postprobes
+    atomic_json(manifest_path, manifest)
+    if not account_postprobes["passed"]:
+        manifest.update({
+            "status": "postimport-account-probe-failed",
+            "error_summary": "one or more imported Grok accounts failed their specified-account probe",
+        })
+        atomic_json(manifest_path, manifest)
+        raise BatchError(manifest["error_summary"])
     set_manifest_stage(manifest, manifest_path, "sub2api-postprobe")
     postprobe = run_postimport_group_probe(config)
     manifest["postimport_group_probe"] = postprobe
@@ -1242,10 +1305,10 @@ def main() -> int:
         "imported_ids": all_ids,
         "backup": import_payload.get("backup", {}),
         "exact_account_state": exact_state,
-        "upstream_usability_probes": "preimport-passed; postimport-passed",
+        "upstream_usability_probes": "preimport-passed; account-postimport-passed; group-postimport-passed",
     })
     atomic_json(manifest_path, manifest)
-    probe_note = "pre-import auth probes and post-import Sub2API probe passed"
+    probe_note = "pre-import auth, specified-account, and group post-import probes passed"
     print(f"IMPORTED: {len(auth_paths)} accounts are ready in the Grok group; {probe_note}")
     return 0
 

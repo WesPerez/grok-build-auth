@@ -10,6 +10,11 @@ import threading
 from typing import Mapping
 from urllib.parse import urlparse
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - persistent rotation is Linux-only
+    fcntl = None
+
 
 class ProxyPoolError(RuntimeError):
     pass
@@ -40,12 +45,16 @@ class ProxyLease:
 
 
 class ProxyPool:
-    def __init__(self, specs: list[ProxySpec], *, configured: bool) -> None:
+    def __init__(
+        self, specs: list[ProxySpec], *, configured: bool,
+        rotation_state_path: Path | None = None,
+    ) -> None:
         self._specs = specs
         self.configured = configured
         self._active = {spec.ref: 0 for spec in specs}
         self._cursor = 0
         self._lock = threading.Lock()
+        self._rotation_state_path = rotation_state_path
 
     @property
     def capacity(self) -> int:
@@ -65,14 +74,84 @@ class ProxyPool:
         with self._lock:
             if not self._specs:
                 raise ProxyPoolError("proxy pool is configured but has no enabled nodes")
-            for offset in range(len(self._specs)):
-                index = (self._cursor + offset) % len(self._specs)
-                spec = self._specs[index]
-                if self._active[spec.ref] < spec.max_active_leases:
-                    self._active[spec.ref] += 1
-                    self._cursor = (index + 1) % len(self._specs)
-                    return ProxyLease(spec)
+            lock_fd = self._lock_rotation_state()
+            try:
+                cursor = self._read_rotation_cursor() if lock_fd is not None else self._cursor
+                for offset in range(len(self._specs)):
+                    index = (cursor + offset) % len(self._specs)
+                    spec = self._specs[index]
+                    if self._active[spec.ref] < spec.max_active_leases:
+                        next_cursor = (index + 1) % len(self._specs)
+                        if lock_fd is not None:
+                            self._write_rotation_cursor(next_cursor)
+                        self._active[spec.ref] += 1
+                        self._cursor = next_cursor
+                        return ProxyLease(spec)
+            finally:
+                if lock_fd is not None:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
         raise ProxyPoolError("proxy pool has no available lease")
+
+    def _lock_rotation_state(self) -> int | None:
+        path = self._rotation_state_path
+        if path is None:
+            return None
+        if fcntl is None:
+            raise ProxyPoolError("persistent proxy rotation requires fcntl support")
+        if not path.parent.is_dir():
+            raise ProxyPoolError(f"proxy rotation state directory does not exist: {path.parent}")
+        lock_path = path.with_name(path.name + ".lock")
+        if lock_path.is_symlink():
+            raise ProxyPoolError(f"proxy rotation lock must not be a symlink: {lock_path}")
+        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(lock_path, flags, 0o600)
+        if os.fstat(fd).st_mode & 0o077:
+            os.close(fd)
+            raise ProxyPoolError(f"proxy rotation lock permissions must be 0600: {lock_path}")
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+
+    def _read_rotation_cursor(self) -> int:
+        path = self._rotation_state_path
+        assert path is not None
+        if not path.exists():
+            return 0
+        if path.stat().st_mode & 0o077:
+            raise ProxyPoolError(f"proxy rotation state permissions must be 0600: {path}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ProxyPoolError(f"invalid proxy rotation state: {path}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("version") != 1
+            or set(payload) - {"version", "next_ref"}
+        ):
+            raise ProxyPoolError(f"invalid proxy rotation state: {path}")
+        next_ref = str(payload.get("next_ref") or "")
+        for index, spec in enumerate(self._specs):
+            if spec.ref == next_ref:
+                return index
+        return 0
+
+    def _write_rotation_cursor(self, cursor: int) -> None:
+        path = self._rotation_state_path
+        assert path is not None
+        next_ref = self._specs[cursor % len(self._specs)].ref
+        temp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        try:
+            fd = os.open(temp_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                payload = (json.dumps({"version": 1, "next_ref": next_ref}) + "\n").encode()
+                os.write(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(temp_path, path)
+        except Exception:
+            temp_path.unlink(missing_ok=True)
+            raise
 
     def release(self, lease: ProxyLease | None) -> None:
         if lease is None:
@@ -151,4 +230,31 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
             sub2api_proxy_id=proxy_id,
         ))
         seen.add(ref)
-    return ProxyPool(specs, configured=True)
+    rotation_state_raw = str(values.get("GROK_PROXY_ROTATION_STATE_FILE") or "").strip()
+    rotation_state_candidate = Path(rotation_state_raw).expanduser() if rotation_state_raw else None
+    if rotation_state_candidate is not None and rotation_state_candidate.is_symlink():
+        raise ProxyPoolError("proxy rotation state must not be a symlink")
+    rotation_state_path = rotation_state_candidate.resolve() if rotation_state_candidate is not None else None
+    if rotation_state_path is not None:
+        if path.parent.stat().st_mode & 0o077:
+            raise ProxyPoolError(f"proxy private directory permissions must be 0700: {path.parent}")
+        if rotation_state_path.parent != path.parent:
+            raise ProxyPoolError("proxy rotation state must be beside the proxy pool file")
+        if rotation_state_path == path:
+            raise ProxyPoolError("proxy rotation state must differ from the proxy pool file")
+        if rotation_state_path.is_symlink():
+            raise ProxyPoolError("proxy rotation state must not be a symlink")
+        if rotation_state_path.exists():
+            if rotation_state_path.stat().st_mode & 0o077:
+                raise ProxyPoolError(f"proxy rotation state permissions must be 0600: {rotation_state_path}")
+            try:
+                state_payload = json.loads(rotation_state_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                raise ProxyPoolError(f"invalid proxy rotation state: {rotation_state_path}") from exc
+            if (
+                not isinstance(state_payload, dict)
+                or state_payload.get("version") != 1
+                or set(state_payload) - {"version", "next_ref"}
+            ):
+                raise ProxyPoolError(f"invalid proxy rotation state: {rotation_state_path}")
+    return ProxyPool(specs, configured=True, rotation_state_path=rotation_state_path)

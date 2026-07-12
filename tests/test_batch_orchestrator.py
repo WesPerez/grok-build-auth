@@ -304,6 +304,40 @@ def test_group_probe_key_uses_active_target_group_key(monkeypatch):
     assert "g.name='grok'" in commands[0][-1]
 
 
+def test_postimport_account_probes_require_each_sse_completion(monkeypatch):
+    bodies = iter([
+        b'data: {"type":"test_complete","success":true}\n\n',
+        b'data: {"type":"error","error":"upstream failed"}\n\n',
+    ])
+
+    class Response:
+        status = 200
+
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit):
+            return self.body
+
+    class Opener:
+        def open(self, request, timeout):
+            return Response(next(bodies))
+
+    monkeypatch.setattr(MODULE, "make_admin_token", lambda config: "admin-jwt")
+    monkeypatch.setattr(MODULE.urllib.request, "build_opener", lambda *handlers: Opener())
+    result = MODULE.run_postimport_account_probes({"SUB2API_URL": "http://sub2api"}, [11, 12])
+    assert result["tested"] == 2
+    assert result["passed"] is False
+    assert result["results"][0]["completed"] is True
+    assert result["results"][1]["error"] == "upstream failed"
+
+
 def test_proxy_pool_is_direct_when_not_configured():
     pool = MODULE.load_proxy_pool("", {})
     assert pool.configured is False
@@ -395,3 +429,87 @@ def test_proxy_pool_allows_missing_sub2api_proxy_id_only_with_explicit_flag(tmp_
 
     assert pool.configured is True
     assert pool.specs[0].sub2api_proxy_id is None
+
+
+def test_proxy_pool_rotation_persists_across_process_instances(tmp_path):
+    tmp_path.chmod(0o700)
+    config = tmp_path / "proxies.json"
+    state = tmp_path / "proxy-rotation.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [
+            {"ref": "node-a", "url_env": "NODE_A", "sub2api_proxy_id": 11},
+            {"ref": "node-b", "url_env": "NODE_B", "sub2api_proxy_id": 12},
+        ],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    values = {
+        "NODE_A": "socks5://127.0.0.1:10900",
+        "NODE_B": "socks5://127.0.0.1:10901",
+        "GROK_PROXY_ROTATION_STATE_FILE": str(state),
+    }
+
+    first_pool = MODULE.load_proxy_pool(str(config), values)
+    first = first_pool.acquire()
+    assert first.ref == "node-a"
+    first_pool.release(first)
+
+    second_pool = MODULE.load_proxy_pool(str(config), values)
+    second = second_pool.acquire()
+    assert second.ref == "node-b"
+    second_pool.release(second)
+
+    third_pool = MODULE.load_proxy_pool(str(config), values)
+    assert third_pool.acquire().ref == "node-a"
+    assert state.stat().st_mode & 0o077 == 0
+
+
+def test_proxy_pool_rotation_write_failure_does_not_leak_lease(tmp_path, monkeypatch):
+    tmp_path.chmod(0o700)
+    config = tmp_path / "proxies.json"
+    state = tmp_path / "proxy-rotation.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-a", "url_env": "NODE_A", "sub2api_proxy_id": 11}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    pool = MODULE.load_proxy_pool(str(config), {
+        "NODE_A": "socks5://127.0.0.1:10900",
+        "GROK_PROXY_ROTATION_STATE_FILE": str(state),
+    })
+    monkeypatch.setattr(pool, "_write_rotation_cursor", lambda cursor: (_ for _ in ()).throw(OSError("disk full")))
+    with pytest.raises(OSError, match="disk full"):
+        pool.acquire()
+    monkeypatch.undo()
+    lease = pool.acquire()
+    assert lease.ref == "node-a"
+
+
+def test_proxy_pool_rejects_rotation_state_path_collisions(tmp_path):
+    tmp_path.chmod(0o700)
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-a", "url_env": "NODE_A", "sub2api_proxy_id": 11}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    values = {
+        "NODE_A": "socks5://127.0.0.1:10900",
+        "GROK_PROXY_ROTATION_STATE_FILE": str(config),
+    }
+    with pytest.raises(MODULE.ProxyPoolError, match="must differ"):
+        MODULE.load_proxy_pool(str(config), values)
+
+    outside = tmp_path.parent / "outside-rotation.json"
+    values["GROK_PROXY_ROTATION_STATE_FILE"] = str(outside)
+    with pytest.raises(MODULE.ProxyPoolError, match="beside"):
+        MODULE.load_proxy_pool(str(config), values)
+
+    target = tmp_path / "real-rotation.json"
+    target.write_text('{"version":1,"next_ref":"node-a"}\n', encoding="utf-8")
+    target.chmod(0o600)
+    link = tmp_path / "linked-rotation.json"
+    link.symlink_to(target)
+    values["GROK_PROXY_ROTATION_STATE_FILE"] = str(link)
+    with pytest.raises(MODULE.ProxyPoolError, match="symlink"):
+        MODULE.load_proxy_pool(str(config), values)
