@@ -191,7 +191,34 @@ python3 scripts/check_proxy_pool.py \
 
 任一节点成功率低于 2/3、TLS 校验失败、出口漂移或不同 ref 实际同出口，整批 fail closed。不要把论坛节点凭据、完整代理 URL 或出口 IP 写进仓库和公开日志。
 
-### 4.4 运行服务器流程
+### 4.4 主 V2Ray 与 Grok 代理池隔离
+
+服务器上的公共代理和 Grok 注册代理池是两个独立服务：
+
+| 服务 | 配置 | 监听范围 | 用途 |
+|---|---|---|---|
+| `v2ray.service` | `/etc/v2ray/config.json` | 公网 VMess/mKCP UDP 31535；共享 SOCKS 10808/10810 | 其他客户端和服务器日常代理 |
+| `v2ray-grok-pool.service` | `/etc/v2ray/grok_pool.json` | 仅 `127.0.0.1:10900-10907` | GROKAUTH 注册代理池 |
+
+严禁在 `v2ray.service.d/*.conf` 中把主服务 `ExecStart` 覆盖为 `grok_pool.json`。这会让公网 UDP 31535、10808 和 10810 全部消失，其他客户端立即断线。
+
+只读检查：
+
+```bash
+python3 scripts/check_v2ray_isolation.py
+```
+
+正确结果必须同时满足：
+
+- `v2ray.service` 的 `ExecStart` 指向 `/etc/v2ray/config.json`。
+- `v2ray-grok-pool.service` 指向 `/etc/v2ray/grok_pool.json`。
+- 主服务 UDP 31535、TCP 10808/10810 存在。
+- 代理池 10900–10907 只绑定 `127.0.0.1`。
+- 两份配置均通过 `v2ray test`。
+
+如发现主服务 drop-in 指向 `grok_pool.json`，先保存现场并确认配置有效，再删除该精确 drop-in、执行 `systemctl daemon-reload`，分别重启两个服务。不要删除 `/etc/v2ray/config.json`，也不要把代理池合并进公共服务。
+
+### 4.5 运行服务器流程
 
 推荐单账号 canary：
 
@@ -227,7 +254,7 @@ python3 scripts/register_and_import.py \
 
 批次中存在注册失败时，默认不导入成功子集。只有审查失败原因后才使用 `--import-partial`。
 
-### 4.5 Web 控制台
+### 4.6 Web 控制台
 
 ```bash
 bash start_web_console.sh --host 127.0.0.1 --port 17860
@@ -237,7 +264,7 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 
 控制台支持环境检查、创建批次、实时日志、历史批次和导入续跑；当前不提供 OAuth recovery 和 `--no-import` UI，这两项使用 CLI。
 
-### 4.6 真实执行顺序
+### 4.7 真实执行顺序
 
 1. 获取跨进程批次锁。
 2. 校验 `runtime.env` 权限、必填字段、worker、目标分组和 base URL。
@@ -255,7 +282,7 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 
 新账号资格可能需要传播。preprobe 首次 403、等待后变 200，不代表 token 只有几分钟有效；默认最多等待 900 秒，每 60 秒重试。
 
-### 4.7 成功判定
+### 4.8 成功判定
 
 不要只看进程退出码。检查：
 
@@ -273,7 +300,7 @@ jq '{status, imported_ids, preimport_auth_probes, exact_account_state, postimpor
 - `postimport_group_probe.status=200`
 - postprobe 为 completed 且输出匹配
 
-### 4.8 失败恢复
+### 4.9 失败恢复
 
 导入失败或仅注册未导入：
 

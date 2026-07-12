@@ -1,0 +1,14 @@
+[Unit]
+Description=V2Ray Grok Registration Proxy Pool
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/v2ray/v2ray run -config /etc/v2ray/grok_pool.json
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
