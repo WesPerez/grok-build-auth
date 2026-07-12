@@ -662,23 +662,53 @@ def parse_args() -> argparse.Namespace:
 def run_preimport_auth_probes(
     auth_paths: list[Path], timeout: float = 60.0,
     proxy_by_file: dict[str, str] | None = None,
+    max_wait_seconds: float = 0.0,
+    retry_interval_seconds: float = 60.0,
+    sleep_fn=time.sleep,
+    monotonic_fn=time.monotonic,
 ) -> dict[str, Any]:
-    results: list[dict[str, Any]] = []
-    for path in auth_paths:
-        try:
-            item = probe_grok_auth(
-                path,
-                timeout=timeout,
-                proxy=(proxy_by_file or {}).get(path.name, ""),
-            )
-        except Exception as exc:
-            item = {"file": path.name, "error": f"{type(exc).__name__}: {exc}"}
-        results.append(item)
+    started = monotonic_fn()
+    attempts = {path.name: 0 for path in auth_paths}
+    final_results: dict[str, dict[str, Any]] = {}
+    pending = list(auth_paths)
+
+    while pending:
+        retry_paths: list[Path] = []
+        for path in pending:
+            attempts[path.name] += 1
+            try:
+                item = probe_grok_auth(
+                    path,
+                    timeout=timeout,
+                    proxy=(proxy_by_file or {}).get(path.name, ""),
+                )
+            except Exception as exc:
+                item = {"file": path.name, "error": f"{type(exc).__name__}: {exc}"}
+            item["attempts"] = attempts[path.name]
+            final_results[path.name] = item
+            status = item.get("status")
+            if item.get("error") or status == 403 or (isinstance(status, int) and status >= 500):
+                retry_paths.append(path)
+
+        elapsed = monotonic_fn() - started
+        remaining = max_wait_seconds - elapsed
+        if not retry_paths or remaining <= 0:
+            break
+        delay = min(retry_interval_seconds, remaining)
+        if delay <= 0:
+            break
+        sleep_fn(delay)
+        pending = retry_paths
+
+    results = [final_results[path.name] for path in auth_paths]
     passed = sum(1 for item in results if item.get("status") == 200 and not item.get("error"))
     return {
         "tested": len(results),
         "http_200_completed": passed,
         "passed": passed == len(results),
+        "max_wait_seconds": max_wait_seconds,
+        "retry_interval_seconds": retry_interval_seconds,
+        "elapsed_seconds": round(monotonic_fn() - started, 3),
         "results": results,
     }
 
@@ -701,7 +731,9 @@ def resolve_group_probe_key(config: dict[str, str]) -> str:
 def validate_sub2api_proxy_ids(config: dict[str, str], proxy_pool: Any) -> None:
     if not proxy_pool.configured:
         return
-    expected = {int(spec.sub2api_proxy_id) for spec in proxy_pool.specs}
+    expected = {int(spec.sub2api_proxy_id) for spec in proxy_pool.specs if spec.sub2api_proxy_id is not None}
+    if not expected:
+        return
     ids = ",".join(str(item) for item in sorted(expected))
     proc = run([
         "docker", "exec", config["SUB2API_POSTGRES_CONTAINER"],
@@ -770,13 +802,19 @@ def main() -> int:
     config = load_env(runtime_file)
     try:
         configured_workers = int(config.get("GROK_MAX_REGISTRATION_WORKERS", "2") or "2")
+        preprobe_max_wait = int(config.get("GROK_PREIMPORT_PROBE_MAX_WAIT_SECONDS", "900") or "900")
+        preprobe_retry_interval = int(config.get("GROK_PREIMPORT_PROBE_RETRY_INTERVAL_SECONDS", "60") or "60")
     except ValueError as exc:
-        raise BatchError("GROK_MAX_REGISTRATION_WORKERS must be an integer") from exc
+        raise BatchError("worker and pre-import probe settings must be integers") from exc
     workers = args.workers if args.workers is not None else configured_workers
     if configured_workers < 1 or configured_workers > 16:
         raise BatchError("GROK_MAX_REGISTRATION_WORKERS must be between 1 and 16")
     if workers < 1 or workers > configured_workers:
         raise BatchError(f"--workers must be between 1 and {configured_workers}")
+    if preprobe_max_wait < 0 or preprobe_max_wait > 3600:
+        raise BatchError("GROK_PREIMPORT_PROBE_MAX_WAIT_SECONDS must be between 0 and 3600")
+    if preprobe_retry_interval < 1 or preprobe_retry_interval > 300:
+        raise BatchError("GROK_PREIMPORT_PROBE_RETRY_INTERVAL_SECONDS must be between 1 and 300")
     if args.registration_backend == "browser-playwright-edge" and workers != 1:
         raise BatchError("browser-playwright-edge requires --workers 1")
     try:
@@ -840,9 +878,15 @@ def main() -> int:
             "stage_started_at": utc_now(),
             "workers": workers,
             "registration_backend": args.registration_backend,
+            "preimport_probe_policy": {
+                "max_wait_seconds": preprobe_max_wait,
+                "retry_interval_seconds": preprobe_retry_interval,
+                "retry_statuses": [403, "transport-error", "5xx"],
+            },
             "proxy_pool": {
                 "configured": proxy_pool.configured,
                 "enabled_nodes": proxy_pool.enabled_count,
+                "postimport_stickiness": all(spec.sub2api_proxy_id is not None for spec in proxy_pool.specs),
                 "mode": "pool" if proxy_pool.configured else (
                     "legacy-single" if config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") else "direct"
                 ),
@@ -1048,7 +1092,12 @@ def main() -> int:
             proxy_by_file[auth_file.name] = proxy_pool.url_for(ref)
         elif legacy_proxy:
             proxy_by_file[auth_file.name] = legacy_proxy
-    preprobe = run_preimport_auth_probes(auth_paths, proxy_by_file=proxy_by_file)
+    preprobe = run_preimport_auth_probes(
+        auth_paths,
+        proxy_by_file=proxy_by_file,
+        max_wait_seconds=preprobe_max_wait,
+        retry_interval_seconds=preprobe_retry_interval,
+    )
     manifest["preimport_auth_probes"] = preprobe
     atomic_json(manifest_path, manifest)
     if not preprobe["passed"]:

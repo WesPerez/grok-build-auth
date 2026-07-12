@@ -107,6 +107,9 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
         raise ProxyPoolError("proxy pool requires version=1 and a proxies array")
     specs: list[ProxySpec] = []
     seen: set[str] = set()
+    allow_missing_proxy_ids = str(values.get("GROK_ALLOW_MISSING_SUB2API_PROXY_IDS", "")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
     for item in payload["proxies"]:
         if not isinstance(item, dict) or item.get("enabled", True) is False:
             continue
@@ -137,9 +140,9 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
             proxy_id = int(proxy_id_raw) if proxy_id_raw not in (None, "") else None
         except (TypeError, ValueError) as exc:
             raise ProxyPoolError(f"proxy {ref} has invalid sub2api_proxy_id") from exc
-        if proxy_id is None:
+        if proxy_id is None and not allow_missing_proxy_ids:
             raise ProxyPoolError(f"proxy {ref} requires sub2api_proxy_id for post-import stickiness")
-        if proxy_id < 1:
+        if proxy_id is not None and proxy_id < 1:
             raise ProxyPoolError(f"proxy {ref} sub2api_proxy_id must be positive")
         specs.append(ProxySpec(
             ref=ref,

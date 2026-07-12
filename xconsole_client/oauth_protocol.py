@@ -184,15 +184,30 @@ class ProtocolOAuthClient:
             kwargs["proxies"] = {"http": proxy, "https": proxy}
         self._s = creq.Session(**kwargs)
 
-    def load_cookies(self, cookies: Dict[str, str]) -> None:
-        """Inject pre-existing accounts.x.ai session cookies (e.g. post-signup)."""
+    def load_cookies(self, cookies) -> None:
+        """Inject pre-existing accounts.x.ai session cookies (e.g. post-signup).
+
+        Accepts:
+          - Dict[str, str]: name -> value
+          - list[dict]: Playwright-style [{name: ..., value: ...}, ...]
+        """
         if not cookies:
             return
-        for name, value in cookies.items():
+        cookie_dict: Dict[str, str] = {}
+        if isinstance(cookies, list):
+            for c in cookies:
+                n = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
+                v = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
+                if n and v is not None:
+                    cookie_dict[str(n)] = str(v)
+        elif isinstance(cookies, dict):
+            cookie_dict = {str(k): str(v) for k, v in cookies.items() if v is not None}
+        else:
+            return
+        for name, value in cookie_dict.items():
             if name != "sso":
                 continue
             try:
-                # Prefer domain-scoped cookies for accounts.x.ai
                 self._s.cookies.set(name, value, domain="accounts.x.ai")
             except Exception:
                 try:

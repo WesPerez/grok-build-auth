@@ -244,6 +244,49 @@ def test_preimport_auth_probes_require_every_account_http_200(tmp_path, monkeypa
     assert result["passed"] is False
 
 
+def test_preimport_auth_probes_retry_transient_forbidden_until_success(tmp_path, monkeypatch):
+    path = write_auth(tmp_path / "one.json")
+    responses = iter([{"status": 403}, {"status": 403}, {"status": 200}])
+    clock = [0.0]
+
+    monkeypatch.setattr(MODULE, "probe_grok_auth", lambda auth_path, timeout, proxy="": next(responses))
+
+    result = MODULE.run_preimport_auth_probes(
+        [path],
+        timeout=1,
+        max_wait_seconds=120,
+        retry_interval_seconds=60,
+        sleep_fn=lambda seconds: clock.__setitem__(0, clock[0] + seconds),
+        monotonic_fn=lambda: clock[0],
+    )
+
+    assert result["passed"] is True
+    assert result["http_200_completed"] == 1
+    assert result["elapsed_seconds"] == 120
+    assert result["results"][0]["attempts"] == 3
+
+
+def test_preimport_auth_probes_do_not_retry_rate_limit(tmp_path, monkeypatch):
+    path = write_auth(tmp_path / "one.json")
+    calls = []
+    monkeypatch.setattr(
+        MODULE,
+        "probe_grok_auth",
+        lambda auth_path, timeout, proxy="": calls.append(auth_path) or {"status": 429},
+    )
+
+    result = MODULE.run_preimport_auth_probes(
+        [path],
+        timeout=1,
+        max_wait_seconds=900,
+        sleep_fn=lambda seconds: (_ for _ in ()).throw(AssertionError("must not sleep")),
+    )
+
+    assert result["passed"] is False
+    assert result["results"][0]["attempts"] == 1
+    assert len(calls) == 1
+
+
 def test_group_probe_key_uses_active_target_group_key(monkeypatch):
     commands = []
     monkeypatch.setattr(
@@ -323,3 +366,32 @@ def test_proxy_pool_rejects_unsafe_ref_and_url(tmp_path):
     }), encoding="utf-8")
     with pytest.raises(MODULE.ProxyPoolError, match="valid URL"):
         MODULE.load_proxy_pool(str(config), {"NODE": "file:///etc/passwd"})
+
+
+def test_proxy_pool_requires_sub2api_proxy_id_by_default(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-safe", "url_env": "NODE"}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+
+    with pytest.raises(MODULE.ProxyPoolError, match="post-import stickiness"):
+        MODULE.load_proxy_pool(str(config), {"NODE": "socks5://127.0.0.1:10900"})
+
+
+def test_proxy_pool_allows_missing_sub2api_proxy_id_only_with_explicit_flag(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-safe", "url_env": "NODE"}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+
+    pool = MODULE.load_proxy_pool(str(config), {
+        "NODE": "socks5://127.0.0.1:10900",
+        "GROK_ALLOW_MISSING_SUB2API_PROXY_IDS": "true",
+    })
+
+    assert pool.configured is True
+    assert pool.specs[0].sub2api_proxy_id is None
