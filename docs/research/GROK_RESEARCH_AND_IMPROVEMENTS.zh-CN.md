@@ -164,4 +164,4 @@ Grok CLI `/v1/responses` 不接受 reasoning item 中显式存在的 `content: n
 - LINUX DO topics：`2556512`、`2558107`、`2560435`、`2561596`、`2562322`、`2564994`。
 - 审查归档 SHA256：`2ce366e2c9185062f192dd6f1e090c923ff825f474e6a6d8bb8da0b78e82a5b3`、`bb4ff06d91f47e91533aeaec017367a3fb249624769d6edd84d2c9975ad1d314`、`ed64400831565202d3183a4e859ac45c77d849b302b61df533b27a7d125c8dac`。
 
-项目内实施证据见 `run.py`、`scripts/register_and_import.py`、`xconsole_client/`、`PROXY_POOL_OPERATIONS.zh-CN.md` 和 `SUB2API_GROK_RESPONSES.zh-CN.md`。原始归档、论坛抓取和第三方仓库 clone 不作为本仓库产物保留。
+项目内实施证据见 `run.py`、`scripts/register_and_import.py`、`xconsole_client/` 和 `OPERATIONS.zh-CN.md`。原始归档、论坛抓取和第三方仓库 clone 不作为本仓库产物保留。
