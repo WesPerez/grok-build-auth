@@ -11,66 +11,70 @@ def run(*command: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, capture_output=True, text=True, check=False)
 
 
-def pool_config_policy(path: Path, docker_listen: str) -> dict[str, bool]:
+def pool_config_policy(path: Path) -> dict[str, bool]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"loopback": False, "docker_auth": False, "no_extra": False, "routing": False}
+        return {"loopback": False, "no_extra": False, "routing": False}
     inbounds = payload.get("inbounds") if isinstance(payload, dict) else None
+    outbounds = payload.get("outbounds") if isinstance(payload, dict) else None
     rules = (payload.get("routing") or {}).get("rules") if isinstance(payload, dict) else None
-    if not isinstance(inbounds, list) or not isinstance(rules, list):
-        return {"loopback": False, "docker_auth": False, "no_extra": False, "routing": False}
+    if not isinstance(inbounds, list) or not isinstance(outbounds, list) or not isinstance(rules, list):
+        return {"loopback": False, "no_extra": False, "routing": False}
 
     by_endpoint = {
         (str(item.get("listen") or ""), item.get("port")): item
         for item in inbounds if isinstance(item, dict)
     }
-    loopback_ok = all(("127.0.0.1", port) in by_endpoint for port in range(10900, 10908))
-    docker_ok = True
+    outbound_tags = {
+        str(item.get("tag") or "") for item in outbounds if isinstance(item, dict)
+    }
+    loopback_ok = True
     routing_ok = True
     for number, port in enumerate(range(10900, 10908), 1):
-        item = by_endpoint.get((docker_listen, port))
-        settings = item.get("settings") if isinstance(item, dict) else None
-        accounts = settings.get("accounts") if isinstance(settings, dict) else None
+        item = by_endpoint.get(("127.0.0.1", port))
         if (
             not isinstance(item, dict)
             or item.get("protocol") != "socks"
-            or not isinstance(settings, dict)
-            or settings.get("auth") != "password"
-            or not isinstance(accounts, list) or not accounts
-            or not all(
-                isinstance(entry, dict) and entry.get("user") and entry.get("pass")
-                for entry in accounts
-            )
+            or item.get("tag") != f"in-proxy-{number:02d}"
+            or (item.get("settings") or {}).get("auth") != "noauth"
         ):
-            docker_ok = False
-        inbound_tag = f"in-docker-proxy-{number:02d}"
+            loopback_ok = False
+        inbound_tag = f"in-proxy-{number:02d}"
         outbound_tag = f"proxy-{number:02d}"
-        if not any(
+        matching_rules = [
+            rule for rule in rules
+            if (
+                isinstance(rule, dict)
+                and rule.get("inboundTag") == [inbound_tag]
+                and rule.get("outboundTag") == outbound_tag
+            )
+        ]
+        if len(matching_rules) != 1 or outbound_tag not in outbound_tags:
+            routing_ok = False
+        if any(
             isinstance(rule, dict)
-            and rule.get("inboundTag") == [inbound_tag]
-            and rule.get("outboundTag") == outbound_tag
+            and inbound_tag in (rule.get("inboundTag") or [])
+            and rule not in matching_rules
             for rule in rules
         ):
             routing_ok = False
-    allowed = {"127.0.0.1", docker_listen}
     no_extra = all(
         item.get("port") not in range(10900, 10908)
-        or str(item.get("listen") or "") in allowed
+        or str(item.get("listen") or "") == "127.0.0.1"
         for item in inbounds if isinstance(item, dict)
     )
-    return {"loopback": loopback_ok, "docker_auth": docker_ok, "no_extra": no_extra, "routing": routing_ok}
+    return {"loopback": loopback_ok, "no_extra": no_extra, "routing": routing_ok}
 
 
-def listener_policy(tcp: str, pool_pid: str, docker_listen: str) -> dict[str, bool]:
+def listener_policy(tcp: str, pool_pid: str) -> dict[str, bool]:
     lines = tcp.splitlines()
-    allowed = ("127.0.0.1", docker_listen)
     expected = all(
-        any(f"{address}:{port}" in line and f"pid={pool_pid}," in line for line in lines)
-        for address in allowed for port in range(10900, 10908)
+        any(f"127.0.0.1:{port}" in line and f"pid={pool_pid}," in line for line in lines)
+        for port in range(10900, 10908)
     )
     no_extra = all(
-        any(f"{address}:{port}" in line for address in allowed)
+        f"127.0.0.1:{port}" in line
         for line in lines for port in range(10900, 10908) if f":{port}" in line
     )
     return {"expected": expected, "no_extra": no_extra}
@@ -82,7 +86,6 @@ def main() -> int:
     parser.add_argument("--pool-config", default="/etc/v2ray/grok_pool.json")
     parser.add_argument("--main-service", default="v2ray.service")
     parser.add_argument("--pool-service", default="v2ray-grok-pool.service")
-    parser.add_argument("--docker-listen", default="172.18.0.1")
     args = parser.parse_args()
 
     checks: list[dict[str, object]] = []
@@ -111,9 +114,8 @@ def main() -> int:
         result = run(binary, "test", "-config", config)
         check(name, result.returncode == 0, "valid" if result.returncode == 0 else "invalid")
 
-    config_policy = pool_config_policy(Path(args.pool_config), args.docker_listen)
+    config_policy = pool_config_policy(Path(args.pool_config))
     check("pool-loopback-config", config_policy["loopback"], "loopback inbounds")
-    check("pool-docker-auth", config_policy["docker_auth"], "authenticated Docker inbounds")
     check("pool-no-public-inbound", config_policy["no_extra"], "no wildcard/public pool inbounds")
     check("pool-routing", config_policy["routing"], "numbered inbound/outbound mapping")
 
@@ -126,8 +128,8 @@ def main() -> int:
     check("public-vmess", ":31535" in udp, "udp/31535")
     check("main-local-socks", ":10808" in tcp and ":10810" in tcp, "10808,10810")
     pool_pid = run("systemctl", "show", "-p", "MainPID", "--value", args.pool_service).stdout.strip()
-    listeners = listener_policy(tcp, pool_pid, args.docker_listen)
-    check("grok-pool-listeners", listeners["expected"], "loopback and Docker listeners owned by pool PID")
+    listeners = listener_policy(tcp, pool_pid)
+    check("grok-pool-listeners", listeners["expected"], "loopback listeners owned by pool PID")
     check("grok-pool-no-extra-listeners", listeners["no_extra"], "no wildcard/public pool listeners")
 
     passed = all(bool(item["ok"]) for item in checks)

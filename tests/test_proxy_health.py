@@ -61,3 +61,29 @@ def test_health_rejects_too_many_failures():
         raise TimeoutError("timeout")
     with pytest.raises(ProxyPoolError, match="unhealthy"):
         check_proxy_pool_health(pool("one"), probe_once=failing)
+
+
+def test_health_can_filter_unhealthy_nodes_for_registration():
+    def probe(spec, timeout):
+        if spec.ref == "bad":
+            raise TimeoutError("down")
+        return ("8.8.8.8", "US", "TLSv1.3", 10.0)
+
+    snapshot = check_proxy_pool_health(
+        pool("good", "bad"), probe_once=probe, require_all=False,
+    )
+    assert snapshot.healthy_refs == ("good",)
+    assert snapshot.results[1]["reason"] == "insufficient-successes"
+    assert pool("good", "bad").only_refs(set(snapshot.healthy_refs)).specs[0].ref == "good"
+
+
+def test_health_records_duplicate_exit_without_exposing_ip():
+    snapshot = check_proxy_pool_health(
+        pool("one", "two"),
+        probe_once=lambda spec, timeout: ("8.8.8.8", "US", "TLSv1.3", 10.0),
+        require_all=False,
+    )
+    assert snapshot.healthy_refs == ("one",)
+    assert snapshot.results[1]["reason"] == "duplicate-exit"
+    assert snapshot.results[1]["duplicate_of"] == "one"
+    assert "8.8.8.8" not in repr(snapshot)

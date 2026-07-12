@@ -170,7 +170,21 @@ def test_reconcile_updates_exact_ids_through_admin_api(monkeypatch):
         "SUB2API_GROUP": "grok",
         "GROK_ACCOUNT_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
     }, [17, 23])
-    assert updated == [("short-lived-token", 17, 5, None), ("short-lived-token", 23, 5, None)]
+    assert updated == [("short-lived-token", 17, 5, 0), ("short-lived-token", 23, 5, 0)]
+
+
+def test_reconcile_clears_existing_proxy_binding_by_default(monkeypatch):
+    updated = []
+    monkeypatch.setattr(MODULE, "grok_group_id", lambda config: 5)
+    monkeypatch.setattr(MODULE, "make_admin_token", lambda config: "short-lived-token")
+    monkeypatch.setattr(
+        MODULE, "update_account_via_admin_api",
+        lambda config, token, account_id, group_id, proxy_id=None: updated.append(proxy_id),
+    )
+
+    MODULE.reconcile_imported_accounts({}, [17])
+
+    assert updated == [0]
 
 
 def test_build_bundle_rejects_duplicate_auth_tokens(tmp_path):
@@ -285,6 +299,27 @@ def test_preimport_auth_probes_do_not_retry_rate_limit(tmp_path, monkeypatch):
     assert result["passed"] is False
     assert result["results"][0]["attempts"] == 1
     assert len(calls) == 1
+
+
+def test_preprobe_proxy_map_falls_back_when_original_node_is_unhealthy(tmp_path):
+    auth = write_auth(tmp_path / "one.json")
+    proxy_config = tmp_path / "proxies.json"
+    proxy_config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-b", "url_env": "NODE_B"}],
+    }), encoding="utf-8")
+    proxy_config.chmod(0o600)
+    healthy_pool = MODULE.load_proxy_pool(str(proxy_config), {
+        "NODE_B": "socks5://127.0.0.1:10901",
+        "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "false",
+    })
+    attempts = [{"auth_file": str(auth), "proxy_ref": "node-a"}]
+
+    mapping = MODULE.build_preprobe_proxy_map([auth], attempts, healthy_pool)
+
+    assert mapping == {auth.name: "socks5://127.0.0.1:10901"}
+    assert attempts[0]["preprobe_proxy_fallback_from"] == "node-a"
+    assert attempts[0]["preprobe_proxy_ref"] == "node-b"
 
 
 def test_group_probe_key_uses_active_target_group_key(monkeypatch):
@@ -411,7 +446,10 @@ def test_proxy_pool_requires_sub2api_proxy_id_by_default(tmp_path):
     config.chmod(0o600)
 
     with pytest.raises(MODULE.ProxyPoolError, match="post-import stickiness"):
-        MODULE.load_proxy_pool(str(config), {"NODE": "socks5://127.0.0.1:10900"})
+        MODULE.load_proxy_pool(str(config), {
+            "NODE": "socks5://127.0.0.1:10900",
+            "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "true",
+        })
 
 
 def test_proxy_pool_allows_missing_sub2api_proxy_id_only_with_explicit_flag(tmp_path):
@@ -424,10 +462,25 @@ def test_proxy_pool_allows_missing_sub2api_proxy_id_only_with_explicit_flag(tmp_
 
     pool = MODULE.load_proxy_pool(str(config), {
         "NODE": "socks5://127.0.0.1:10900",
+        "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "true",
         "GROK_ALLOW_MISSING_SUB2API_PROXY_IDS": "true",
     })
 
     assert pool.configured is True
+    assert pool.specs[0].sub2api_proxy_id is None
+
+
+def test_proxy_pool_registration_only_mode_allows_missing_proxy_id(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 1,
+        "proxies": [{"ref": "node-safe", "url_env": "NODE"}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+    pool = MODULE.load_proxy_pool(str(config), {
+        "NODE": "socks5://127.0.0.1:10900",
+        "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "false",
+    })
     assert pool.specs[0].sub2api_proxy_id is None
 
 

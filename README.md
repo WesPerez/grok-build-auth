@@ -35,7 +35,7 @@ Web 注册成功、拿到 SSO、写出本地账号文本，都不等于账号已
 - `browser-playwright-edge` 单路浏览器 canary。
 - Mailu/IMAP 邮箱创建、批次产物和失败恢复。
 - 导入前单 auth 上游探针、Sub2API 幂等导入、精确账号收口和导入后分组探针。
-- 可选代理池健康门禁和注册阶段 sticky 出口。
+- 可选代理池健康门禁、跨批次轮询和单次 attempt 内固定出口；默认不绑定 Sub2API 生产调用。
 
 Grok Build OAuth 使用 `https://cli-chat-proxy.grok.com/v1`，不是 `https://api.x.ai/v1` 的付费 API Key 通道。SSO cookie 不能替代 OAuth `access_token` 和 `refresh_token`。
 

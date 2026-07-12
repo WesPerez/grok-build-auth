@@ -68,6 +68,16 @@ class ProxyPool:
     def specs(self) -> tuple[ProxySpec, ...]:
         return tuple(self._specs)
 
+    def only_refs(self, refs: set[str]) -> "ProxyPool":
+        specs = [spec for spec in self._specs if spec.ref in refs]
+        if not specs:
+            raise ProxyPoolError("proxy pool has no healthy nodes")
+        return ProxyPool(
+            specs,
+            configured=self.configured,
+            rotation_state_path=self._rotation_state_path,
+        )
+
     def acquire(self) -> ProxyLease | None:
         if not self.configured:
             return None
@@ -186,7 +196,10 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
         raise ProxyPoolError("proxy pool requires version=1 and a proxies array")
     specs: list[ProxySpec] = []
     seen: set[str] = set()
-    allow_missing_proxy_ids = str(values.get("GROK_ALLOW_MISSING_SUB2API_PROXY_IDS", "")).strip().lower() in {
+    bind_after_import = str(values.get("GROK_BIND_SUB2API_PROXY_AFTER_IMPORT", "false")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    allow_missing_proxy_ids = not bind_after_import or str(values.get("GROK_ALLOW_MISSING_SUB2API_PROXY_IDS", "")).strip().lower() in {
         "1", "true", "yes", "on",
     }
     for item in payload["proxies"]:

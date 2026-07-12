@@ -126,6 +126,7 @@ GROK_PREIMPORT_PROBE_MAX_WAIT_SECONDS=900
 GROK_PREIMPORT_PROBE_RETRY_INTERVAL_SECONDS=60
 GROK_PROXY_POOL_FILE=
 GROK_PROXY_ROTATION_STATE_FILE=
+GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=false
 GROK_ALLOW_MISSING_SUB2API_PROXY_IDS=false
 GROK_PROXY_HEALTH_ATTEMPTS=3
 GROK_PROXY_HEALTH_TIMEOUT=10
@@ -133,9 +134,9 @@ GROK_BROWSER_PROXY_URL=
 GROK_BROWSER_HEADED=true
 ```
 
-没有代理池时，`HTTPS_PROXY`/`HTTP_PROXY` 作为单一 sticky 出口。两者都为空会直连，生产使用前必须明确接受这个结果。
+没有代理池时，`HTTPS_PROXY`/`HTTP_PROXY` 作为注册、OAuth 和 preprobe 的单一出口。两者都为空会直连，生产使用前必须明确接受这个结果。
 
-启用代理池时应保持 `GROK_BROWSER_PROXY_URL` 为空，让每个 attempt 的 lease 代理生效。非空全局浏览器代理会覆盖真实浏览器出口，但 manifest 和导入后 ProxyID 仍可能记录 lease，造成出口不一致。
+启用代理池时应保持 `GROK_BROWSER_PROXY_URL` 为空，让每个 attempt 的 lease 代理生效。非空全局浏览器代理会覆盖真实浏览器出口，但 manifest 仍记录 lease；若又显式开启导入后粘性，还会造成记录的 ProxyID 与真实注册出口不一致。
 
 ### 4.3 代理池
 
@@ -156,8 +157,7 @@ chmod 600 private/proxies.json
       "ref": "node-01",
       "url_env": "GROK_PROXY_NODE_1",
       "enabled": true,
-      "max_active_leases": 1,
-      "sub2api_proxy_id": 12
+      "max_active_leases": 1
     }
   ]
 }
@@ -171,17 +171,19 @@ GROK_PROXY_ROTATION_STATE_FILE=/absolute/path/private/proxy-rotation.json
 GROK_PROXY_NODE_1=socks5://127.0.0.1:<port>
 ```
 
-支持 `http`、`https`、`socks5`、`socks5h`。每个启用节点默认必须有有效的 `sub2api_proxy_id`，这样注册、OAuth、preprobe 和导入后的业务请求才能保持同一代理绑定。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
+支持 `http`、`https`、`socks5`、`socks5h`。默认 `GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=false`：代理 lease 只用于注册、OAuth 和导入前 auth preprobe，导入后 Sub2API 正常调用不依赖注册节点。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
 
 跨进程状态文件只持久化轮询游标；`max_active_leases` 是单进程并发上限。生产入口依靠全局 batch lock 阻止多个 `register_and_import.py` 批次同时运行，不要绕过该锁并行启动多个注册进程。
 
-只有明确接受导入后不保证同出口时，才设置：
+只有明确要求账号长期保持注册出口时，才设置：
 
 ```dotenv
-GROK_ALLOW_MISSING_SUB2API_PROXY_IDS=true
+GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=true
 ```
 
-此时 manifest 会记录 `postimport_stickiness=false`。不能再宣称账号全生命周期 sticky。
+此时再为每个节点添加 `sub2api_proxy_id`。该模式要求每个启用节点都有有效 ProxyID，且对应代理自身有可用的 fallback 策略；否则节点故障会直接影响生产调用。`GROK_ALLOW_MISSING_SUB2API_PROXY_IDS=true` 只保留给低层迁移检查，正式 `register_and_import.py` 仍会在注册前拒绝缺少 ProxyID 的粘性配置。
+
+健康预检会把本轮不健康节点排除出 lease 池，只要至少一个健康节点存在即可继续。节点若在注册中途断开，不盲目重放同一 attempt，因为上游账号可能已经创建；保留失败现场，下一批由持久游标使用下一个健康节点。
 
 运行中立健康检查：
 
@@ -192,7 +194,7 @@ python3 scripts/check_proxy_pool.py \
   --timeout 10
 ```
 
-任一节点成功率低于 2/3、TLS 校验失败、出口漂移或不同 ref 实际同出口，整批 fail closed。不要把论坛节点凭据、完整代理 URL 或出口 IP 写进仓库和公开日志。
+独立运行 `check_proxy_pool.py` 时，任一节点成功率低于 2/3、TLS 校验失败、出口漂移或不同 ref 实际同出口会整体失败，适合完整池审计。批次编排器会排除不健康或重复出口节点，只要至少一个健康节点仍可继续；manifest 会记录每个节点的脱敏原因。不要把论坛节点凭据、完整代理 URL 或出口 IP 写进仓库和公开日志。
 
 ### 4.4 主 V2Ray 与 Grok 代理池隔离
 
@@ -201,7 +203,7 @@ python3 scripts/check_proxy_pool.py \
 | 服务 | 配置 | 监听范围 | 用途 |
 |---|---|---|---|
 | `v2ray.service` | `/etc/v2ray/config.json` | 公网 VMess/mKCP UDP 31535；共享 SOCKS 10808/10810 | 其他客户端和服务器日常代理 |
-| `v2ray-grok-pool.service` | `/etc/v2ray/grok_pool.json` | 本机 `127.0.0.1:10900-10907`；认证的 Docker 网关入口 `172.18.0.1:10900-10907` | GROKAUTH 注册及 Sub2API 账号粘性代理池 |
+| `v2ray-grok-pool.service` | `/etc/v2ray/grok_pool.json` | 仅本机 `127.0.0.1:10900-10907` | GROKAUTH 注册、OAuth 和 preprobe 代理池 |
 
 严禁在 `v2ray.service.d/*.conf` 中把主服务 `ExecStart` 覆盖为 `grok_pool.json`。这会让公网 UDP 31535、10808 和 10810 全部消失，其他客户端立即断线。
 
@@ -216,14 +218,16 @@ python3 scripts/check_v2ray_isolation.py
 - `v2ray.service` 的 `ExecStart` 指向 `/etc/v2ray/config.json`。
 - `v2ray-grok-pool.service` 指向 `/etc/v2ray/grok_pool.json`。
 - 主服务 UDP 31535、TCP 10808/10810 存在。
-- 代理池 10900–10907 只能绑定 `127.0.0.1` 和指定 Docker 网关；禁止 `0.0.0.0` 或公网监听。
-- Docker 网关入口必须启用 SOCKS 密码认证，并按端口严格路由到对应 `proxy-01` 至 `proxy-08`。
-- Sub2API 中每个启用节点必须建立对应代理记录，并把实际返回的 ID 写入 `sub2api_proxy_id`。
+- 代理池 10900–10907 只能绑定 `127.0.0.1`；禁止 Docker 网关、`0.0.0.0` 或公网监听。
+- 每个本机 inbound 必须按端口严格路由到对应 `proxy-01` 至 `proxy-08`。
+- 注册专用模式下 Sub2API 账号 `proxy_id` 应为空，节点故障不会影响生产调用。
 - 两份配置均通过 `v2ray test`。
 
 如发现主服务 drop-in 指向 `grok_pool.json`，先保存现场并确认配置有效，再删除该精确 drop-in、执行 `systemctl daemon-reload`，分别重启两个服务。不要删除 `/etc/v2ray/config.json`，也不要把代理池合并进公共服务。
 
 ### 4.5 运行服务器流程
+
+加 `--confirm-production-write` 前，操作者必须明确确认：当前目录是目标 GROKAUTH 项目；`SUB2API_URL`、PostgreSQL 容器和数据库是目标部署；目标分组是独立 `grok`；本次账号数和 worker 数正确；已授权创建邮箱、注册上游账号、写入 Sub2API 和建立数据库恢复点。任一项不明确时先停在预检，不执行生产写入。
 
 推荐单账号 canary：
 
@@ -273,16 +277,16 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 
 1. 获取跨进程批次锁。
 2. 校验 `runtime.env` 权限、必填字段、worker、目标分组和 base URL。
-3. 如启用代理池，校验 ProxyID、TLS、成功率、出口稳定性和重复出口。
+3. 如启用代理池，校验 TLS、成功率、出口稳定性和重复出口；只有显式启用导入后粘性时才校验 ProxyID。
 4. 创建唯一 Mailu 邮箱。
 5. 每个 attempt 独立运行 `run.py`，完成注册、SSO、OAuth 和 auth JSON。
 6. 校验结果邮箱、auth 路径边界、凭据完整性并聚合 bundle。
 7. 对每个 auth 直接请求 Grok CLI `/responses` 做 preprobe。
 8. 403、传输错误和 5xx 可按配置等待重试；429 不自动重试。
 9. 按 access token hash 查询已存在账号，只导入缺失项；写入前创建数据库恢复点。
-10. 对本批精确账号统一收口 Grok 分组、官方 CLI base URL、凭据、调度状态和可选 ProxyID。
+10. 对本批精确账号统一收口 Grok 分组、官方 CLI base URL、凭据和调度状态；注册专用模式显式清空旧 ProxyID，粘性模式才写入 ProxyID。
 11. 验证数据库精确状态。
-12. 对每个导入账号 ID 调用 Sub2API 指定账号 SSE test，验证绑定后的代理和 OAuth。
+12. 对每个导入账号 ID 调用 Sub2API 指定账号 SSE test，验证 Sub2API 正常生产路径和 OAuth；默认不依赖注册代理。
 13. 使用 Grok 分组 API Key 调用 Sub2API `/v1/responses` 做 postprobe。
 14. 全部成功后 manifest 进入 `imported-preprobed`。
 
@@ -374,7 +378,7 @@ copy config.example.json config.json
 
   "proxy": "<client-local-proxy-url>",
   "register_count": 1,
-  "max_concurrency": 2,
+  "max_concurrency": 1,
   "hide_window": false,
   "block_media_fonts": false,
 
@@ -557,7 +561,7 @@ Content-Type: application/json
 - 邮箱 API 401：检查 `cloudflare_auth_mode=bearer` 和管理凭据。
 - 验证码失败：客户端最多更换邮箱重试 3 次。
 - OAuth 失败：保留邮箱、密码和 SSO，从已有账号补 OAuth，不要重新建号。
-- push 422：账号已隔离。等待资格传播或上游恢复后，重推同一个 CPA JSON。
+- push 422：账号已隔离。先读取指定账号 probe 的真实错误：资格传播或暂时上游故障可等待后重推同一 CPA JSON；`invalid_grant`、`Refresh token has been revoked` 或 `GROK_OAUTH_TOKEN_REFRESH_FAILED` 必须先重新登录铸造 OAuth；429 则等待 reset/cooldown。不能无分类地重复注册。
 - push 超时：先查 bridge 日志和 Sub2API 账号，不能假定服务端没有写入；确认后再幂等重推。
 - push 403：核对 management secret，不要把密钥放到命令行历史。
 - push 500：查看 bridge journal、Sub2API 和 PostgreSQL；不要直接重复注册新账号。

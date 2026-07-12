@@ -1,76 +1,86 @@
-# Windows Grok Client Runbook
+# Grok Sub2API Runbook
 
 ## 目录
 
-- 预检
-- Full 注册 UI
-- 已登录账号导出
-- Bridge 与验收
-- 错误索引
+- 服务器 canary
+- Windows 客户端
+- OAuth 恢复
+- 账号状态
+- 代理池
+- Bridge 和验收
+- 清理边界
 
-## 预检
+## 服务器 canary
 
-1. 使用 Python 3.12 或 3.13。
-2. `config.json` 从 `clients/windows/config.example.json` 创建，权限受限。
-3. `cloudflare_auth_mode=bearer`。
-4. `mint_required=true`、`cpa_push_required=true`、`cpa_require_probe_passed=true`。
-5. 客户端本机代理监听地址可连接；不要照抄另一台机器的 `127.0.0.1:<port>`。
-6. export-only 时用以下方式启动并确认 Edge CDP：
+1. 核对 `private/runtime.env` 和 `private/proxies.json` 权限为 `0600`。
+2. 确认 Mailu、Sub2API、PostgreSQL、bridge 和 Grok 分组身份。
+3. 运行 `scripts/check_v2ray_isolation.py` 和 `scripts/check_proxy_pool.py`。
+4. 固定 `--count 1 --workers 1 --failure-policy abort`。
+5. `protocol-yescaptcha` 不点击浏览器：邮件验证码通过 IMAP 读取，Turnstile 调用配置的 YesCaptcha；premium M1 按当前源码预计每次约 30 points。
+6. 检查 manifest 的 preprobe、精确账号状态、指定账号 SSE postprobe 和分组 postprobe。
 
-```powershell
-msedge.exe --remote-debugging-port=9222
-netstat -ano | findstr "LISTENING" | findstr "9222"
+## Windows 客户端
+
+1. 使用 Python 3.12/3.13，从 `config.example.json` 创建受限配置。
+2. full 模式使用客户端本机真实代理并执行 `--skip-cdp` 预检；首次并发输入 1。
+3. export-only 才需要用户明确启动 Edge CDP 9222；只附着，不结束用户 Edge。
+4. OneTrust 可能有零尺寸按钮；邮箱提交无效时先 Enter，再 `requestSubmit()`。
+5. 验证码优先从邮件 subject 的 `XXX-XXX` 解析，填表时去掉连字符。
+6. 资料字段写入或账号文本落盘都不是成功；必须继续 OAuth、auth 写盘、bridge push 和 probe。
+7. device OAuth 超时可回退 SSO 协议 OAuth；不要重新注册同一账号。
+
+## OAuth 恢复
+
+出现以下错误时标记 revoked：
+
+```text
+invalid_grant
+Refresh token has been revoked
+GROK_OAUTH_TOKEN_REFRESH_FAILED
 ```
 
-只附着用户已授权的 Edge，不结束它。
+恢复顺序：
 
-## Full 注册 UI
+1. 查受限账号产物是否保存邮箱、密码和 SSO，不打印值。
+2. 有密码/SSO时重新铸造 OAuth，先直接请求官方 CLI `/responses` 验证新 auth。
+3. 更新原 Sub2API 账号凭据，不创建重复账号；执行指定账号 probe 后再恢复调度。
+4. 无密码但邮箱可收信时走 xAI 忘记密码；邮箱也不存在时无法安全恢复。
+5. 旧 refresh token、数据库备份或旧 auth 文件不能替代重新登录。
 
-固定并发 1。页面变化时按以下状态推进，不按固定 sleep 猜测成功：
+## 账号状态
 
-1. 打开 `accounts.x.ai/sign-up`。
-2. 只点击有尺寸、可见的“使用邮箱注册”；OneTrust 常存在零尺寸隐藏按钮，不要硬点。
-3. 填邮箱后，点击提交无效时优先在邮箱框按 Enter，再用 `form.requestSubmit()` 回退。
-4. 验证码优先从邮件 subject 的 `XXX-XXX` 提取，填表时去掉连字符。
-5. 资料页“完成注册”不能以 DOM 字段已填或本地账号文件为成功。至少要进入 `grok.com` 并出现 `sso`/`sso-rw`。
-6. SSO 只用于 Web 会话；必须继续完成 OAuth mint、auth 写盘和 bridge push。
+| 结果 | 含义 | 动作 |
+|---|---|---|
+| 指定账号 test 完成 | 当前真实可用 | 保持入组和调度 |
+| 429 rolling 24h | 免费额度耗尽 | 临时冷却，等待 reset |
+| refresh revoked | token 不可刷新 | 重新登录铸造 OAuth |
+| 403 entitlement | 资格传播、订阅或风控 | 等待并复测，不立即删除 |
+| bridge 422 | probe 未通过且已隔离 | 按内部错误分类后恢复 |
 
-## 已登录账号导出
+数据库 `active`、`schedulable` 或 refresh token 字段存在都不是可用证据。审计时调用指定账号测试，不用分组请求代替。
 
-export-only 要求 Edge 中已有 `grok.com` 标签且目标身份正确。脚本会：
+## 代理池
 
-1. 附着 CDP 9222。
-2. 选择非 `accounts.x.ai` 的 `grok.com` 标签。
-3. 验证 `sso` 或 `sso-rw` cookie 名存在，不打印值。
-4. 运行 device OAuth；失败时可由客户端实现回退 SSO 协议 OAuth。
-5. 写 `xai-<email>.json`。
-6. push bridge，并要求 `probe=passed`。
+- 默认只覆盖注册、OAuth 和 preprobe；Sub2API 生产调用不绑定注册节点。
+- 启动前检查成功率、TLS、出口稳定和重复出口，只租用健康节点。
+- 持久游标使连续单账号批次轮换节点。
+- 节点在 attempt 中途失败时不盲目重放；账号可能已创建，先检查结果和邮箱。
+- 续跑时原注册节点若已不健康，preprobe 选择当前健康节点作为 fallback，并在 manifest 记录原 ref 和实际 preprobe ref；这不会给 Sub2API 账号绑定生产代理。
+- Windows 客户端使用其本机代理；服务器池的 `127.0.0.1` 地址不能照抄到另一台机器。
 
-多账号 Edge 必须先人工确认当前身份，避免给错误账号授权。
+## Bridge 和验收
 
-## Bridge 与验收
+- `200 + probe=passed + action=created`：客户端新增账号。
+- `action=updated`：更新已有账号。
+- `422`：隔离，不能算成功。
+- `403`：management secret 不匹配。
+- `500`：检查 bridge、Sub2API 和 PostgreSQL。
 
-- 200 + `probe=passed`：指定账号 probe 已通过并进入 Grok 分组。
-- `action=created`：本次新增账号。
-- `action=updated`：更新已有账号，不能声称账号数 +1。
-- 422：probe 未在窗口内通过，账号保持隔离。
-- 403：management secret 不匹配。
-- 500：查 bridge journal、Sub2API 和数据库依赖。
+最终再调用 Grok 分组 `/v1/responses`。服务器路径以 manifest/imported IDs 为新增证据；客户端路径以 bridge `action=created` 为新增证据。
 
-最终最好再调用 Grok 分组 `/v1/responses`。如果没有分组 API Key，只能报告“bridge 指定账号探针通过”，不能扩大为客户端业务入口已验证。
+## 清理边界
 
-## 错误索引
-
-| 现象 | 处理 |
-|---|---|
-| CDP 9222 连接拒绝 | 用远程调试参数重启 Edge，核对监听地址 |
-| 没有已登录 Grok 标签 | 在同一 Edge 登录目标账号后重试 |
-| 页面没有邮箱框 | 等 SPA，点击可见“使用邮箱注册”，检查代理挑战页 |
-| 邮箱提交无反应 | Enter，再 `requestSubmit()` |
-| 验证码不来 | 查邮箱 JWT、subject、MX/IMAP 和 bridge 日志 |
-| 资料页不跳转 | 查 Turnstile、密码规则、网络响应；不要记录假成功 |
-| device 一直 pending | 确认点了“允许”并到 done 页，核对目标身份和代理 |
-| push 超时 | 先查账号是否已创建，再幂等重推同一 auth |
-| bridge 422 | 等资格传播或上游恢复，重推同一 auth |
-| push 200 但无 `probe=passed` | 按失败处理，不能计为可用账号 |
-| Responses 401/403/429 | 分别查 token refresh、entitlement/传播、额度 reset/cooldown |
+- 账号删除前建立数据库恢复点，只删除用户明确指定的账号 ID。
+- 删除 Sub2API 账号不自动等于删除 Mailu 邮箱；两者分别授权。
+- 只删除本任务创建的临时 `config.json`、venv、任务调试端口和已证明归属的浏览器 profile。
+- auth、账号密码记录、数据库备份和审计日志默认保留为受限运行产物，除非用户精确授权删除。

@@ -5,8 +5,7 @@
       "ref": "node-01",
       "url_env": "GROK_PROXY_NODE_1",
       "enabled": true,
-      "max_active_leases": 1,
-      "sub2api_proxy_id": 12
+      "max_active_leases": 1
     }
   ]
 }

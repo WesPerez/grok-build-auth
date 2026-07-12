@@ -59,6 +59,7 @@ def check_proxy_pool_health(
     attempts: int = 3,
     timeout: float = 10.0,
     min_successes: int = 2,
+    require_all: bool = True,
     probe_once: Callable[[ProxySpec, float], tuple[str, str, str, float]] = _probe_once,
 ) -> ProxyHealthSnapshot:
     if not pool.configured:
@@ -82,9 +83,17 @@ def check_proxy_pool_health(
         healthy = len(samples) >= min_successes and len(ips) == 1
         ip_value = next(iter(ips)) if len(ips) == 1 else ""
         digest = hashlib.sha256(salt + ip_value.encode()).hexdigest()[:16] if ip_value else ""
+        reason = ""
+        duplicate_of = ""
+        if len(samples) < min_successes:
+            reason = "insufficient-successes"
+        elif len(ips) != 1:
+            reason = "exit-drift"
         if healthy and ip_value in exits:
             healthy = False
-            duplicates.append(f"{spec.ref}={exits[ip_value]}")
+            duplicate_of = exits[ip_value]
+            reason = "duplicate-exit"
+            duplicates.append(f"{spec.ref}={duplicate_of}")
         elif healthy:
             exits[ip_value] = spec.ref
         if not healthy:
@@ -99,6 +108,8 @@ def check_proxy_pool_health(
             "exit_hash": digest,
             "country": samples[0][1] if samples else "",
             "tls": samples[0][2] if samples else "",
+            "reason": reason,
+            "duplicate_of": duplicate_of,
             "latency_ms": {
                 "min": round(min(latencies), 1),
                 "median": round(statistics.median(latencies), 1),
@@ -106,7 +117,10 @@ def check_proxy_pool_health(
             } if latencies else {},
             "errors": sorted(set(errors)),
         })
-    if unhealthy:
+    healthy_refs = tuple(item["ref"] for item in results if item["healthy"])
+    if not healthy_refs:
+        raise ProxyPoolError(f"unhealthy proxy refs: {sorted(unhealthy)}; no healthy nodes")
+    if unhealthy and require_all:
         detail = f"unhealthy proxy refs: {sorted(unhealthy)}"
         if duplicates:
             detail += f"; duplicate exits: {sorted(duplicates)}"
@@ -116,6 +130,6 @@ def check_proxy_pool_health(
     return ProxyHealthSnapshot(
         checked_at=checked_at,
         results=tuple(results),
-        healthy_refs=tuple(item["ref"] for item in results if item["healthy"]),
+        healthy_refs=healthy_refs,
         snapshot_sha256=hashlib.sha256(encoded).hexdigest(),
     )

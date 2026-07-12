@@ -558,7 +558,7 @@ def reconcile_imported_accounts(
     for account_id in sorted(set(imported_ids)):
         update_account_via_admin_api(
             config, token, account_id, group_id,
-            (proxy_ids or {}).get(account_id),
+            (proxy_ids or {}).get(account_id, 0),
         )
 
 
@@ -713,6 +713,34 @@ def run_preimport_auth_probes(
         "elapsed_seconds": round(monotonic_fn() - started, 3),
         "results": results,
     }
+
+
+def build_preprobe_proxy_map(
+    auth_paths: list[Path], attempts: list[dict[str, Any]],
+    proxy_pool: Any, legacy_proxy: str = "",
+) -> dict[str, str]:
+    auth_names = {path.name for path in auth_paths}
+    proxy_by_file: dict[str, str] = {}
+    healthy_specs = list(proxy_pool.specs)
+    healthy_by_ref = {spec.ref: spec for spec in healthy_specs}
+    fallback_index = 0
+    for attempt in attempts:
+        auth_file = Path(str(attempt.get("auth_file") or ""))
+        if auth_file.name not in auth_names:
+            continue
+        ref = str(attempt.get("proxy_ref") or "")
+        if proxy_pool.configured and ref and ref != "direct":
+            selected = healthy_by_ref.get(ref)
+            if selected is None and healthy_specs:
+                selected = healthy_specs[fallback_index % len(healthy_specs)]
+                fallback_index += 1
+                attempt["preprobe_proxy_fallback_from"] = ref
+            if selected is not None:
+                attempt["preprobe_proxy_ref"] = selected.ref
+                proxy_by_file[auth_file.name] = selected.url
+        elif legacy_proxy:
+            proxy_by_file[auth_file.name] = legacy_proxy
+    return proxy_by_file
 
 
 def resolve_group_probe_key(config: dict[str, str]) -> str:
@@ -875,7 +903,15 @@ def main() -> int:
         proxy_pool = load_proxy_pool(config.get("GROK_PROXY_POOL_FILE", ""), config)
     except ProxyPoolError as exc:
         raise BatchError(str(exc)) from exc
+    bind_proxy_after_import = config.get("GROK_BIND_SUB2API_PROXY_AFTER_IMPORT", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+    configured_proxy_nodes = proxy_pool.enabled_count
     if proxy_pool.configured:
+        if bind_proxy_after_import and any(spec.sub2api_proxy_id is None for spec in proxy_pool.specs):
+            raise BatchError(
+                "post-import proxy stickiness requires sub2api_proxy_id on every enabled node"
+            )
         workers = min(workers, proxy_pool.capacity)
         if workers < 1:
             raise BatchError("configured proxy pool has no lease capacity")
@@ -892,7 +928,8 @@ def main() -> int:
             "SUB2API_POSTGRES_CONTAINER", "SUB2API_PG_USER", "SUB2API_PG_DB",
             "SUB2API_IMPORT_TOOL", "GROK_ACCOUNT_BASE_URL",
         ])
-        validate_sub2api_proxy_ids(config, proxy_pool)
+        if bind_proxy_after_import:
+            validate_sub2api_proxy_ids(config, proxy_pool)
     proxy_health = None
     if proxy_pool.configured:
         try:
@@ -900,7 +937,10 @@ def main() -> int:
                 proxy_pool,
                 attempts=int(config.get("GROK_PROXY_HEALTH_ATTEMPTS", "3") or "3"),
                 timeout=float(config.get("GROK_PROXY_HEALTH_TIMEOUT", "10") or "10"),
+                require_all=False,
             )
+            proxy_pool = proxy_pool.only_refs(set(proxy_health.healthy_refs))
+            workers = min(workers, proxy_pool.capacity)
         except (ProxyPoolError, ValueError) as exc:
             raise BatchError(f"proxy health preflight failed: {exc}") from exc
     if runtime_file.stat().st_mode & 0o077:
@@ -940,7 +980,8 @@ def main() -> int:
             "proxy_pool": {
                 "configured": proxy_pool.configured,
                 "enabled_nodes": proxy_pool.enabled_count,
-                "postimport_stickiness": all(spec.sub2api_proxy_id is not None for spec in proxy_pool.specs),
+                "configured_nodes": configured_proxy_nodes,
+                "postimport_stickiness": bind_proxy_after_import,
                 "mode": "pool" if proxy_pool.configured else (
                     "legacy-single" if config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") else "direct"
                 ),
@@ -982,7 +1023,7 @@ def main() -> int:
             try:
                 lease = proxy_pool.acquire()
                 attempt["proxy_ref"] = lease.ref if lease else "direct"
-                if lease and lease.spec.sub2api_proxy_id is not None:
+                if bind_proxy_after_import and lease and lease.spec.sub2api_proxy_id is not None:
                     attempt["sub2api_proxy_id"] = lease.spec.sub2api_proxy_id
                 save_manifest()
                 create_mailbox(config, email)
@@ -1136,16 +1177,9 @@ def main() -> int:
 
     set_manifest_stage(manifest, manifest_path, "upstream-preprobe")
     legacy_proxy = config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") or ""
-    proxy_by_file: dict[str, str] = {}
-    for attempt in manifest.get("attempts") or []:
-        auth_file = Path(str(attempt.get("auth_file") or ""))
-        if not auth_file.name:
-            continue
-        ref = str(attempt.get("proxy_ref") or "")
-        if proxy_pool.configured and ref and ref != "direct":
-            proxy_by_file[auth_file.name] = proxy_pool.url_for(ref)
-        elif legacy_proxy:
-            proxy_by_file[auth_file.name] = legacy_proxy
+    proxy_by_file = build_preprobe_proxy_map(
+        auth_paths, manifest.get("attempts") or [], proxy_pool, legacy_proxy,
+    )
     preprobe = run_preimport_auth_probes(
         auth_paths,
         proxy_by_file=proxy_by_file,
@@ -1257,13 +1291,23 @@ def main() -> int:
     for attempt in manifest.get("attempts") or []:
         if attempt.get("status") != "registered" or not attempt.get("auth_file"):
             continue
-        proxy_id = attempt.get("sub2api_proxy_id")
+        proxy_id = attempt.get("sub2api_proxy_id") if bind_proxy_after_import else None
         if not isinstance(proxy_id, int) or proxy_id < 1:
             continue
         digest = auth_token_hash(Path(str(attempt["auth_file"])))
         account_id = resolved.get(digest)
         if account_id is not None:
             proxy_ids_by_account[account_id] = proxy_id
+    if bind_proxy_after_import:
+        missing_proxy_bindings = sorted(set(all_ids) - set(proxy_ids_by_account))
+        if missing_proxy_bindings:
+            raise BatchError(
+                "post-import proxy stickiness is enabled but no proxy mapping was recorded "
+                f"for account IDs: {missing_proxy_bindings}"
+            )
+    else:
+        # Sub2API interprets proxy_id=0 as an explicit request to clear the binding.
+        proxy_ids_by_account = {account_id: 0 for account_id in all_ids}
     set_manifest_stage(manifest, manifest_path, "grok-reconcile")
     try:
         reconcile_imported_accounts(config, all_ids, proxy_ids_by_account)
