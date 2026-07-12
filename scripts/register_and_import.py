@@ -39,6 +39,7 @@ from xai_build_quota_probe import probe as probe_grok_auth
 PROJECT_DIR = Path(__file__).resolve().parents[1]
 EMAIL_RE = re.compile(r"^(xai[a-f0-9]{6})@([A-Za-z0-9.-]+)$")
 BATCH_LOCK_PATH = PROJECT_DIR / "private" / "batch-orchestrator.lock"
+GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
 
 class BatchError(RuntimeError):
@@ -263,9 +264,10 @@ def validate_grok_target_config(config: dict[str, str]) -> str:
     value = config.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/")
     parsed = urlparse(value)
     if (
-        parsed.scheme != "http"
-        or parsed.hostname != "grok-cli-proxy"
-        or parsed.port != 8080
+        value != GROK_CLI_BASE_URL
+        or parsed.scheme != "https"
+        or parsed.hostname != "cli-chat-proxy.grok.com"
+        or parsed.port is not None
         or parsed.path != "/v1"
         or parsed.params
         or parsed.query
@@ -273,7 +275,7 @@ def validate_grok_target_config(config: dict[str, str]) -> str:
         or parsed.username
         or parsed.password
     ):
-        raise BatchError("GROK_ACCOUNT_BASE_URL must be http://grok-cli-proxy:8080/v1")
+        raise BatchError(f"GROK_ACCOUNT_BASE_URL must be {GROK_CLI_BASE_URL}")
     return value
 
 

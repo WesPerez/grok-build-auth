@@ -11,7 +11,7 @@
 - `status=active`
 - `schedulable=true`
 - 只绑定 Grok 分组
-- `credentials.base_url=http://grok-cli-proxy:8080/v1`
+- `credentials.base_url=https://cli-chat-proxy.grok.com/v1`
 - 指定账号探针和 Grok 分组 `/v1/responses` 均成功
 
 有两条生产路径：
@@ -41,8 +41,7 @@ grok_register_ttk.py -> bridge 邮箱 API -> x.ai 注册 -> OAuth
 | GROKAUTH | 注册、OAuth、批次、探针、导入编排 | 本仓库 |
 | 外部客户端 | 浏览器注册、OAuth、CPA JSON 推送 | `clients/windows/` |
 | bridge | 邮箱兼容 API、CPA 接收、隔离探针和入组 | `bridge/bridge.py` |
-| Sub2API | 账号池、分组、轮询和 OpenAI 兼容 API | 独立仓库/部署 |
-| `grok-cli-proxy` | 固定 Grok CLI 上游并补齐兼容请求头 | Sub2API 部署侧 sidecar |
+| Sub2API | 账号池、分组、轮询、Grok CLI 请求兼容和 OpenAI 兼容 API | 独立仓库/部署 |
 
 Windows 调试现场中的日志、真实 auth、账号密码、代理节点和一次性 patch/test 脚本没有纳入仓库。仓库只保留经过脱敏和收口的正式入口。
 
@@ -52,7 +51,7 @@ Windows 调试现场中的日志、真实 auth、账号密码、代理节点和�
 - Docker CLI，以及可访问的 Mailu、PostgreSQL 和 Sub2API。
 - YesCaptcha 或兼容 createTask 的 Turnstile 服务。
 - 自有、授权且稳定的 HTTP/SOCKS 代理；代理失败时不得静默回退直连。
-- Sub2API 中已有独立 Grok 分组、可用 Grok API Key 和 `grok-cli-proxy`。
+- Sub2API 中已有独立 Grok 分组、可用 Grok API Key，并包含原生 Grok CLI 请求兼容。
 - 所有系统时钟正确，否则 JWT、OAuth 和冷却时间会误判。
 
 安装 GROKAUTH：
@@ -107,7 +106,7 @@ backup/*.dump
 | `MAILU_ADMIN_CONTAINER`、`MAILU_FLASK_BIN` | Mailu 官方用户创建/删除入口 |
 | `MAILU_IMAP_CONTAINER`、`MAILU_MAIL_ROOT` | 仅用于精确清理本批失败邮箱 |
 | `SUB2API_GROUP` | 必须为 `grok` |
-| `GROK_ACCOUNT_BASE_URL` | 必须为 `http://grok-cli-proxy:8080/v1` |
+| `GROK_ACCOUNT_BASE_URL` | 必须为 `https://cli-chat-proxy.grok.com/v1` |
 
 生产导入额外必填：
 
@@ -275,7 +274,7 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 7. 对每个 auth 直接请求 Grok CLI `/responses` 做 preprobe。
 8. 403、传输错误和 5xx 可按配置等待重试；429 不自动重试。
 9. 按 access token hash 查询已存在账号，只导入缺失项；写入前创建数据库恢复点。
-10. 对本批精确账号统一收口 Grok 分组、sidecar base URL、凭据、调度状态和可选 ProxyID。
+10. 对本批精确账号统一收口 Grok 分组、官方 CLI base URL、凭据、调度状态和可选 ProxyID。
 11. 验证数据库精确状态。
 12. 使用 Grok 分组 API Key 调用 Sub2API `/v1/responses` 做 postprobe。
 13. 全部成功后 manifest 进入 `imported-preprobed`。
@@ -523,7 +522,7 @@ Content-Type: application/json
 
 1. 校验 email、access token、refresh token、JWT `exp` 和 `sub`。
 2. 创建或更新账号时先设置 `group_ids=[]`、`schedulable=false`。
-3. 强制写入 `http://grok-cli-proxy:8080/v1`。
+3. 强制写入 `https://cli-chat-proxy.grok.com/v1`。
 4. 调用 Sub2API 指定账号 Responses test。
 5. 每 30 秒重试，最长 180 秒。
 6. 通过后绑定 Grok 分组并设置 `schedulable=true`。
@@ -540,7 +539,7 @@ Content-Type: application/json
 - 本地 CPA JSON 已生成且权限安全。
 - 日志明确显示 push HTTP 200。
 - bridge 响应含 `account_id` 和 `probe=passed`。
-- Sub2API 账号为 active、schedulable、唯一 Grok 分组、内网 sidecar base URL。
+- Sub2API 账号为 active、schedulable、唯一 Grok 分组、官方 CLI base URL。
 - Grok 分组 `/v1/responses` 返回 200。
 
 ### 5.8 外部客户端失败恢复
@@ -597,14 +596,15 @@ curl -sS -N https://<sub2api-domain>/v1/responses \
 
 ## 7. Sub2API Grok 路由和账号轮询
 
-Grok CLI OAuth 请求必须经过兼容 sidecar，补齐 CLI User-Agent 和 Grok CLI headers。sidecar 应满足：
+Sub2API 已原生处理 Grok CLI OAuth Responses 请求：
 
-- 固定上游 `https://cli-chat-proxy.grok.com/v1`，客户端不能选择 Host。
-- 透传 Authorization，但不持久化 token 和请求体。
-- 不映射宿主公网端口，只在受控容器网络内提供服务。
-- `/healthz` 只表示进程存活，不代表 OAuth、资格或额度可用。
+- OAuth 账号默认并只需使用官方 `https://cli-chat-proxy.grok.com/v1`。
+- 出站请求由当前调度账号生成 `Authorization: Bearer <access_token>`。
+- 固定补齐 `grok-cli/0.2.93` User-Agent、`X-XAI-Token-Auth`、客户端版本和客户端标识。
+- 对 `grok-4.5*` 历史 `input` 中 `type=reasoning` 且 `content=null` 的项目只删除该空字段。
+- 流式和非流式响应共用同一原生请求构造，不依赖独立 sidecar。
 
-若 Sub2API 需要 `XAI_ALLOW_UNSAFE_URL_OVERRIDES=true` 才能指向 sidecar，该设置扩大了管理员可配置 URL 的 SSRF 风险。只允许受信管理员修改 Grok 账号；Sub2API 原生支持 CLI headers 后应删除该变量和 sidecar。
+生产不应再设置 `XAI_ALLOW_UNSAFE_URL_OVERRIDES`，也不应保留 `grok-cli-proxy` 容器。官方 CLI host 已在 Sub2API 的 xAI allowlist 中，恢复默认 URL 校验可避免内部 HTTP URL 和任意上游覆盖扩大 SSRF 范围。
 
 当前已验证的 429 行为：
 
@@ -631,7 +631,7 @@ token 过期 -> refresh token 续期
 | 402 | 不能统一解释为欠费；先检查 CLI headers、base URL、通道兼容和明确额度证据 |
 | 403 | entitlement、资格传播、订阅或风控 |
 | 429 | 限流/额度；看 `Retry-After`、reset 和响应体，不要立即永久禁用账号 |
-| 502 | 可能是上游 402/403 的包装，也可能是 sidecar/网络错误；查 ops 日志真实状态 |
+| 502 | token refresh、上游连接或内部转发失败；查 ops 日志中的真实 reason 和账号 ID |
 
 ## 8. 发布、验证和回滚
 
@@ -639,14 +639,14 @@ token 过期 -> refresh token 续期
 
 1. 备份账号、分组、API Key 和相关数据库表。
 2. 创建独立 Grok 分组和专用 Key。
-3. 启动 `grok-cli-proxy` 并通过容器内 healthcheck。
-4. 如需要，受控启用 URL override 并重建 Sub2API。
+3. 部署包含原生 Grok CLI headers 和 reasoning sanitizer 的 Sub2API 镜像。
+4. 确认 `XAI_ALLOW_UNSAFE_URL_OVERRIDES` 未设置，且没有独立 Grok sidecar。
 5. 先导入 1 个账号，保持隔离直至指定账号探针通过。
-6. 校验数据库精确状态。
-7. 执行非流式和流式 Responses。
+6. 校验数据库和 Redis 中账号 base URL 都是官方 CLI URL。
+7. 执行公网非流式和流式 Responses。
 8. 再逐步扩大账号数和代理节点数。
 
-回滚前必须确认备份、目标账号和允许的中断窗口。一般顺序：停止使用 Grok 专用 Key，隔离账号，将 base URL 恢复到官方 CLI URL，等待调度缓存/outbox 收敛，再移除 sidecar 和 URL override。移除 sidecar 后若 Sub2API 仍不会原生补 CLI headers，Responses 会重新失败，因此不能只做一半回滚。
+回滚前必须确认备份、目标账号和允许的中断窗口。应用版本回滚与账号 URL 回滚必须配套：旧版若不原生补齐 CLI headers，就不能让账号继续直连官方 CLI URL；此时应先停止 Grok 专用 Key，再恢复经过验证的旧完整部署。不要只恢复 sidecar 或只改数据库而忽略 Redis/outbox。
 
 数据库恢复、删除账号、停止服务、删除镜像或清理邮箱都属于高风险操作，必须明确指定目标。只能清理由本批 manifest 精确证明归属的邮箱或产物。
 
@@ -679,7 +679,7 @@ token 过期 -> refresh token 续期
 运行前：
 
 - `runtime.env`、代理池和外部客户端 `config.json` 权限为 `0600`。
-- Mailu、PostgreSQL、Sub2API、sidecar 和 bridge 健康。
+- Mailu、PostgreSQL、Sub2API 和 bridge 健康，旧 Grok sidecar 不存在。
 - 代理池健康检查通过，未配置冲突的 `GROK_BROWSER_PROXY_URL`。
 - Grok 分组和专用 API Key 存在。
 - 从 1 个账号、1 路并发开始。

@@ -61,6 +61,7 @@ SUB2API_GROK_GROUP_ID = int(required_env("SUB2API_GROK_GROUP_ID"))
 
 BRIDGE_PORT = int(os.environ.get("BRIDGE_PORT", "8190"))
 MAX_REQUEST_BODY = 1024 * 1024
+GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 SUB2API_POSTGRES_CONTAINER = required_env("SUB2API_POSTGRES_CONTAINER")
 SUB2API_PG_USER = required_env("SUB2API_PG_USER")
 SUB2API_PG_DB = required_env("SUB2API_PG_DB")
@@ -170,7 +171,7 @@ def find_account_id(name):
 
 def build_account_payload(name, auth_data, group_ids, schedulable):
     fixed_credentials = dict(auth_data)
-    fixed_credentials["base_url"] = "http://grok-cli-proxy:8080/v1"
+    fixed_credentials["base_url"] = GROK_CLI_BASE_URL
     token_hash = hashlib.sha256(str(auth_data["access_token"]).encode()).hexdigest()
     return {
         "name": name,
@@ -178,7 +179,7 @@ def build_account_payload(name, auth_data, group_ids, schedulable):
         "type": "oauth",
         "credentials": fixed_credentials,
         "extra": {
-            "base_url": "http://grok-cli-proxy:8080/v1",
+            "base_url": GROK_CLI_BASE_URL,
             "access_token_sha256": token_hash,
             "import_source": "grok-register-bridge",
         },

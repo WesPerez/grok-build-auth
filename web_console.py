@@ -26,6 +26,7 @@ WEB_DIR = PROJECT_DIR / "web"
 TASK_STATE_PATH = PRIVATE_DIR / "web" / "current-task.json"
 ACTIVE_BATCH_STATUSES = {"running", "importing", "resuming-import"}
 DOCTOR_CACHE_TTL = 30.0
+GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 
 
 def read_json(path: Path) -> dict:
@@ -211,11 +212,11 @@ def doctor() -> list[dict]:
         add("导入工具", helper.is_file(), str(helper) if helper.is_file() else "导入工具路径无效")
         grok_target_ok = (
             values.get("SUB2API_GROUP") == "grok"
-            and values.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/") == "http://grok-cli-proxy:8080/v1"
+            and values.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/") == GROK_CLI_BASE_URL
         )
         add(
             "Grok 导入目标", grok_target_ok,
-            "grok 组 → Docker 内网 CLI 头代理" if grok_target_ok else "必须配置 grok 组和 http://grok-cli-proxy:8080/v1",
+            "grok 组 → 官方 Grok CLI 上游" if grok_target_ok else f"必须配置 grok 组和 {GROK_CLI_BASE_URL}",
         )
         mailu_db = Path(values.get("MAILU_DB", ""))
         add("Mailu 数据库", mailu_db.is_file(), str(mailu_db) if mailu_db.is_file() else "Mailu 数据库路径无效")
@@ -230,22 +231,13 @@ def doctor() -> list[dict]:
             proc = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", container], text=True, capture_output=True) if container else None
             ok = bool(proc and proc.returncode == 0 and proc.stdout.strip() == "true")
             add(label, ok, f"容器 {container} 正常" if ok else f"容器 {container or '(未配置)'} 不可用")
-        proxy = subprocess.run(
-            ["docker", "inspect", "-f", "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{end}}", "sub2api-prod-grok-cli-proxy"],
-            text=True, capture_output=True,
-        )
-        proxy_ok = proxy.returncode == 0 and proxy.stdout.strip() == "true healthy"
-        add("Grok CLI 头代理", proxy_ok, "容器 healthy" if proxy_ok else "sub2api-prod-grok-cli-proxy 不健康")
+        proxy = subprocess.run(["docker", "inspect", "sub2api-prod-grok-cli-proxy"], capture_output=True)
+        add("独立 Grok sidecar", proxy.returncode != 0, "已由 Sub2API 原生处理" if proxy.returncode != 0 else "旧 sidecar 仍存在")
         override = subprocess.run(
-            ["docker", "exec", "sub2api-prod", "sh", "-lc", "test \"$XAI_ALLOW_UNSAFE_URL_OVERRIDES\" = true"],
+            ["docker", "exec", "sub2api-prod", "sh", "-lc", "test -z \"$XAI_ALLOW_UNSAFE_URL_OVERRIDES\""],
             capture_output=True,
         )
-        add("内网上游许可", override.returncode == 0, "Sub2API 允许受控内网 Grok 上游" if override.returncode == 0 else "XAI_ALLOW_UNSAFE_URL_OVERRIDES 未启用")
-        connectivity = subprocess.run(
-            ["docker", "exec", "sub2api-prod", "wget", "-q", "-T", "5", "-O", "/dev/null", "http://grok-cli-proxy:8080/healthz"],
-            capture_output=True,
-        )
-        add("容器内连通性", connectivity.returncode == 0, "Sub2API 可访问 Grok CLI 头代理" if connectivity.returncode == 0 else "Sub2API 无法访问 grok-cli-proxy")
+        add("安全 URL 校验", override.returncode == 0, "unsafe URL override 未启用" if override.returncode == 0 else "必须移除 XAI_ALLOW_UNSAFE_URL_OVERRIDES")
         pg_container = values.get("SUB2API_POSTGRES_CONTAINER", "")
         pg_user = values.get("SUB2API_PG_USER", "")
         pg_db = values.get("SUB2API_PG_DB", "")
@@ -255,6 +247,12 @@ def doctor() -> list[dict]:
         ], text=True, capture_output=True) if pg_container and pg_user and pg_db else None
         group_ok = bool(group_check and group_check.returncode == 0 and group_check.stdout.strip() == "1")
         add("Grok 生产分组", group_ok, "独占且仅 OAuth 的 grok 分组已就绪" if group_ok else "grok 生产分组缺失或配置不正确")
+        account_url_check = subprocess.run([
+            "docker", "exec", pg_container, "psql", "-U", pg_user, "-d", pg_db, "-Atc",
+            "select count(*) from accounts where deleted_at is null and platform='grok' and type='oauth' and credentials->>'base_url' <> 'https://cli-chat-proxy.grok.com/v1';",
+        ], text=True, capture_output=True) if pg_container and pg_user and pg_db else None
+        account_urls_ok = bool(account_url_check and account_url_check.returncode == 0 and account_url_check.stdout.strip() == "0")
+        add("Grok 账号上游", account_urls_ok, "全部使用官方 CLI URL" if account_urls_ok else "存在旧 base_url 或非官方目标")
         admin = values.get("MAILU_ADMIN_CONTAINER", "")
         flask_bin = values.get("MAILU_FLASK_BIN", "")
         proc = subprocess.run(["docker", "exec", admin, "test", "-x", flask_bin], capture_output=True) if admin and flask_bin else None

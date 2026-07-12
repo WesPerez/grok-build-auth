@@ -30,7 +30,7 @@ def write_auth(path: Path, email: str = "xaiabcdef@example.com") -> Path:
 
 
 def test_build_bundle_uses_current_timestamp_and_token_hash(tmp_path):
-    base_url = "http://grok-cli-proxy:8080/v1"
+    base_url = "https://cli-chat-proxy.grok.com/v1"
     bundle = MODULE.build_bundle([write_auth(tmp_path / "auth.json")], base_url)
     assert bundle["exported_at"].endswith("Z")
     assert bundle["accounts"][0]["extra"]["access_token_sha256"]
@@ -126,7 +126,7 @@ def test_resume_bundle_requires_matching_hash_and_exact_path(tmp_path):
     bundle_dir.mkdir()
     auth = write_auth(auth_dir / "xaiabcdef@example.com.json")
     bundle = bundle_dir / "sub2api-bundle.json"
-    MODULE.atomic_json(bundle, MODULE.build_bundle([auth], "http://grok-cli-proxy:8080/v1"))
+    MODULE.atomic_json(bundle, MODULE.build_bundle([auth], "https://cli-chat-proxy.grok.com/v1"))
     MODULE.atomic_json(batch / "manifest.json", {
         "batch_id": "batch-1", "status": "import-failed", "bundle": str(bundle),
         "bundle_sha256": MODULE.hashlib.sha256(bundle.read_bytes()).hexdigest(),
@@ -138,20 +138,20 @@ def test_resume_bundle_requires_matching_hash_and_exact_path(tmp_path):
     assert auth_paths == [auth.resolve()]
 
 
-def test_grok_target_config_requires_dedicated_group_and_proxy():
+def test_grok_target_config_requires_dedicated_group_and_official_cli_url():
     assert MODULE.validate_grok_target_config({
         "SUB2API_GROUP": "grok",
-        "GROK_ACCOUNT_BASE_URL": "http://grok-cli-proxy:8080/v1",
-    }) == "http://grok-cli-proxy:8080/v1"
+        "GROK_ACCOUNT_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
+    }) == "https://cli-chat-proxy.grok.com/v1"
     with pytest.raises(MODULE.BatchError, match="must be grok"):
         MODULE.validate_grok_target_config({
             "SUB2API_GROUP": "openai",
-            "GROK_ACCOUNT_BASE_URL": "http://grok-cli-proxy:8080/v1",
+            "GROK_ACCOUNT_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
         })
-    with pytest.raises(MODULE.BatchError, match="grok-cli-proxy"):
+    with pytest.raises(MODULE.BatchError, match="cli-chat-proxy"):
         MODULE.validate_grok_target_config({
             "SUB2API_GROUP": "grok",
-            "GROK_ACCOUNT_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
+            "GROK_ACCOUNT_BASE_URL": "https://api.x.ai/v1",
         })
 
 
@@ -168,7 +168,7 @@ def test_reconcile_updates_exact_ids_through_admin_api(monkeypatch):
         "SUB2API_PG_USER": "user",
         "SUB2API_PG_DB": "db",
         "SUB2API_GROUP": "grok",
-        "GROK_ACCOUNT_BASE_URL": "http://grok-cli-proxy:8080/v1",
+        "GROK_ACCOUNT_BASE_URL": "https://cli-chat-proxy.grok.com/v1",
     }, [17, 23])
     assert updated == [("short-lived-token", 17, 5, None), ("short-lived-token", 23, 5, None)]
 
@@ -177,7 +177,7 @@ def test_build_bundle_rejects_duplicate_auth_tokens(tmp_path):
     first = write_auth(tmp_path / "one.json", "xai111111@example.com")
     second = write_auth(tmp_path / "two.json", "xai222222@example.com")
     with pytest.raises(MODULE.BatchError, match="duplicate"):
-        MODULE.build_bundle([first, second], "http://grok-cli-proxy:8080/v1")
+        MODULE.build_bundle([first, second], "https://cli-chat-proxy.grok.com/v1")
 
 
 def test_manifest_stage_records_activity_and_stage_start(tmp_path):

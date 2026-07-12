@@ -68,7 +68,7 @@
 
 以下生产数量和环境变量是 2026-07-12 的只读快照，不是源码的永久事实。
 
-- 生产 `XAI_ALLOW_UNSAFE_URL_OVERRIDES=true` 全局绕过 host/private-network 保护，有 SSRF 风险。应只 allowlist 内部 `grok-cli-proxy` 或使用受控内部代理标识。
+- 已移除生产 `XAI_ALLOW_UNSAFE_URL_OVERRIDES` 和内部 `grok-cli-proxy`；Grok OAuth 账号现使用官方 CLI URL，并由 Sub2API 的 xAI host allowlist 校验。
 - `XAI_GROK_UNSAFE_ALLOW_CONCURRENCY_GT_ONE` 目前没有真正执行限制；生产有一个账号 concurrency=10。Grok OAuth 账号默认应强制为 1。
 - RefreshToken 指定不存在代理时会静默直连，应改为明确失败。
 - OAuth session 只存在进程内存，重启或多副本会丢失；应迁移 Redis，并绑定管理员、代理和 redirect URI。
@@ -92,7 +92,7 @@
 ## 落地顺序
 
 1. 已修复邮箱 RPC 和 RSC 建号成功判定。
-2. 已修复 Grok/Codex 多轮 Responses `content:null` 兼容，且限定在指向 compat sidecar 的 `grok-4.5` 账号。
+2. 已在 Sub2API Grok 专用路径修复多轮 Responses `content:null` 兼容，并限定为最终上游模型 `grok-4.5*`。
 3. 把导入前直连 probe、导入后 Sub2API probe 变成强制门禁。
 4. 在阶段耗时、CPU/RAM 和失败率可观测后，才引入默认 1、最大 2 的有界协议注册并发；OAuth 和浏览器路径保持串行。
 5. 实现 per-account sticky `ProxyContext`，全链路传递、出口验证、fail closed，并在导入时绑定 Sub2API `ProxyID`。
@@ -150,9 +150,9 @@ Grok CLI `/v1/responses` 不接受 reasoning item 中显式存在的 `content: n
 
 ### 对当前架构的意义
 
-- 当前 Nginx Grok sidecar 只补 CLI 请求头并透明转发 body，无法修改 JSON，所以它能解决早先的 header/402 问题，不能解决本次 422。
-- 不必改动 Sub2API 的通用 OpenAI 路径。最小、低影响的修复位置是 Grok 专用 `patchGrokResponsesBody`，仅删除 reasoning item 中的 `content:null`，并保留其他字段。这不影响其他分组或模型。
-- 若坚持 Sub2API 源码零改动，只能换用已含该修复的 CLIProxyAPI 转发链，或把 sidecar 升级为能解析和重写 JSON 的应用代理。后者的实现、测试和运维风险都高于 Grok 分支内的局部 sanitizer。
+- Sub2API 的 Grok 专用 `patchGrokResponsesBody` 已实现精确 sanitizer；通用 OpenAI 路径、其他分组和其他模型不受影响。
+- Grok Responses 出站请求已原生补齐四个 CLI headers，账号测试和额度探测共用相同 header helper。
+- 独立 sidecar、内部 HTTP base URL 和 unsafe URL override 已从生产部署移除；公网流式和非流式 Responses 均完成真实 200 验收。
 
 ## 可复核来源
 
