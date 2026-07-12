@@ -192,6 +192,37 @@ def build_account_payload(name, auth_data, group_ids, schedulable):
     }
 
 
+def account_test_succeeded(raw_body):
+    text = raw_body.decode("utf-8", errors="replace")
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        for line in text.splitlines():
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                result = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(result, dict)
+                and result.get("type") == "test_complete"
+                and result.get("success") is True
+            ):
+                return True
+        return False
+
+    if not isinstance(result, dict):
+        return False
+    if result.get("success") is True:
+        return True
+    data = result.get("data")
+    return isinstance(data, dict) and data.get("success") is True
+
+
 def test_sub2api_account(account_id):
     url = f"{SUB2API_BASE}/api/v1/admin/accounts/{account_id}/test"
     body = json.dumps({
@@ -205,13 +236,8 @@ def test_sub2api_account(account_id):
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=60) as resp:
-        result = json.loads(resp.read(1024 * 1024))
-    if not isinstance(result, dict):
-        return False
-    if result.get("success") is True:
-        return True
-    data = result.get("data")
-    return isinstance(data, dict) and data.get("success") is True
+        raw_body = resp.read(1024 * 1024)
+    return account_test_succeeded(raw_body)
 
 
 def test_sub2api_account_with_retry(account_id, max_wait=180, interval=30):

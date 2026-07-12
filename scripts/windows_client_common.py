@@ -105,8 +105,9 @@ def responses_probe(
             "Accept": "application/json",
         },
     )
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with opener.open(request, timeout=timeout) as response:
             status = int(response.status)
             body = response.read(1024 * 1024).decode(errors="replace")
     except urllib.error.HTTPError as exc:

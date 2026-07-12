@@ -355,6 +355,7 @@ copy config.example.json config.json
 {
   "email_provider": "cloudflare",
   "cloudflare_api_base": "https://<bridge-domain>",
+  "bridge_health_path": "/health",
   "cloudflare_path_accounts": "/admin/new_address",
   "cloudflare_path_domains": "/api/domains",
   "cloudflare_path_token": "/api/token",
@@ -390,6 +391,7 @@ copy config.example.json config.json
 注意：
 
 - `proxy` 必须是客户端本机实际监听地址，不能照抄服务器的 `127.0.0.1:<port>`。
+- bridge 健康检查不是 `/health` 时，通过 `bridge_health_path` 填写实际公网路径，例如 `/bridge-health`。
 - `mint_proxy` 为空时复用注册代理。
 - 邮箱 API 和 CPA push 当前可使用同一 bridge 管理凭据，但应长期拆分权限。
 - `config.json` 含管理密钥，权限必须为 `0600`，不得打包分享或提交 Git。

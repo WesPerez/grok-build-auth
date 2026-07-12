@@ -59,6 +59,44 @@ def test_bridge_probe_parses_json(monkeypatch, tmp_path):
     assert bridge.test_sub2api_account(1) is True
 
 
+def test_bridge_probe_parses_sse(monkeypatch, tmp_path):
+    bridge = load_bridge(monkeypatch, tmp_path)
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit):
+            return (
+                b'data: {"type":"test_start","model":"grok-4.5"}\n\n'
+                b'data: {"type":"content","text":"OK"}\n\n'
+                b'data: {"type":"test_complete","success":true}\n\n'
+            )
+
+    monkeypatch.setattr(bridge.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    assert bridge.test_sub2api_account(1) is True
+
+
+def test_bridge_probe_rejects_incomplete_sse(monkeypatch, tmp_path):
+    bridge = load_bridge(monkeypatch, tmp_path)
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit):
+            return b'data: {"type":"test_start","success":true}\n\n'
+
+    monkeypatch.setattr(bridge.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    assert bridge.test_sub2api_account(1) is False
+
+
 def test_bridge_source_contains_no_embedded_production_secret():
     source = BRIDGE.read_text(encoding="utf-8")
     assert "mailu_api_" not in source

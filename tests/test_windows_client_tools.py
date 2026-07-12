@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -16,6 +17,7 @@ sys.path.insert(0, str(SCRIPTS))
 from windows_client_common import (  # noqa: E402
     WindowsClientError,
     require_config,
+    responses_probe,
     validate_bridge_result,
 )
 
@@ -33,6 +35,19 @@ def test_require_config_rejects_placeholders():
         require_config({"remote": "<secret>"}, "remote")
 
 
+def test_windows_preflight_supports_configured_bridge_health_path():
+    preflight = load_module("windows_client_preflight_test", SCRIPTS / "windows_client_preflight.py")
+    assert preflight.bridge_health_url({
+        "cloudflare_api_base": "https://bridge.example/",
+        "bridge_health_path": "/bridge-health",
+    }) == "https://bridge.example/bridge-health"
+    with pytest.raises(WindowsClientError, match="absolute path"):
+        preflight.bridge_health_url({
+            "cloudflare_api_base": "https://bridge.example",
+            "bridge_health_path": "https://evil.example/health",
+        })
+
+
 def test_validate_bridge_result_requires_probe_and_created(tmp_path):
     auth = tmp_path / "xai-test.json"
     auth.write_text("{}", encoding="utf-8")
@@ -48,6 +63,49 @@ def test_validate_bridge_result_requires_probe_and_created(tmp_path):
     result["push_response"]["action"] = "updated"
     with pytest.raises(WindowsClientError, match="not a new account"):
         validate_bridge_result(result, require_created=True)
+
+
+def test_responses_probe_ignores_environment_proxy(monkeypatch):
+    handlers = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit):
+            return json.dumps({
+                "status": "completed",
+                "output": [{"content": [{"text": "WINDOWS_CLIENT_OK"}]}],
+            }).encode()
+
+    class Opener:
+        def open(self, request, timeout):
+            return Response()
+
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:10900")
+
+    def build_opener(*items):
+        handlers.extend(items)
+        return Opener()
+
+    monkeypatch.setattr(
+        "windows_client_common.urllib.request.build_opener",
+        build_opener,
+    )
+    monkeypatch.setattr(
+        "windows_client_common.urllib.request.urlopen",
+        lambda *args, **kwargs: pytest.fail("responses_probe used the environment-aware global opener"),
+    )
+    assert responses_probe("https://sub2api.example", "secret")["output_ok"] is True
+    assert any(
+        isinstance(handler, urllib.request.ProxyHandler) and handler.proxies == {}
+        for handler in handlers
+    )
 
 
 def test_cpa_export_requires_bridge_probe(tmp_path, monkeypatch):

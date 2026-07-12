@@ -1,5 +1,6 @@
 {
   "cloudflare_api_base": "https://<bridge-domain>",
+  "bridge_health_path": "/health",
   "cloudflare_api_key": "<bridge-management-secret>",
   "cloudflare_auth_mode": "bearer",
   "cloudflare_path_domains": "/api/domains",

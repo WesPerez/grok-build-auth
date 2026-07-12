@@ -18,6 +18,13 @@ from windows_client_common import (
 )
 
 
+def bridge_health_url(config: dict[str, object]) -> str:
+    path = str(config.get("bridge_health_path") or "/health").strip()
+    if not path.startswith("/") or path.startswith("//") or urlparse(path).scheme:
+        raise WindowsClientError("bridge_health_path must be an absolute path")
+    return str(config["cloudflare_api_base"]).rstrip("/") + path
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Validate the GROKAUTH Windows client without registering")
     parser.add_argument("--config", required=True)
@@ -58,7 +65,7 @@ def main() -> int:
             pass
         checks.append({"name": "proxy-listener", "ok": True, "endpoint": f"{proxy.hostname}:{proxy.port}"})
 
-        health = url_json(str(config["cloudflare_api_base"]).rstrip("/") + "/health")
+        health = url_json(bridge_health_url(config))
         if health.get("status") != "ok":
             raise WindowsClientError("bridge health is not ok")
         checks.append({"name": "bridge", "ok": True})
