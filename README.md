@@ -151,6 +151,9 @@ pytest -q
 ├── scripts/register_and_import.py
 ├── scripts/recover_batch_oauth.py
 ├── web_console.py
+├── clients/windows/              # 脱敏后的 Windows 浏览器客户端
+├── bridge/                       # 环境变量驱动的 bridge 源码
+├── skills/grok-sub2api-ops/      # 可复用 Codex 操作技能
 ├── private.example/             # 无秘密模板
 ├── xconsole_client/             # 协议与后端实现
 └── docs/research/               # 研究记录，不作为生产操作入口
@@ -162,8 +165,8 @@ pytest -q
 
 - 第三方页面、OAuth、Turnstile 和邮箱接口变化都可能使流程失效。
 - 浏览器后端是单路 canary，不应在未知出口上自动高并发轮换。
-- 外部客户端源码和 bridge 当前不在本 Git 仓库内；本仓库只作为统一操作文档入口。
-- bridge 仍有必须处理的密钥迁移与轮换安全债，详见完整手册。
+- Windows 客户端和 bridge 已纳入本仓库；现有生产服务迁移到仓库路径前，旧部署目录仍需保留。
+- 历史 bridge 密钥若曾硬编码或进入聊天/日志，仍必须轮换，详见完整手册。
 - `/v1/responses` 已验证；不能据此推断 Chat、图片、视频或其他端点也受支持。
 
 License: [MIT](LICENSE)。使用条款以 [NOTICE](NOTICE) 为准。

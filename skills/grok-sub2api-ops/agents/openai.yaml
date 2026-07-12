@@ -1,0 +1,4 @@
+interface:
+  display_name: "Grok Sub2API Operations"
+  short_description: "注册、导出并验证 Grok OAuth 账号进入 Sub2API"
+  default_prompt: "Use $grok-sub2api-ops to add and verify one usable Grok OAuth account in Sub2API."

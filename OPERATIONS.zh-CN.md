@@ -39,12 +39,12 @@ grok_register_ttk.py -> bridge 邮箱 API -> x.ai 注册 -> OAuth
 | 组件 | 当前职责 | 代码位置 |
 |---|---|---|
 | GROKAUTH | 注册、OAuth、批次、探针、导入编排 | 本仓库 |
-| 外部客户端 | 浏览器注册、OAuth、CPA JSON 推送 | 独立目录/部署包 `grok-register` |
-| bridge | 邮箱兼容 API、CPA 接收、隔离探针和入组 | 独立部署 `grok-register-bridge` |
+| 外部客户端 | 浏览器注册、OAuth、CPA JSON 推送 | `clients/windows/` |
+| bridge | 邮箱兼容 API、CPA 接收、隔离探针和入组 | `bridge/bridge.py` |
 | Sub2API | 账号池、分组、轮询和 OpenAI 兼容 API | 独立仓库/部署 |
 | `grok-cli-proxy` | 固定 Grok CLI 上游并补齐兼容请求头 | Sub2API 部署侧 sidecar |
 
-外部客户端和 bridge 目前不是本 Git 仓库的一部分。部署时必须分别取得对应代码，不能只 clone GROKAUTH 就假定外部链路存在。
+Windows 调试现场中的日志、真实 auth、账号密码、代理节点和一次性 patch/test 脚本没有纳入仓库。仓库只保留经过脱敏和收口的正式入口。
 
 ## 3. 共同前置条件
 
@@ -304,18 +304,19 @@ python3 scripts/register_and_import.py \
 
 ### 5.1 部署边界和要求
 
-外部客户端代码位于独立的 `grok-register` 项目。要求：
+外部客户端代码位于本仓库 `clients/windows/`。要求：
 
 - Python 3.12 或 3.13。
-- Windows 使用本机 Chrome/Chromium；Linux 使用 Microsoft Edge，并提供 DISPLAY/Xvfb。
+- full 模式由客户端启动受控浏览器；export-only 模式附着用户明确启动的 Microsoft Edge CDP。
 - 客户端本机有真实可用的 HTTP/SOCKS 代理。
 - 能通过 HTTPS 访问 bridge 公网入口。
 
 安装：
 
 ```bash
-cd /path/to/grok-register
+cd /path/to/grok-build-auth/clients/windows
 python -m pip install -r requirements.txt
+copy config.example.json config.json
 ```
 
 先用 1 路并发完成全链验收，再考虑提高到 2。旧的 5 到 15 路建议不适用于当前长探针和不稳定免费出口。
@@ -338,6 +339,7 @@ python -m pip install -r requirements.txt
 
   "proxy": "<client-local-proxy-url>",
   "register_count": 1,
+  "max_concurrency": 2,
   "hide_window": false,
   "block_media_fonts": false,
 
@@ -350,6 +352,7 @@ python -m pip install -r requirements.txt
   "cpa_remote_verify_tls": true,
   "cpa_push_proxy": "",
   "cpa_push_required": true,
+  "cpa_require_probe_passed": true,
   "cpa_push_timeout_sec": 240,
 
   "mint_proxy": "",
@@ -371,7 +374,7 @@ python -m pip install -r requirements.txt
 Windows：
 
 ```powershell
-cd D:\path\to\grok-register
+cd D:\path\to\grok-build-auth\clients\windows
 python grok_register_ttk.py
 ```
 
@@ -385,6 +388,52 @@ DISPLAY=:99 bash -c 'echo 1 | .venv/bin/python3 grok_register_ttk.py'
 ```
 
 脚本没有稳定的非交互参数接口，不要把位置参数当 CLI 选项使用。
+
+运行前从仓库根目录执行预检：
+
+```powershell
+python scripts\windows_client_preflight.py `
+  --config clients\windows\config.json `
+  --skip-cdp
+```
+
+`--skip-cdp` 只适用于 full 模式。export-only 模式先用远程调试端口启动 Edge：
+
+```powershell
+& "${Env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe" --remote-debugging-port=9222
+netstat -ano | findstr "LISTENING" | findstr "9222"
+python scripts\windows_client_preflight.py --config clients\windows\config.json
+```
+
+已经在 Edge 登录目标账号时，可跳过注册直接铸造、推送和验证。密码通过环境变量或隐藏提示提供，不写进命令行：
+
+```powershell
+$Env:GROK_ACCOUNT_PASSWORD = Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText
+python scripts\windows_export_logged_in.py `
+  --config clients\windows\config.json `
+  --email <account-email> `
+  --require-created
+Remove-Item Env:GROK_ACCOUNT_PASSWORD
+```
+
+已有 auth 文件时：
+
+```powershell
+python scripts\windows_push_auth.py `
+  --config clients\windows\config.json `
+  --auth <xai-auth.json> `
+  --require-created
+```
+
+需要同时验证公网业务入口时，设置 `GROK_GROUP_API_KEY` 环境变量，并追加 `--responses-base https://<sub2api-domain>`。
+
+Windows UI 排障要点：
+
+- OneTrust/Cookie 弹层可能包含零尺寸隐藏按钮，只操作有尺寸的可见元素。
+- 邮箱提交按钮无响应时，优先在邮箱框按 Enter，再回退 `form.requestSubmit()`。
+- 验证码优先从邮件 subject 的 `XXX-XXX` 提取，填表时移除连字符。
+- 资料页字段已填、本地账号文本已写都可能是假成功；至少要进入 `grok.com` 并出现 `sso` 或 `sso-rw`，然后继续 OAuth 和 push。
+- 禁止使用硬编码账号密码的 `export_one.py`、`one_shot_pipeline.py` 或历史 patch/debug 脚本。
 
 ### 5.4 客户端内部流程
 
@@ -457,7 +506,7 @@ Content-Type: application/json
 
 ### 5.7 外部客户端成功判定
 
-当前客户端存在一个已知口径缺陷：`register_one()` 没有检查 CPA export/push 的返回对象。即使 push 返回 422/500，worker 仍可能打印“注册成功”。因此本地成功计数不能作为最终判据。
+仓库内客户端已修复历史口径缺陷：`register_one()` 会检查 OAuth、auth 写盘、push 和 `probe=passed`，失败不会增加成功计数；退出时也不再扫描并终止所有调试 Chrome 或 Google 更新进程。旧的外部副本仍可能保留这些缺陷，必须以本仓库版本为准。
 
 必须同时确认：
 
@@ -583,12 +632,13 @@ token 过期 -> refresh token 续期
 - Mailu、Sub2API、bridge、Basic Auth 和代理凭据
 - auth JSON、bundle、result、日志和数据库备份
 
-Bridge 当前仍有以下已知安全债：
+仓库内 bridge 已改为从环境变量或 credential file 读取 Mailu、Sub2API 和 bridge 密钥，并使用结构化 JSON 判断指定账号 probe。部署时从 `private.example/bridge.env.example` 创建 `private/bridge.env`。
 
-- 历史实现把 Mailu API token 和 Sub2API admin key 硬编码在源码中。必须迁移到 root-only EnvironmentFile/systemd credentials，并轮换旧密钥。
+仍有以下安全债：
+
+- 历史部署曾把 Mailu API token 和 Sub2API admin key 硬编码在源码中。迁移到仓库版本后仍必须轮换旧密钥。
 - access JWT 只解码 payload，未验证 xAI 签名、issuer 和 audience；真实 Sub2API probe 是最终门禁，不能移除。
 - 幂等键是 email/账号名，不是 token hash 或 `sub`。
-- probe 成功判断仍依赖响应文本，应改为结构化 JSON。
 - 邮箱 JWT 内含 IMAP 密码，虽然签名且一小时过期，但未加密。
 - CORS 为 `*`，bridge 使用标准库 WSGI server；公网入口必须由 Nginx 鉴权、限流和请求大小/超时保护。
 - Web 控制台依赖反向代理认证，应用自身没有独立 CSRF/Origin 门禁。

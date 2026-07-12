@@ -1,0 +1,17 @@
+[Unit]
+Description=Grok Register Bridge (Email API and CPA Push)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/grok-build-auth-review
+EnvironmentFile=/root/grok-build-auth-review/private/bridge.env
+ExecStart=/usr/bin/python3 -u /root/grok-build-auth-review/bridge/bridge.py
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -24,6 +24,10 @@ sso_output/
 oauth_output/
 accounts_output/
 cliproxyapi_auth/
+clients/windows/config.json
+clients/windows/cpa_auths/
+clients/windows/accounts_*.txt
+clients/windows/mail_credentials.txt
 
 # alias_mail runtime state
 .alias_domain_health.json
