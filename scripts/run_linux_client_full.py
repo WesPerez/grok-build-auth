@@ -169,6 +169,7 @@ def build_config(
     target: int,
     email_provider: str = "cloudflare",
     duckmail_domain: str = "",
+    mail_api_base: str = "",
 ) -> dict[str, Any]:
     return {
         "client_root": str(client_root),
@@ -182,6 +183,7 @@ def build_config(
         "cloudflare_path_messages": "/api/mails",
         "email_provider": email_provider,
         "duckmail_domain": duckmail_domain,
+        "duckmail_api_base": mail_api_base,
         "defaultDomains": domain,
         "proxy": proxy,
         "register_count": attempts,
@@ -234,6 +236,7 @@ def main() -> int:
         "--email-provider", choices=("cloudflare", "duckmail"), default="cloudflare"
     )
     parser.add_argument("--duckmail-domain", default="")
+    parser.add_argument("--mail-api-base", default="")
     parser.add_argument("--run-id")
     parser.add_argument("--reprobe-interval", type=int, default=300)
     args = parser.parse_args()
@@ -317,6 +320,7 @@ def main() -> int:
             target=target,
             email_provider=args.email_provider,
             duckmail_domain=args.duckmail_domain,
+            mail_api_base=args.mail_api_base,
         )
         write_private_json(config_path, config)
         preflight_result = subprocess.run(

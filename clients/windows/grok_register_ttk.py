@@ -34,6 +34,7 @@ MEMORY_CLEANUP_INTERVAL = 5
 
 DEFAULT_CONFIG = {
     "duckmail_api_key": "",
+    "duckmail_api_base": "",
     "cloudflare_api_base": "",
     "cloudflare_api_key": "",
     "cloudflare_auth_mode": "none",
@@ -155,6 +156,10 @@ EXTENSION_PATH = os.path.abspath(
 
 
 DUCKMAIL_API_BASE = "https://api.duckmail.sbs"
+
+
+def get_duckmail_api_base():
+    return str(config.get("duckmail_api_base") or DUCKMAIL_API_BASE).rstrip("/")
 
 
 def get_proxies():
@@ -557,7 +562,7 @@ def get_domains(api_key=None):
     key = api_key or get_duckmail_api_key()
     if key:
         headers["Authorization"] = f"Bearer {key}"
-    resp = http_get(f"{DUCKMAIL_API_BASE}/domains", headers=headers)
+    resp = http_get(f"{get_duckmail_api_base()}/domains", headers=headers)
     resp.raise_for_status()
     return resp.json().get("hydra:member", [])
 
@@ -568,28 +573,28 @@ def create_account(address, password, api_key=None, expires_in=0):
     if key:
         headers["Authorization"] = f"Bearer {key}"
     data = {"address": address, "password": password, "expiresIn": expires_in}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/accounts", json=data, headers=headers)
+    resp = http_post(f"{get_duckmail_api_base()}/accounts", json=data, headers=headers)
     resp.raise_for_status()
     return resp.json()
 
 
 def get_token(address, password):
     data = {"address": address, "password": password}
-    resp = http_post(f"{DUCKMAIL_API_BASE}/token", json=data)
+    resp = http_post(f"{get_duckmail_api_base()}/token", json=data)
     resp.raise_for_status()
     return resp.json().get("token")
 
 
 def get_messages(token):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages", headers=headers)
+    resp = http_get(f"{get_duckmail_api_base()}/messages", headers=headers)
     resp.raise_for_status()
     return resp.json().get("hydra:member", [])
 
 
 def get_message_detail(token, message_id):
     headers = {"Authorization": f"Bearer {token}"}
-    resp = http_get(f"{DUCKMAIL_API_BASE}/messages/{message_id}", headers=headers)
+    resp = http_get(f"{get_duckmail_api_base()}/messages/{message_id}", headers=headers)
     resp.raise_for_status()
     return resp.json()
 
@@ -896,7 +901,7 @@ def pick_domain(api_key=None):
                 item
                 for item in domains
                 if str(item.get("domain") or "").strip().lower() == preferred
-                and item.get("isVerified")
+                and (item.get("isVerified") or item.get("isActive"))
             ),
             None,
         )
@@ -904,10 +909,10 @@ def pick_domain(api_key=None):
             raise Exception(f"DuckMail 指定域名不可用: {preferred}")
         return match["domain"]
     private = [d for d in domains if d.get("ownerId")]
-    verified_private = [d for d in private if d.get("isVerified")]
+    verified_private = [d for d in private if d.get("isVerified") or d.get("isActive")]
     if verified_private:
         return verified_private[0]["domain"]
-    public = [d for d in domains if d.get("isVerified")]
+    public = [d for d in domains if d.get("isVerified") or d.get("isActive")]
     if public:
         return public[0]["domain"]
     raise Exception("DuckMail 鏃犲凡楠岃瘉鍩熷悕鍙敤")
@@ -2183,13 +2188,19 @@ def _native_find_input(page, selector):
 
 
 def _native_type(page, element, value):
-    element.clear(by_js=False)
-    element.focus()
-    page.actions.type(str(value), interval=random.uniform(0.035, 0.075))
-    sleep_with_cancel(random.uniform(0.25, 0.55))
-    actual = str(element.property("value") or element.attr("value") or "")
-    if actual.strip() != str(value).strip():
-        raise RuntimeError("native input value mismatch")
+    expected = str(value)
+    for attempt in range(2):
+        element.clear(by_js=False)
+        element.focus()
+        if attempt == 0:
+            page.actions.type(expected, interval=random.uniform(0.035, 0.075))
+        else:
+            element.input(expected, clear=True, by_js=False)
+        sleep_with_cancel(random.uniform(0.25, 0.55))
+        actual = str(element.property("value") or element.attr("value") or "")
+        if actual.strip() == expected.strip():
+            return
+    raise RuntimeError("native input value mismatch")
 
 
 def click_email_signup_button(session, timeout=10, log_callback=None, cancel_callback=None):
