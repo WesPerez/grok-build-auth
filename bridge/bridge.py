@@ -55,6 +55,13 @@ def secret_from_env_or_file(name, file_name):
 MAILU_API_TOKEN = secret_from_env_or_file("MAILU_API_TOKEN", "MAILU_API_TOKEN_FILE")
 MAILU_API_BASE = required_env("MAILU_API_BASE").rstrip("/")
 MAILU_DOMAIN = required_env("MAILU_DOMAIN").lower()
+MAILU_DOMAINS = tuple(dict.fromkeys(
+    domain.strip().lower()
+    for domain in os.environ.get("MAILU_DOMAINS", MAILU_DOMAIN).split(",")
+    if domain.strip()
+))
+if MAILU_DOMAIN not in MAILU_DOMAINS:
+    MAILU_DOMAINS = (MAILU_DOMAIN, *MAILU_DOMAINS)
 MAILU_IMAP_HOST = required_env("MAILU_IMAP_HOST")
 MAILU_IMAP_PORT = int(os.environ.get("MAILU_IMAP_PORT", "993"))
 
@@ -790,7 +797,7 @@ def handle_request(environ, start_response):
         domain = str(body.get("domain") or MAILU_DOMAIN).strip().lower()
         if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", name):
             return error_response("邮箱本地部分无效")
-        if domain != MAILU_DOMAIN:
+        if domain not in MAILU_DOMAINS:
             return error_response("邮箱域名无效")
         password = generate_password()
         email_addr = f"{name}@{domain}"
@@ -837,7 +844,7 @@ def handle_request(environ, start_response):
     if path == "/api/domains" and method == "GET":
         if not email_api_authorized(headers):
             return error_response("未授权", "401 Unauthorized")
-        return json_response([MAILU_DOMAIN])
+        return json_response(list(MAILU_DOMAINS))
 
     if path == "/api/token" and method == "POST":
         if not email_api_authorized(headers):

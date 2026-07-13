@@ -237,6 +237,7 @@ def main() -> int:
     )
     parser.add_argument("--duckmail-domain", default="")
     parser.add_argument("--mail-api-base", default="")
+    parser.add_argument("--mail-domain", default="")
     parser.add_argument("--run-id")
     parser.add_argument("--reprobe-interval", type=int, default=300)
     args = parser.parse_args()
@@ -257,7 +258,14 @@ def main() -> int:
         raise RuntimeError("bridge management key is empty")
     bridge_port = int(bridge_env.get("BRIDGE_PORT", "8190"))
     bridge_base = f"http://127.0.0.1:{bridge_port}"
-    domain = bridge_env["MAILU_DOMAIN"]
+    available_domains = {
+        item.strip().lower()
+        for item in bridge_env.get("MAILU_DOMAINS", bridge_env["MAILU_DOMAIN"]).split(",")
+        if item.strip()
+    }
+    domain = str(args.mail_domain or bridge_env["MAILU_DOMAIN"]).strip().lower()
+    if args.email_provider == "cloudflare" and domain not in available_domains:
+        raise RuntimeError(f"mail domain is not enabled by bridge: {domain}")
 
     proxies = load_proxy_urls(project)
     if args.proxy_urls:

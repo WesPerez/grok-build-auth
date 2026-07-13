@@ -29,6 +29,7 @@ def load_bridge(monkeypatch, tmp_path):
     monkeypatch.setenv("MAILU_API_TOKEN_FILE", str(tmp_path / "mailu"))
     monkeypatch.setenv("MAILU_API_BASE", "https://mail.example/api")
     monkeypatch.setenv("MAILU_DOMAIN", "example.com")
+    monkeypatch.setenv("MAILU_DOMAINS", "example.com,alt.example.com")
     monkeypatch.setenv("MAILU_IMAP_HOST", "mail.example.com")
     monkeypatch.setenv("SUB2API_ADMIN_KEY_FILE", str(tmp_path / "sub2api"))
     monkeypatch.setenv("SUB2API_GROK_GROUP_ID", "5")
@@ -50,6 +51,7 @@ def test_bridge_uses_secret_files_and_signed_mailbox_tokens(monkeypatch, tmp_pat
     payload = bridge.verify_jwt(token)
     assert payload["email"] == "test@example.com"
     assert bridge.SUB2API_GROK_GROUP_ID == 5
+    assert bridge.MAILU_DOMAINS == ("example.com", "alt.example.com")
 
 
 def test_bridge_probe_parses_json(monkeypatch, tmp_path):

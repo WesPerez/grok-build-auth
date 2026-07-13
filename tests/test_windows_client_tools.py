@@ -278,6 +278,7 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     assert '"--email-provider"' in runner_source
     assert '"duckmail_domain": duckmail_domain' in runner_source
     assert '"duckmail_api_base": mail_api_base' in runner_source
+    assert 'parser.add_argument("--mail-domain"' in runner_source
     assert config["client_root"] == str(CLIENT)
     assert config["max_concurrency"] == 1
     assert config["hide_window"] is False
