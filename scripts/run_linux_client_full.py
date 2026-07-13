@@ -225,6 +225,7 @@ def main() -> int:
     parser.add_argument("--routes", type=int, default=2)
     parser.add_argument("--attempts-per-route", type=int, default=200)
     parser.add_argument("--proxy-ref", action="append", dest="proxy_refs")
+    parser.add_argument("--proxy-url", action="append", dest="proxy_urls")
     parser.add_argument("--run-id")
     parser.add_argument("--reprobe-interval", type=int, default=300)
     args = parser.parse_args()
@@ -248,12 +249,25 @@ def main() -> int:
     domain = bridge_env["MAILU_DOMAIN"]
 
     proxies = load_proxy_urls(project)
-    selected_refs = args.proxy_refs or list(proxies)[: args.routes]
-    if len(selected_refs) != args.routes or len(set(selected_refs)) != args.routes:
-        raise RuntimeError("provide one distinct --proxy-ref per route")
-    missing = [ref for ref in selected_refs if ref not in proxies]
-    if missing:
-        raise RuntimeError(f"proxy refs are not configured/enabled: {missing}")
+    if args.proxy_urls:
+        if args.proxy_refs:
+            raise RuntimeError("use either --proxy-ref or --proxy-url, not both")
+        if len(args.proxy_urls) != args.routes or len(set(args.proxy_urls)) != args.routes:
+            raise RuntimeError("provide one distinct --proxy-url per route")
+        selected_routes = [
+            (f"explicit-{index}", value.strip())
+            for index, value in enumerate(args.proxy_urls, start=1)
+        ]
+        if any(not value for _, value in selected_routes):
+            raise RuntimeError("--proxy-url cannot be empty")
+    else:
+        selected_refs = args.proxy_refs or list(proxies)[: args.routes]
+        if len(selected_refs) != args.routes or len(set(selected_refs)) != args.routes:
+            raise RuntimeError("provide one distinct --proxy-ref per route")
+        missing = [ref for ref in selected_refs if ref not in proxies]
+        if missing:
+            raise RuntimeError(f"proxy refs are not configured/enabled: {missing}")
+        selected_routes = [(ref, proxies[ref]) for ref in selected_refs]
 
     run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(3)
     run_dir = project / "private" / "client-runs" / run_id
@@ -277,7 +291,9 @@ def main() -> int:
     env["DISPLAY"] = env.get("DISPLAY") or ":99"
 
     route_specs: list[dict[str, Any]] = []
-    for index, (ref, target) in enumerate(zip(selected_refs, targets), start=1):
+    for index, ((ref, proxy_url), target) in enumerate(
+        zip(selected_routes, targets), start=1
+    ):
         route_dir = run_dir / f"route-{index}"
         route_dir.mkdir(mode=0o700)
         config_path = route_dir / "config.json"
@@ -287,7 +303,7 @@ def main() -> int:
             bridge_base=bridge_base,
             management_key=management_key,
             domain=domain,
-            proxy=proxies[ref],
+            proxy=proxy_url,
             route_dir=route_dir,
             attempts=args.attempts_per_route,
             target=target,
