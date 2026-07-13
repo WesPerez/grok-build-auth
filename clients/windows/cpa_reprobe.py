@@ -276,21 +276,46 @@ def run(args: argparse.Namespace) -> dict[str, int]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--root", required=True, help="parent directory containing cpa_auths/cpa_pending/cpa_cooldown")
+    parser.add_argument("--config", help="client config; keeps bridge secrets out of the command line")
+    parser.add_argument("--root", help="parent directory containing cpa_auths/cpa_pending/cpa_cooldown")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--workers", type=int, default=8, help="parallel probes/pushes (use 15 for registration-sized batches)")
     parser.add_argument("--attempts", type=int, default=3, help="bounded probe attempts per auth")
     parser.add_argument("--retry-delay", type=float, default=2, help="seconds between retryable probe attempts")
     parser.add_argument("--include-verified", action="store_true", help="retry unconfirmed pushes from cpa_auths")
     parser.add_argument("--push-cooldown", action="store_true", help="push authenticated 402/429 accounts; bridge must accept usable_exhausted")
-    parser.add_argument("--proxy", default="")
-    parser.add_argument("--timeout", type=float, default=45)
-    parser.add_argument("--remote-base", default="")
-    parser.add_argument("--remote-secret", default="")
-    parser.add_argument("--push-proxy", default="")
-    parser.add_argument("--push-timeout", type=float, default=240)
-    parser.add_argument("--insecure", action="store_true")
+    parser.add_argument("--proxy")
+    parser.add_argument("--timeout", type=float)
+    parser.add_argument("--remote-base")
+    parser.add_argument("--remote-secret")
+    parser.add_argument("--push-proxy")
+    parser.add_argument("--push-timeout", type=float)
+    parser.add_argument("--insecure", action="store_true", default=None)
     args = parser.parse_args()
+    config: dict[str, Any] = {}
+    if args.config:
+        config = json.loads(Path(args.config).read_text(encoding="utf-8-sig"))
+        if not isinstance(config, dict):
+            raise SystemExit("client config root must be an object")
+    if not args.root:
+        auth_dir = str(config.get("cpa_auth_dir") or "").strip()
+        if not auth_dir:
+            raise SystemExit("--root or config cpa_auth_dir is required")
+        args.root = str(Path(auth_dir).expanduser().resolve().parent)
+    if args.proxy is None:
+        args.proxy = str(config.get("mint_proxy") or config.get("proxy") or "")
+    if args.timeout is None:
+        args.timeout = float(config.get("cpa_preprobe_timeout_sec", 45) or 45)
+    if args.remote_base is None:
+        args.remote_base = str(config.get("cpa_remote_base") or "")
+    if args.remote_secret is None:
+        args.remote_secret = str(config.get("cpa_remote_secret") or "")
+    if args.push_proxy is None:
+        args.push_proxy = str(config.get("cpa_push_proxy") or "")
+    if args.push_timeout is None:
+        args.push_timeout = float(config.get("cpa_push_timeout_sec", 240) or 240)
+    if args.insecure is None:
+        args.insecure = not bool(config.get("cpa_remote_verify_tls", True))
     print(json.dumps(run(args), ensure_ascii=False))
     return 0
 

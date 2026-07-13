@@ -40,7 +40,7 @@ def main() -> int:
         checks.append({"name": "python", "ok": True, "version": sys.version.split()[0]})
 
         config_path, config = load_config(args.config)
-        root = client_root_from_config(config_path)
+        root = client_root_from_config(config_path, config)
         require_config(
             config,
             "cloudflare_api_base", "cloudflare_api_key", "defaultDomains",

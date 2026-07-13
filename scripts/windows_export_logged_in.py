@@ -30,7 +30,7 @@ def main() -> int:
 
     try:
         config_path, config = load_config(args.config)
-        root = client_root_from_config(config_path)
+        root = client_root_from_config(config_path, config)
         sys.path.insert(0, str(root))
         from DrissionPage import Chromium, ChromiumOptions
         import cpa_export

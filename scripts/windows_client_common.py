@@ -36,8 +36,16 @@ def require_config(config: dict[str, Any], *names: str) -> None:
         raise WindowsClientError("missing config values: " + ", ".join(missing))
 
 
-def client_root_from_config(config_path: Path) -> Path:
-    root = config_path.parent
+def client_root_from_config(
+    config_path: Path,
+    config: dict[str, Any] | None = None,
+) -> Path:
+    configured_root = str((config or {}).get("client_root") or "").strip()
+    root = (
+        Path(configured_root).expanduser().resolve()
+        if configured_root
+        else config_path.parent
+    )
     if not (root / "cpa_export.py").is_file():
         raise WindowsClientError(f"Windows client modules not found beside {config_path}")
     return root

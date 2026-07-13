@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import types
 import urllib.request
 from pathlib import Path
 
@@ -194,7 +195,99 @@ def test_windows_example_defaults_to_single_hidden_worker():
     config = json.loads((CLIENT / "config.example.json").read_text(encoding="utf-8"))
     assert config["register_count"] == 1
     assert config["max_concurrency"] == 1
+    assert config["target_successes"] == 0
     assert config["hide_window"] is True
+    assert config["cpa_require_created"] is False
+
+
+def test_windows_client_target_success_stops_new_slots(tmp_path, monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        drission = types.ModuleType("DrissionPage")
+        drission.Chromium = object
+        drission.ChromiumOptions = object
+        drission_errors = types.ModuleType("DrissionPage.errors")
+        drission_errors.PageDisconnectedError = RuntimeError
+        curl_cffi = types.ModuleType("curl_cffi")
+        curl_cffi.requests = object()
+        monkeypatch.setitem(sys.modules, "DrissionPage", drission)
+        monkeypatch.setitem(sys.modules, "DrissionPage.errors", drission_errors)
+        monkeypatch.setitem(sys.modules, "curl_cffi", curl_cffi)
+        client = load_module("grok_register_target_test", CLIENT / "grok_register_ttk.py")
+        client.config["mail_credentials_file"] = str(tmp_path / "mail_credentials.txt")
+        state = client.SharedState(
+            10,
+            str(tmp_path / "accounts.txt"),
+            target_successes=2,
+        )
+        assert state.claim_slot() == (True, 1)
+        assert state.record_success() == 1
+        assert state.claim_slot() == (True, 2)
+        assert state.record_success() == 2
+        assert state.target_reached() is True
+        assert state.claim_slot() == (False, 0)
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_windows_client_supports_isolated_noninteractive_routes():
+    source = (CLIENT / "grok_register_ttk.py").read_text(encoding="utf-8-sig")
+    assert 'os.environ.get(\n    "GROK_CLIENT_CONFIG"' in source
+    assert 'parser.add_argument("--non-interactive"' in source
+    assert 'parser.add_argument("--target-successes"' in source
+    assert 'config.get("cpa_require_created", False)' in source
+
+
+def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
+    runner = load_module(
+        "linux_client_full_runner_test",
+        SCRIPTS / "run_linux_client_full.py",
+    )
+    assert runner.split_targets(50, 2) == [25, 25]
+    assert runner.split_targets(5, 2) == [3, 2]
+    config = runner.build_config(
+        client_root=CLIENT,
+        bridge_base="http://127.0.0.1:8190",
+        management_key="secret",
+        domain="example.com",
+        proxy="socks5://127.0.0.1:10900",
+        route_dir=tmp_path,
+        attempts=20,
+        target=3,
+    )
+    assert config["target_successes"] == 3
+    assert config["client_root"] == str(CLIENT)
+    assert config["max_concurrency"] == 1
+    assert config["cpa_require_created"] is True
+    assert config["cpa_auth_dir"] == str(tmp_path / "cpa_auths")
+
+
+def test_cpa_reprobe_loads_sensitive_values_from_config(tmp_path, monkeypatch, capsys):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        reprobe = load_module("cpa_reprobe_config_test", CLIENT / "cpa_reprobe.py")
+        config_path = tmp_path / "config.json"
+        config_path.write_text(json.dumps({
+            "cpa_auth_dir": str(tmp_path / "route" / "cpa_auths"),
+            "proxy": "socks5://127.0.0.1:10900",
+            "cpa_remote_base": "http://127.0.0.1:8190",
+            "cpa_remote_secret": "secret",
+            "cpa_push_proxy": "",
+            "cpa_push_timeout_sec": 960,
+            "cpa_remote_verify_tls": True,
+        }), encoding="utf-8")
+        captured = {}
+        monkeypatch.setattr(reprobe, "run", lambda args: captured.update(vars(args)) or {"scanned": 0})
+        monkeypatch.setattr(sys, "argv", ["cpa_reprobe.py", "--config", str(config_path)])
+        assert reprobe.main() == 0
+        assert captured["root"] == str(tmp_path / "route")
+        assert captured["remote_secret"] == "secret"
+        assert captured["push_timeout"] == 960
+        assert json.loads(capsys.readouterr().out)["scanned"] == 0
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
 
 
 def test_oauth_device_transport_fallback_preserves_proxy(monkeypatch):
@@ -459,6 +552,39 @@ def test_cpa_export_preprobe_pending_not_push(tmp_path, monkeypatch):
         assert not list(out.glob("xai-*.json"))
         pending = out.parent / "cpa_pending"
         assert list(pending.glob("xai-*.json"))
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_cpa_export_can_wait_for_permission_propagation(monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        cpa_export = load_module(
+            "windows_cpa_export_permission_wait_test",
+            CLIENT / "cpa_export.py",
+        )
+        import cpa
+
+        results = iter([
+            {"decision": "retry", "code": "PERMISSION_DENIED", "status": 403},
+            {"decision": "pass", "code": "PROBE_PASSED", "status": 200},
+        ])
+        monkeypatch.setattr(cpa.preprobe, "probe_auth", lambda *args, **kwargs: next(results))
+        sleeps = []
+        monkeypatch.setattr(cpa_export.time, "sleep", sleeps.append)
+        probe, payload = cpa_export._run_preprobe(
+            {"access_token": "token", "refresh_token": "refresh"},
+            proxy="socks5://127.0.0.1:10900",
+            cfg={
+                "cpa_preprobe_attempts": 2,
+                "cpa_preprobe_permission_retry_delay_sec": 60,
+            },
+            log=lambda message: None,
+        )
+        assert probe["decision"] == "pass"
+        assert payload["refresh_token"] == "refresh"
+        assert sleeps == [60]
     finally:
         if str(CLIENT) in sys.path:
             sys.path.remove(str(CLIENT))

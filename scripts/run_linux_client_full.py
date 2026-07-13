@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+
+def read_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, raw_value = line.split("=", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        try:
+            parts = shlex.split(raw_value, comments=True, posix=True)
+        except ValueError as exc:
+            raise RuntimeError(f"invalid env value for {key} in {path}: {exc}") from exc
+        values[key] = parts[0] if parts else ""
+    return values
+
+
+def write_private_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    fd = os.open(temp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        os.chmod(path, 0o600)
+    finally:
+        if temp.exists():
+            temp.unlink()
+
+
+def load_proxy_urls(project: Path) -> dict[str, str]:
+    runtime = read_env(project / "private" / "runtime.env")
+    pool = json.loads((project / "private" / "proxies.json").read_text(encoding="utf-8"))
+    result: dict[str, str] = {}
+    for item in pool.get("proxies", []):
+        if not item.get("enabled", True):
+            continue
+        ref = str(item.get("ref") or "").strip()
+        env_name = str(item.get("url_env") or "").strip()
+        value = runtime.get(env_name, "").strip()
+        if ref and value:
+            result[ref] = value
+    return result
+
+
+def split_targets(total: int, routes: int) -> list[int]:
+    base, remainder = divmod(total, routes)
+    return [base + (1 if index < remainder else 0) for index in range(routes)]
+
+
+def parse_summary(log_path: Path) -> dict[str, Any] | None:
+    marker = "GROK_CLIENT_SUMMARY="
+    summary = None
+    with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if line.startswith(marker):
+                summary = json.loads(line[len(marker):])
+    return summary
+
+
+def build_config(
+    *,
+    client_root: Path,
+    bridge_base: str,
+    management_key: str,
+    domain: str,
+    proxy: str,
+    route_dir: Path,
+    attempts: int,
+    target: int,
+) -> dict[str, Any]:
+    return {
+        "client_root": str(client_root),
+        "cloudflare_api_base": bridge_base,
+        "bridge_health_path": "/health",
+        "cloudflare_api_key": management_key,
+        "cloudflare_auth_mode": "bearer",
+        "cloudflare_path_domains": "/api/domains",
+        "cloudflare_path_accounts": "/admin/new_address",
+        "cloudflare_path_token": "/api/token",
+        "cloudflare_path_messages": "/api/mails",
+        "email_provider": "cloudflare",
+        "defaultDomains": domain,
+        "proxy": proxy,
+        "register_count": attempts,
+        "max_concurrency": 1,
+        "target_successes": target,
+        "accounts_output_dir": str(route_dir),
+        "mail_credentials_file": str(route_dir / "mail_credentials.txt"),
+        "enable_nsfw": False,
+        "hide_window": True,
+        "block_media_fonts": False,
+        "stealth_patch": False,
+        "cpa_export_enabled": True,
+        "cpa_auth_dir": str(route_dir / "cpa_auths"),
+        "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
+        "cpa_push_enabled": True,
+        "cpa_remote_base": bridge_base,
+        "cpa_remote_secret": management_key,
+        "cpa_remote_verify_tls": True,
+        "cpa_push_proxy": "",
+        "cpa_push_required": True,
+        "cpa_require_probe_passed": True,
+        "cpa_require_created": True,
+        "cpa_push_timeout_sec": 960,
+        "mint_proxy": "",
+        "mint_timeout_sec": 420,
+        "mint_required": True,
+        "cpa_preprobe_enabled": True,
+        "cpa_preprobe_required": True,
+        "cpa_preprobe_timeout_sec": 60,
+        "cpa_preprobe_refresh_on_invalid": True,
+        "cpa_preprobe_attempts": 4,
+        "cpa_preprobe_retry_delay_sec": 4,
+        "cpa_preprobe_permission_retry_delay_sec": 60,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Run isolated Linux/Xvfb client-full Grok registration routes"
+    )
+    parser.add_argument("--project-dir", default="/root/grok-build-auth")
+    parser.add_argument("--target", type=int, required=True)
+    parser.add_argument("--routes", type=int, default=2)
+    parser.add_argument("--attempts-per-route", type=int, default=200)
+    parser.add_argument("--proxy-ref", action="append", dest="proxy_refs")
+    parser.add_argument("--run-id")
+    args = parser.parse_args()
+
+    project = Path(args.project_dir).resolve()
+    if args.target < 1:
+        raise SystemExit("--target must be at least 1")
+    if args.routes < 1 or args.routes > 2:
+        raise SystemExit("--routes must be 1 or 2")
+    targets = split_targets(args.target, args.routes)
+    if any(target > args.attempts_per_route for target in targets):
+        raise SystemExit("--attempts-per-route must be at least each route target")
+
+    bridge_env = read_env(project / "private" / "bridge.env")
+    management_key_path = Path(bridge_env["BRIDGE_MANAGEMENT_KEY_FILE"])
+    management_key = management_key_path.read_text(encoding="utf-8").strip()
+    if not management_key:
+        raise RuntimeError("bridge management key is empty")
+    bridge_port = int(bridge_env.get("BRIDGE_PORT", "8190"))
+    bridge_base = f"http://127.0.0.1:{bridge_port}"
+    domain = bridge_env["MAILU_DOMAIN"]
+
+    proxies = load_proxy_urls(project)
+    selected_refs = args.proxy_refs or list(proxies)[: args.routes]
+    if len(selected_refs) != args.routes or len(set(selected_refs)) != args.routes:
+        raise RuntimeError("provide one distinct --proxy-ref per route")
+    missing = [ref for ref in selected_refs if ref not in proxies]
+    if missing:
+        raise RuntimeError(f"proxy refs are not configured/enabled: {missing}")
+
+    run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(3)
+    run_dir = project / "private" / "client-runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=False, mode=0o700)
+    os.chmod(run_dir, 0o700)
+    manifest_path = run_dir / "manifest.json"
+    manifest: dict[str, Any] = {
+        "run_id": run_id,
+        "status": "preparing",
+        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "target": args.target,
+        "routes": [],
+    }
+    write_private_json(manifest_path, manifest)
+
+    python = project / "clients" / "windows" / ".venv" / "bin" / "python3"
+    client = project / "clients" / "windows" / "grok_register_ttk.py"
+    preflight = project / "scripts" / "windows_client_preflight.py"
+    env = os.environ.copy()
+    env["DISPLAY"] = env.get("DISPLAY") or ":99"
+
+    route_specs: list[dict[str, Any]] = []
+    for index, (ref, target) in enumerate(zip(selected_refs, targets), start=1):
+        route_dir = run_dir / f"route-{index}"
+        route_dir.mkdir(mode=0o700)
+        config_path = route_dir / "config.json"
+        log_path = route_dir / "client.log"
+        config = build_config(
+            client_root=project / "clients" / "windows",
+            bridge_base=bridge_base,
+            management_key=management_key,
+            domain=domain,
+            proxy=proxies[ref],
+            route_dir=route_dir,
+            attempts=args.attempts_per_route,
+            target=target,
+        )
+        write_private_json(config_path, config)
+        preflight_result = subprocess.run(
+            [str(python), str(preflight), "--config", str(config_path), "--skip-cdp"],
+            cwd=project,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        if preflight_result.returncode != 0:
+            raise RuntimeError(
+                f"route {index} preflight failed: {preflight_result.stdout.strip()}"
+            )
+        route_specs.append({
+            "index": index,
+            "proxy_ref": ref,
+            "target": target,
+            "config_path": str(config_path),
+            "log_path": str(log_path),
+            "route_dir": str(route_dir),
+        })
+
+    processes: list[tuple[subprocess.Popen[bytes], Any, dict[str, Any]]] = []
+    for route in route_specs:
+        log_fd = os.open(
+            route["log_path"],
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        os.chmod(route["log_path"], 0o600)
+        log_handle = os.fdopen(log_fd, "ab", buffering=0)
+        command = [
+            str(python),
+            "-u",
+            str(client),
+            "--config",
+            route["config_path"],
+            "--count",
+            str(args.attempts_per_route),
+            "--target-successes",
+            str(route["target"]),
+            "--concurrency",
+            "1",
+            "--non-interactive",
+        ]
+        process = subprocess.Popen(
+            command,
+            cwd=project / "clients" / "windows",
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        route["pid"] = process.pid
+        route["status"] = "running"
+        processes.append((process, log_handle, route))
+
+    manifest["status"] = "running"
+    manifest["routes"] = route_specs
+    write_private_json(manifest_path, manifest)
+
+    while any(process.poll() is None for process, _handle, _route in processes):
+        time.sleep(5)
+
+    all_passed = True
+    for process, log_handle, route in processes:
+        log_handle.close()
+        route["exit_code"] = process.returncode
+        route["summary"] = parse_summary(Path(route["log_path"]))
+        route["status"] = "passed" if process.returncode == 0 else "failed"
+        if process.returncode != 0:
+            all_passed = False
+
+    manifest["status"] = "completed" if all_passed else "failed"
+    manifest["finished_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    manifest["routes"] = route_specs
+    write_private_json(manifest_path, manifest)
+    print(json.dumps({
+        "run_id": run_id,
+        "status": manifest["status"],
+        "target": args.target,
+        "manifest": str(manifest_path),
+    }, ensure_ascii=False))
+    return 0 if all_passed else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

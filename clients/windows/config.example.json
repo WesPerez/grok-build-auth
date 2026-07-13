@@ -12,6 +12,9 @@
   "proxy": "http://127.0.0.1:10808",
   "register_count": 1,
   "max_concurrency": 1,
+  "target_successes": 0,
+  "accounts_output_dir": "",
+  "mail_credentials_file": "",
   "enable_nsfw": false,
   "hide_window": true,
   "block_media_fonts": false,
@@ -26,6 +29,7 @@
   "cpa_push_proxy": "",
   "cpa_push_required": true,
   "cpa_require_probe_passed": true,
+  "cpa_require_created": false,
   "cpa_push_timeout_sec": 240,
   "mint_proxy": "",
   "mint_timeout_sec": 300,
@@ -35,5 +39,6 @@
   "cpa_preprobe_timeout_sec": 45,
   "cpa_preprobe_refresh_on_invalid": true,
   "cpa_preprobe_attempts": 3,
-  "cpa_preprobe_retry_delay_sec": 4
+  "cpa_preprobe_retry_delay_sec": 4,
+  "cpa_preprobe_permission_retry_delay_sec": 0
 }

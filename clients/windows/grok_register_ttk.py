@@ -10,6 +10,7 @@ import datetime
 import time
 import os
 import sys
+import argparse
 import gc
 import secrets
 import struct
@@ -24,7 +25,10 @@ from curl_cffi import requests
 import psutil
 
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+CONFIG_FILE = os.environ.get(
+    "GROK_CLIENT_CONFIG",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
+)
 MEMORY_CLEANUP_INTERVAL = 5
 
 DEFAULT_CONFIG = {
@@ -40,6 +44,9 @@ DEFAULT_CONFIG = {
     "enable_nsfw": True,
     "register_count": 1,
     "max_concurrency": 1,
+    "target_successes": 0,
+    "accounts_output_dir": "",
+    "mail_credentials_file": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # ===== Sub2API auth 导出 / 免费 Grok 4.5（OIDC，非 Web SSO）=====
     # 注册成功后走设备码 OIDC 铸造 token，写出 Sub2API 的 xai-<email>.json，并可
@@ -56,6 +63,7 @@ DEFAULT_CONFIG = {
     "cpa_push_proxy": "",                # 推送用代理；空=直连（不走 mint 代理）
     "cpa_push_required": True,           # 推送失败不得计为完整成功
     "cpa_require_probe_passed": True,    # bridge 必须返回 probe=passed
+    "cpa_require_created": False,        # 新注册批次可要求 bridge action=created
     # OIDC 设备码铸造（独立 Chromium）
     "mint_proxy": "",                    # 铸造专用代理；空=复用 proxy
     "mint_timeout_sec": 300,             # 单账号铸造超时（秒）
@@ -3056,10 +3064,12 @@ def cli_log(message):
 class SharedState:
     """并发 worker 间共享的状态：名额发放、计数、文件与日志写入，全部加锁。"""
 
-    def __init__(self, count, accounts_output_file):
+    def __init__(self, count, accounts_output_file, target_successes=0):
         self.count = count
+        self.target_successes = max(0, int(target_successes or 0))
         self.accounts_output_file = accounts_output_file
-        self.mail_cred_file = os.path.join(
+        configured_mail_file = str(config.get("mail_credentials_file") or "").strip()
+        self.mail_cred_file = configured_mail_file or os.path.join(
             os.path.dirname(__file__), "mail_credentials.txt"
         )
         self._issued = 0  # 已发放的名额数（总共发放 count 个）
@@ -3072,7 +3082,11 @@ class SharedState:
     def claim_slot(self):
         """领取一个注册名额，返回 (是否成功, 序号)。"""
         with self._lock:
-            if self.stop_requested or self._issued >= self.count:
+            if (
+                self.stop_requested
+                or self._issued >= self.count
+                or (self.target_successes and self.success_count >= self.target_successes)
+            ):
                 return False, 0
             self._issued += 1
             return True, self._issued
@@ -3092,6 +3106,12 @@ class SharedState:
 
     def stop(self):
         self.stop_requested = True
+
+    def target_reached(self):
+        with self._lock:
+            return bool(
+                self.target_successes and self.success_count >= self.target_successes
+            )
 
     def log(self, worker_id, message):
         with self._io_lock:
@@ -3215,6 +3235,12 @@ def register_one(session, shared, worker_id, slot_no):
         response = export_result.get("push_response") or {}
         if response.get("probe") != "passed":
             raise RuntimeError(f"bridge 未确认 probe=passed: {response or export_result}")
+    if config.get("cpa_require_created", False):
+        response = export_result.get("push_response") or {}
+        if response.get("action") != "created":
+            raise RuntimeError(
+                f"bridge action 不是 created，不能计为新增账号: {response or export_result}"
+            )
     return email
 
 
@@ -3279,15 +3305,22 @@ def register_worker(worker_id, shared):
         log("[Debug] worker 结束")
 
 
-def run_registration_concurrent(count, concurrency):
+def run_registration_concurrent(count, concurrency, target_successes=0):
+    output_dir = str(config.get("accounts_output_dir") or "").strip()
+    if not output_dir:
+        output_dir = os.path.dirname(__file__)
+    output_dir = os.path.abspath(os.path.expanduser(output_dir))
+    os.makedirs(output_dir, mode=0o700, exist_ok=True)
+    os.chmod(output_dir, 0o700)
     accounts_output_file = os.path.join(
-        os.path.dirname(__file__),
+        output_dir,
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
     max_concurrency = max(1, int(config.get("max_concurrency", 1) or 1))
     concurrency = max(1, min(concurrency, count, max_concurrency))
-    shared = SharedState(count, accounts_output_file)
-    cli_log(f"[*] 开始并发注册，目标 {count} 个，并发 {concurrency} 个浏览器")
+    shared = SharedState(count, accounts_output_file, target_successes=target_successes)
+    target_text = f"，成功目标 {shared.target_successes}" if shared.target_successes else ""
+    cli_log(f"[*] 开始并发注册，最多尝试 {count} 个{target_text}，并发 {concurrency} 个浏览器")
     cli_log(f"[*] 成功账号将实时保存到: {accounts_output_file}")
     threads = []
     for worker_id in range(concurrency):
@@ -3308,14 +3341,42 @@ def run_registration_concurrent(count, concurrency):
             t.join()
     cleanup_stray_chrome()
     cli_log(f"[*] 任务结束。成功 {shared.success_count} | 失败 {shared.fail_count}")
+    return {
+        "attempted": shared._issued,
+        "successes": shared.success_count,
+        "failures": shared.fail_count,
+        "target_successes": shared.target_successes,
+        "target_reached": shared.target_reached() if shared.target_successes else True,
+        "accounts_output_file": accounts_output_file,
+    }
 
 
 def main():
+    global CONFIG_FILE
+    parser = argparse.ArgumentParser(description="Register Grok accounts through the browser client")
+    parser.add_argument("--config")
+    parser.add_argument("--count", type=int)
+    parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--target-successes", type=int)
+    parser.add_argument("--non-interactive", action="store_true")
+    args = parser.parse_args()
+    if args.config:
+        CONFIG_FILE = os.path.abspath(os.path.expanduser(args.config))
     load_config()
-    count = int(config.get("register_count", 1) or 1)
+    count = int(args.count if args.count is not None else config.get("register_count", 1) or 1)
+    target_successes = int(
+        args.target_successes
+        if args.target_successes is not None
+        else config.get("target_successes", 0) or 0
+    )
+    if count < 1:
+        raise SystemExit("--count/register_count must be at least 1")
+    if target_successes < 0 or target_successes > count:
+        raise SystemExit("target_successes must be between 0 and count")
     cli_log("[*] 已加载配置")
     cli_log(
-        f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | 目标注册数: {count}"
+        f"[*] 当前邮箱服务商: {config.get('email_provider', 'duckmail')} | "
+        f"最多尝试数: {count} | 成功目标: {target_successes or '未设置'}"
     )
     if config.get("cpa_export_enabled", True):
         push = "开" if config.get("cpa_push_enabled", False) else "关"
@@ -3326,20 +3387,31 @@ def main():
         )
     else:
         cli_log("[*] Sub2API auth 导出: 关闭（仅写 accounts_*.txt）")
-    try:
-        raw = input("请输入并发数量（同时开几个浏览器，直接回车=1）: ").strip()
-    except (KeyboardInterrupt, EOFError):
-        cli_log("[!] 已取消")
-        return
-    try:
-        concurrency = int(raw) if raw else 1
-    except ValueError:
-        cli_log("[!] 并发数量无效，使用 1")
-        concurrency = 1
+    if args.concurrency is not None:
+        concurrency = args.concurrency
+    elif args.non_interactive:
+        concurrency = int(config.get("max_concurrency", 1) or 1)
+    else:
+        try:
+            raw = input("请输入并发数量（同时开几个浏览器，直接回车=1）: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            cli_log("[!] 已取消")
+            return 130
+        try:
+            concurrency = int(raw) if raw else 1
+        except ValueError:
+            cli_log("[!] 并发数量无效，使用 1")
+            concurrency = 1
     if concurrency < 1:
         concurrency = 1
-    run_registration_concurrent(count, concurrency)
+    summary = run_registration_concurrent(
+        count,
+        concurrency,
+        target_successes=target_successes,
+    )
+    print("GROK_CLIENT_SUMMARY=" + json.dumps(summary, ensure_ascii=False), flush=True)
+    return 0 if summary["target_reached"] else 2
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

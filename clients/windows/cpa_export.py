@@ -67,12 +67,17 @@ def _run_preprobe(
     timeout = float(cfg.get("cpa_preprobe_timeout_sec", 45) or 45)
     attempts = max(1, int(cfg.get("cpa_preprobe_attempts", 3) or 3))
     retry_delay = float(cfg.get("cpa_preprobe_retry_delay_sec", 4) or 4)
+    permission_retry_delay = float(
+        cfg.get("cpa_preprobe_permission_retry_delay_sec", 0) or 0
+    )
     soft_retry_codes = {
         "PROBE_NETWORK_ERROR",
         "INVALID_RESPONSE",
         "INCOMPLETE_RESPONSE",
         "UPSTREAM_ERROR",
     }
+    if permission_retry_delay > 0:
+        soft_retry_codes.add("PERMISSION_DENIED")
     probe: dict = {}
     for attempt in range(1, attempts + 1):
         probe = probe_auth(payload, proxy=proxy or "", timeout=timeout)
@@ -92,7 +97,11 @@ def _run_preprobe(
         if code not in soft_retry_codes:
             break
         if attempt < attempts:
-            time.sleep(retry_delay)
+            time.sleep(
+                permission_retry_delay
+                if code == "PERMISSION_DENIED"
+                else retry_delay
+            )
 
     decision = probe.get("decision")
     code = probe.get("code")
