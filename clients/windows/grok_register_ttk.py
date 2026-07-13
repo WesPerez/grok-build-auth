@@ -2169,8 +2169,9 @@ def _native_click_matching(page, selector, phrases):
     ):
         try:
             element.scroll.to_see()
-            element.click(by_js=False, timeout=2.0)
-            return text
+            click_result = element.click(by_js=False, timeout=2.0)
+            if click_result is not False:
+                return text
         except Exception:
             continue
     return ""
