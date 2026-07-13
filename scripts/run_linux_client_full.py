@@ -210,9 +210,9 @@ def build_config(
         "cpa_preprobe_required": True,
         "cpa_preprobe_timeout_sec": 60,
         "cpa_preprobe_refresh_on_invalid": True,
-        "cpa_preprobe_attempts": 4,
+        "cpa_preprobe_attempts": 3,
         "cpa_preprobe_retry_delay_sec": 4,
-        "cpa_preprobe_permission_retry_delay_sec": 60,
+        "cpa_preprobe_permission_retry_delay_sec": 0,
     }
 
 
