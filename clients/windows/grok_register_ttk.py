@@ -1746,8 +1746,12 @@ return {
                 f"send={detail.get('hasSend')}, disabled={detail.get('sendDisabled')}"
             )
 
-        editor_result = page.run_js(
-            r"""
+        editor_deadline = time.time() + 10
+        editor_result = {}
+        while time.time() < editor_deadline:
+            raise_if_cancelled(cancel_callback)
+            editor_result = page.run_js(
+                r"""
 const marker = arguments[0];
 function visible(node) {
   if (!node) return false;
@@ -1770,9 +1774,15 @@ editor.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertT
 editor.dispatchEvent(new Event('change', {bubbles: true}));
 return {filled: true, url: location.href};
 """,
-            marker,
-        )
-        if not isinstance(editor_result, dict) or not editor_result.get("filled"):
+                marker,
+            )
+            if isinstance(editor_result, dict) and editor_result.get("filled"):
+                break
+            current_url = str((editor_result or {}).get("url") or getattr(page, "url", ""))
+            if "tos-gate" in current_url or "/login" in current_url:
+                return False, f"网页对话填写时被门禁阻断: {current_url[:160]}"
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
             return False, f"网页对话填写失败: {(editor_result or {}).get('reason', 'unknown')}"
         send_deadline = time.time() + 10
         send_result = {}
