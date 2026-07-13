@@ -188,6 +188,9 @@ def test_windows_main_has_no_global_process_kill():
     assert 'response.get("probe") != "passed"' in source
     assert "surface_deadline" in chat_canary
     assert "editor_deadline" in chat_canary
+    assert "native-cdp" in chat_canary
+    assert "What is {left} + {right}?" in chat_canary
+    assert "WEB_CANARY_" not in chat_canary
     assert "has_chat_editor" in browser_gate
     assert "chat_ready_stable" in browser_gate
     assert 'result.get("assistantMatch")' in chat_canary

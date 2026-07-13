@@ -18,6 +18,7 @@ import random
 import re
 import string
 import json
+import base64
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
@@ -275,6 +276,16 @@ def get_user_agent():
         "user_agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     )
+
+
+def get_jwt_claim(token, name):
+    try:
+        payload = str(token).split(".", 2)[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload).decode("utf-8"))
+        return claims.get(name)
+    except Exception:
+        return None
 
 
 def export_cpa_after_register(email, password, session=None, sso="", log_callback=None):
@@ -1396,8 +1407,10 @@ def browser_activate_chat_permission(browser_session, sso_token, log_callback=No
                     pass
 
     def click_accept_like_buttons():
-        return page.run_js(
+        marker = secrets.token_hex(8)
+        detail = page.run_js(
             r"""
+const marker = arguments[0];
 function isVisible(node) {
   if (!node) return false;
   const style = window.getComputedStyle(node);
@@ -1421,6 +1434,7 @@ function score(t) {
   const s = raw.toLowerCase().replace(/\s+/g, '');
   let n = 0;
   // policy/document links are NOT accept buttons
+  if (s.includes('privacy') || s.includes('terms') || s.includes('policy') || s.includes('acceptableuse')) n -= 200;
   if (s.includes('acceptableusepolicy') || s.includes('privacypolicy') || s.includes('termsofservice') || s.includes('policy') && (s.includes('view') || s.includes('read') || raw.length > 28)) n -= 150;
   if (s.includes('服务条款') || s.includes('使用政策') || s.includes('隐私政策')) n -= 80;
   if (s.includes('acceptandcontinue') || s.includes('acceptcontinue') || s.includes('iaccept') || s.includes('acceptall')) n += 100;
@@ -1441,8 +1455,6 @@ const selectors = [
   'input[type="submit"]',
   '[role="button"]',
   'div[role="button"]',
-  // anchors last: often policy links, not accept actions
-  'a[href]',
 ];
 const seen = new Set();
 const nodes = [];
@@ -1471,27 +1483,49 @@ if (!ranked.length) {
 }
 const best = ranked[0];
 try { best.n.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
-try { best.n.focus(); } catch (e) {}
-try { best.n.click(); } catch (e) {
-  try {
-    best.n.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
-  } catch (e2) {}
-}
-// also tick any visible checkboxes/terms toggles before/after
+best.n.setAttribute('data-grok-gate-target', marker);
+let checkboxCount = 0;
 for (const box of Array.from(document.querySelectorAll('input[type="checkbox"]'))) {
   if (isVisible(box) && !box.checked && !box.disabled) {
-    try { box.click(); } catch (e) {}
+    box.setAttribute('data-grok-gate-checkbox', marker);
+    checkboxCount += 1;
   }
 }
 return {
-  state: 'clicked',
+  state: 'targeted',
   text: best.t.slice(0, 100),
   score: best.s,
   url: location.href,
   body,
+  marker,
+  checkboxCount,
 };
-"""
+""",
+            marker,
         )
+        if not isinstance(detail, dict) or detail.get("state") != "targeted":
+            return detail
+        try:
+            for checkbox in page.eles(
+                f'css:input[type="checkbox"][data-grok-gate-checkbox="{marker}"]',
+                timeout=0.5,
+            ):
+                if not checkbox.states.is_checked:
+                    checkbox.click(by_js=False, timeout=1.5)
+            target = page.ele(
+                f'css:[data-grok-gate-target="{marker}"]', timeout=1.0
+            )
+            if not target:
+                detail["state"] = "target-missing"
+                return detail
+            target.click(by_js=False, timeout=2.0)
+            detail["state"] = "clicked"
+            detail["via"] = "native-cdp"
+            return detail
+        except Exception as exc:
+            detail["state"] = "click-error"
+            detail["error"] = type(exc).__name__
+            return detail
 
     def is_gate_url(url):
         low = str(url or "").lower()
@@ -1719,13 +1753,16 @@ def browser_chat_canary(
     cancel_callback=None,
     timeout=60,
 ):
-    """Send a browser chat canary and require an assistant reply marker."""
+    """Send a natural browser chat canary and require the exact answer."""
     log = log_callback or (lambda *_: None)
     if browser_session is None or getattr(browser_session, "page", None) is None:
         return False, "browser session 不可用"
 
     page = browser_session.page
-    marker = "WEB_CANARY_" + secrets.token_hex(12)
+    left = secrets.randbelow(39) + 11
+    right = secrets.randbelow(39) + 11
+    marker = str(left + right)
+    prompt = f"What is {left} + {right}? Reply with only the number."
     try:
         page.get("https://grok.com/")
         surface_deadline = time.time() + min(30, max(10, int(timeout or 60) // 2))
@@ -1771,65 +1808,47 @@ return {
             )
 
         editor_deadline = time.time() + 10
-        editor_result = {}
+        editor_result = {"reason": "no-editor"}
         while time.time() < editor_deadline:
             raise_if_cancelled(cancel_callback)
-            editor_result = page.run_js(
-                r"""
-const marker = arguments[0];
-function visible(node) {
-  if (!node) return false;
-  const rect = node.getBoundingClientRect();
-  const style = getComputedStyle(node);
-  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-}
-const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
-if (!editor) return {sent: false, reason: 'no-editor', url: location.href};
-const value = 'Reply exactly: ' + marker;
-editor.focus();
-if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
-  const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value');
-  if (descriptor && descriptor.set) descriptor.set.call(editor, value);
-  else editor.value = value;
-} else {
-  editor.textContent = value;
-}
-editor.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
-editor.dispatchEvent(new Event('change', {bubbles: true}));
-return {filled: true, url: location.href};
-""",
-                marker,
-            )
-            if isinstance(editor_result, dict) and editor_result.get("filled"):
-                break
-            editor_detail = editor_result if isinstance(editor_result, dict) else {}
-            current_url = str(editor_detail.get("url") or getattr(page, "url", ""))
+            current_url = str(getattr(page, "url", "") or "")
             if "tos-gate" in current_url or "/login" in current_url:
                 return False, f"网页对话填写时被门禁阻断: {current_url[:160]}"
+            editor = None
+            for candidate in page.eles(
+                'css:textarea,[contenteditable="true"]', timeout=0.5
+            ):
+                try:
+                    if candidate.states.is_displayed and candidate.states.is_enabled:
+                        editor = candidate
+                        break
+                except Exception:
+                    continue
+            if editor:
+                editor.input(prompt, clear=True, by_js=False)
+                editor_result = {"filled": True, "url": current_url}
+                break
             sleep_with_cancel(0.5, cancel_callback)
         else:
             editor_detail = editor_result if isinstance(editor_result, dict) else {}
             return False, f"网页对话填写失败: {editor_detail.get('reason', 'unknown')}"
         send_deadline = time.time() + 10
-        send_result = {}
+        send_result = {"reason": "chat-submit-unavailable"}
         while time.time() < send_deadline:
             raise_if_cancelled(cancel_callback)
-            send_result = page.run_js(
-                r"""
-function visible(node) {
-  if (!node) return false;
-  const rect = node.getBoundingClientRect();
-  const style = getComputedStyle(node);
-  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-}
-const send = document.querySelector('button[data-testid="chat-submit"]');
-if (!send || !visible(send) || send.disabled) return {sent: false, reason: 'chat-submit-unavailable'};
-send.click();
-return {sent: true, via: 'chat-submit', url: location.href};
-"""
-            )
-            if isinstance(send_result, dict) and send_result.get("sent"):
-                break
+            send = page.ele('css:button[data-testid="chat-submit"]', timeout=0.5)
+            if send:
+                try:
+                    if send.states.is_displayed and send.states.is_enabled:
+                        send.click(by_js=False, timeout=2.0)
+                        send_result = {
+                            "sent": True,
+                            "via": "native-cdp",
+                            "url": str(getattr(page, "url", "") or ""),
+                        }
+                        break
+                except Exception as exc:
+                    send_result = {"reason": type(exc).__name__}
             sleep_with_cancel(0.5, cancel_callback)
         else:
             return False, f"网页对话发送失败: {(send_result or {}).get('reason', 'unknown')}"
@@ -1839,14 +1858,14 @@ return {sent: true, via: 'chat-submit', url: location.href};
             raise_if_cancelled(cancel_callback)
             submitted = page.run_js(
                 r"""
-const marker = arguments[0];
+const prompt = arguments[0];
 const userSelectors = [
   '[data-message-author-role="user"]',
   '[data-role="user"]',
   '[data-testid*="user-message"]',
 ];
 const userMatch = userSelectors.some((selector) =>
-  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
+  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(prompt))
 );
 const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find((node) => {
   const rect = node.getBoundingClientRect();
@@ -1855,12 +1874,12 @@ const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="
 const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
 const body = document.body && document.body.innerText || '';
 return {
-  submitted: userMatch || (!editorText.includes(marker) && body.includes(marker)),
+  submitted: userMatch || (!editorText.includes(prompt) && body.includes(prompt)),
   permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
   url: location.href,
 };
 """,
-                marker,
+                prompt,
             )
             if isinstance(submitted, dict) and submitted.get("permissionDenied"):
                 return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
@@ -1882,7 +1901,7 @@ const assistantSelectors = [
   '[data-testid*="assistant"]',
 ];
 const assistantMatch = assistantSelectors.some((selector) =>
-  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
+  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').trim() === marker)
 );
 const body = document.body && document.body.innerText || '';
 return {
@@ -3229,6 +3248,11 @@ def register_one(session, shared, worker_id, slot_no):
         raise Exception("验证码阶段失败，已达到最大重试次数")
     profile = fill_profile_and_submit(session, log_callback=log, cancel_callback=cancel)
     sso = wait_for_sso_cookie(session, log_callback=log, cancel_callback=cancel)
+    sso_bot_flag = get_jwt_claim(sso, "bot_flag_source")
+    log(
+        "[Debug] 注册完成后的 SSO bot_flag_source="
+        + ("absent" if sso_bot_flag is None else str(sso_bot_flag))
+    )
     # TOS、生日和网页对话均为硬门禁；OAuth 后的客户端 preprobe 是最终可用性门禁。
     api_ok, api_msg = accept_tos_for_token(sso, log_callback=log, max_attempts=4, retry_delay=2.0)
     browser_ok, browser_msg = browser_activate_chat_permission(
