@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -1172,7 +1172,7 @@ def set_birth_date(session, log_callback=None):
         return False, f"set_birth_date 异常: {e}"
 
 
-def set_tos_accepted(session, log_callback=None):
+def set_tos_accepted(session, log_callback=None, timeout=30):
     url = "https://accounts.x.ai/auth_mgmt.AuthManagement/SetTosAcceptedVersion"
     payload = struct.pack("B", (2 << 3) | 0) + struct.pack("B", 1)
     data = b"\x00" + struct.pack(">I", len(payload)) + payload
@@ -1184,7 +1184,7 @@ def set_tos_accepted(session, log_callback=None):
         "referer": "https://accounts.x.ai/accept-tos",
     }
     try:
-        res = session.post(url, data=data, headers=new_headers, timeout=15)
+        res = session.post(url, data=data, headers=new_headers, timeout=timeout)
         if log_callback:
             log_callback(f"[Debug] set_tos_accepted status: {res.status_code}")
         if 200 <= res.status_code < 300:
@@ -1200,6 +1200,51 @@ def set_tos_accepted(session, log_callback=None):
         if log_callback:
             log_callback(f"[set_tos_accepted] 异常: {e}")
         return False, f"set_tos_accepted 异常: {e}"
+
+
+def accept_tos_for_token(token, cf_clearance="", log_callback=None, max_attempts=4, retry_delay=2.0):
+    """强制接受 TOS：优先 config.proxy，失败再直连。"""
+    user_agent = get_user_agent()
+    last_message = "set_tos_accepted 未执行"
+    proxy_url = str(config.get("proxy") or "").strip()
+    proxy_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
+    modes = []
+    if proxy_dict:
+        modes.append(("proxy", proxy_dict))
+    modes.append(("direct", None))
+    schedule = []
+    while len(schedule) < max_attempts:
+        for item in modes:
+            schedule.append(item)
+            if len(schedule) >= max_attempts:
+                break
+    for attempt, (mode, proxies) in enumerate(schedule, 1):
+        try:
+            with requests.Session(impersonate="chrome120", proxies=proxies) as session:
+                cookie_parts = [f"sso={token}", f"sso-rw={token}"]
+                if cf_clearance:
+                    cookie_parts.append(f"cf_clearance={cf_clearance}")
+                session.headers.update({
+                    "user-agent": user_agent,
+                    "cookie": "; ".join(cookie_parts),
+                })
+                if log_callback:
+                    log_callback(f"[*] TOS 尝试 {attempt}/{len(schedule)} via {mode}")
+                ok, message = set_tos_accepted(session, log_callback=log_callback, timeout=30)
+                if ok:
+                    if log_callback:
+                        log_callback(f"[+] TOS 已接受（{mode}，第 {attempt}/{len(schedule)} 次）")
+                    return True, "ok"
+                last_message = f"{mode}: {message}"
+                if log_callback:
+                    log_callback(f"[!] TOS 未成功（{mode}，第 {attempt}/{len(schedule)} 次）: {message}")
+        except Exception as e:
+            last_message = f"{mode}: accept_tos_for_token 异常: {e}"
+            if log_callback:
+                log_callback(f"[!] TOS 异常（{mode}，第 {attempt}/{len(schedule)} 次）: {e}")
+        if attempt < len(schedule):
+            time.sleep(retry_delay)
+    return False, last_message
 
 
 def encode_grpc_nsfw_settings():
@@ -1240,6 +1285,290 @@ def update_nsfw_settings(session, log_callback=None):
         if log_callback:
             log_callback(f"[update_nsfw] 异常: {e}")
         return False, f"update_nsfw_settings 异常: {e}"
+
+
+def browser_activate_chat_permission(browser_session, sso_token, log_callback=None, cancel_callback=None, timeout=90):
+    """强制浏览器通过 tos-gate：写入 SSO，点击同意，必须离开 tos-gate 才算成功。"""
+    log = log_callback or (lambda *_: None)
+    if browser_session is None or getattr(browser_session, "page", None) is None:
+        return False, "browser session 不可用"
+    if not sso_token:
+        return False, "sso token 为空"
+
+    page = browser_session.page
+    token = str(sso_token).strip()
+    last_detail = ""
+
+    def current_url():
+        try:
+            return str(getattr(page, "url", "") or "")
+        except Exception:
+            return ""
+
+    def page_body(limit=240):
+        try:
+            return str(
+                page.run_js(
+                    "return (document.body && document.body.innerText || '').replace(/\\s+/g,' ').trim().slice(0, arguments[0]);",
+                    limit,
+                )
+                or ""
+            )
+        except Exception:
+            return ""
+
+    def inject_sso_cookies():
+        cookies = [
+            {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso", "value": token, "domain": ".grok.com", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso-rw", "value": token, "domain": ".grok.com", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso", "value": token, "domain": "accounts.x.ai", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso-rw", "value": token, "domain": "accounts.x.ai", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso", "value": token, "domain": "grok.com", "path": "/", "secure": True, "httpOnly": True},
+            {"name": "sso-rw", "value": token, "domain": "grok.com", "path": "/", "secure": True, "httpOnly": True},
+        ]
+        try:
+            page.set.cookies(cookies)
+        except Exception:
+            for c in cookies:
+                try:
+                    page.set.cookies(c)
+                except Exception:
+                    pass
+
+    def click_accept_like_buttons():
+        return page.run_js(
+            r"""
+function isVisible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (!style || style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+  return [
+    node.innerText,
+    node.textContent,
+    node.getAttribute('aria-label'),
+    node.getAttribute('title'),
+    node.getAttribute('value'),
+    node.getAttribute('data-testid'),
+    node.getAttribute('name'),
+  ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+function score(t) {
+  const raw = String(t || '');
+  const s = raw.toLowerCase().replace(/\s+/g, '');
+  let n = 0;
+  // policy/document links are NOT accept buttons
+  if (s.includes('acceptableusepolicy') || s.includes('privacypolicy') || s.includes('termsofservice') || s.includes('policy') && (s.includes('view') || s.includes('read') || raw.length > 28)) n -= 150;
+  if (s.includes('服务条款') || s.includes('使用政策') || s.includes('隐私政策')) n -= 80;
+  if (s.includes('acceptandcontinue') || s.includes('acceptcontinue') || s.includes('iaccept') || s.includes('acceptall')) n += 100;
+  if ((s === 'accept' || s.startsWith('accept')) && !s.includes('policy')) n += 90;
+  if (s.includes('agree') || s.includes('iagree') || s.includes('agreeto')) n += 85;
+  if (s.includes('同意') || s.includes('接受') || s.includes('确认并继续') || s.includes('我同意')) n += 90;
+  if (s.includes('continue') || s.includes('继续') || s.includes('start') || s.includes('开始') || s.includes('next') || s.includes('下一步')) n += 40;
+  if (s.includes('gotit') || s.includes('ok') || s.includes('好的') || s.includes('done') || s.includes('完成')) n += 25;
+  if (s.includes('cancel') || s.includes('取消') || s.includes('decline') || s.includes('拒绝') || s.includes('later') || s.includes('skip')) n -= 120;
+  // short primary buttons preferred
+  if (raw.trim().length > 0 && raw.trim().length <= 18) n += 15;
+  return n;
+}
+// prefer main buttons, then any clickable
+const selectors = [
+  'button[type="submit"]',
+  'button',
+  'input[type="submit"]',
+  '[role="button"]',
+  'div[role="button"]',
+  // anchors last: often policy links, not accept actions
+  'a[href]',
+];
+const seen = new Set();
+const nodes = [];
+for (const sel of selectors) {
+  for (const n of Array.from(document.querySelectorAll(sel))) {
+    if (seen.has(n)) continue;
+    seen.add(n);
+    nodes.push(n);
+  }
+}
+const ranked = nodes
+  .filter((n) => isVisible(n) && !n.disabled && n.getAttribute('aria-disabled') !== 'true')
+  .map((n) => ({ n, t: textOf(n), s: score(textOf(n)) }))
+  .filter((x) => x.s > 0)
+  .sort((a, b) => b.s - a.s);
+const body = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 220);
+if (!ranked.length) {
+  return {
+    state: 'no-button',
+    url: location.href,
+    title: document.title,
+    body,
+    buttons: Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"]'))
+      .filter(isVisible).map(textOf).filter(Boolean).slice(0, 8),
+  };
+}
+const best = ranked[0];
+try { best.n.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+try { best.n.focus(); } catch (e) {}
+try { best.n.click(); } catch (e) {
+  try {
+    best.n.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+  } catch (e2) {}
+}
+// also tick any visible checkboxes/terms toggles before/after
+for (const box of Array.from(document.querySelectorAll('input[type="checkbox"]'))) {
+  if (isVisible(box) && !box.checked && !box.disabled) {
+    try { box.click(); } catch (e) {}
+  }
+}
+return {
+  state: 'clicked',
+  text: best.t.slice(0, 100),
+  score: best.s,
+  url: location.href,
+  body,
+};
+"""
+        )
+
+    def is_gate_url(url):
+        low = str(url or "").lower()
+        return ("tos-gate" in low) or ("accept-tos" in low) or ("/tos" in low and "grok.com" in low)
+
+    def is_login_wall(url, body=""):
+        low = str(url or "").lower()
+        b = str(body or "").lower()
+        if any(x in low for x in ("sign-in", "sign-up", "login", "accounts.x.ai/sign")):
+            return True
+        if "sign in" in b or "登录" in b or "log in" in b:
+            return True
+        return False
+
+    def has_sso_cookie():
+        try:
+            cookies_now = page.cookies(all_domains=True, all_info=True) or []
+        except Exception:
+            return False
+        for item in cookies_now:
+            name = str(item.get("name", "") if isinstance(item, dict) else getattr(item, "name", "")).strip()
+            value = str(item.get("value", "") if isinstance(item, dict) else getattr(item, "value", "")).strip()
+            if name == "sso" and value:
+                return True
+        return False
+
+    def chat_ready(url, body=""):
+        low = str(url or "").lower()
+        b = str(body or "").lower()
+        if not low or is_gate_url(low) or is_login_wall(low, b):
+            return False
+        if "grok.com" not in low:
+            return False
+        # negative markers of unfinished TOS
+        if "terms of service" in b and ("accept" in b or "agree" in b):
+            return False
+        if "服务条款" in b and ("接受" in b or "同意" in b):
+            return False
+        return has_sso_cookie()
+
+    def hard_click_pass_gate(stage):
+        nonlocal last_detail, page
+        clicked = click_accept_like_buttons()
+        if isinstance(clicked, dict):
+            state = clicked.get("state")
+            if state == "clicked":
+                log(f"[*] 浏览器 {stage} 点击: {clicked.get('text') or 'button'}")
+                last_detail = f"{stage}:clicked:{clicked.get('text')}"
+            else:
+                buttons = clicked.get("buttons") or []
+                body = clicked.get("body") or ""
+                last_detail = f"{stage}:no-button body={str(body)[:80]} buttons={buttons[:4]}"
+                log(f"[Debug] 浏览器 {stage} 无按钮: {last_detail}")
+            return clicked
+        last_detail = f"{stage}:click-result={clicked}"
+        return clicked
+
+    try:
+        # 1) seed cookies on both domains
+        try:
+            page.get("https://accounts.x.ai/")
+            sleep_with_cancel(0.8, cancel_callback)
+        except Exception:
+            pass
+        inject_sso_cookies()
+        log("[*] 浏览器已写入 sso cookie，开始强制过 TOS 门禁")
+
+        targets = [
+            "https://accounts.x.ai/accept-tos",
+            "https://grok.com/tos-gate",
+            "https://grok.com/",
+        ]
+        deadline = time.time() + max(45, int(timeout or 90))
+        attempt = 0
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            attempt += 1
+            target = targets[(attempt - 1) % len(targets)]
+            try:
+                browser_session.refresh_page()
+                page = browser_session.page
+            except Exception:
+                pass
+            try:
+                inject_sso_cookies()
+                page.get(target)
+            except Exception as e:
+                last_detail = f"open {target} failed: {e}"
+                log(f"[!] 浏览器打开失败: {last_detail}")
+                sleep_with_cancel(1.0, cancel_callback)
+                continue
+
+            sleep_with_cancel(1.2, cancel_callback)
+            # multi-click rounds on current page
+            for round_i in range(1, 8):
+                raise_if_cancelled(cancel_callback)
+                url = current_url()
+                body = page_body()
+                if chat_ready(url, body):
+                    log(f"[+] 浏览器已离开 TOS 门禁: {url[:140]}")
+                    return True, f"browser left gate: {url[:140]}"
+                if is_gate_url(url) or ("accept" in body.lower() and "term" in body.lower()) or ("同意" in body) or ("接受" in body):
+                    hard_click_pass_gate(f"gate-r{round_i}")
+                    sleep_with_cancel(1.4, cancel_callback)
+                    url2 = current_url()
+                    body2 = page_body()
+                    if chat_ready(url2, body2):
+                        log(f"[+] 浏览器点击后离开 TOS 门禁: {url2[:140]}")
+                        return True, f"browser left gate after click: {url2[:140]}"
+                else:
+                    # not obviously a gate; still try one accept-like click then re-check
+                    hard_click_pass_gate(f"page-r{round_i}")
+                    sleep_with_cancel(1.2, cancel_callback)
+                    url2 = current_url()
+                    body2 = page_body()
+                    if chat_ready(url2, body2):
+                        log(f"[+] 浏览器页面激活完成: {url2[:140]}")
+                        return True, f"browser ready: {url2[:140]}"
+                    # if redirected to gate, keep looping
+                    if is_gate_url(url2):
+                        continue
+                    break
+
+            # small pause before next target cycle
+            sleep_with_cancel(0.8, cancel_callback)
+
+        # final check
+        url = current_url()
+        body = page_body()
+        if chat_ready(url, body):
+            log(f"[+] 浏览器 TOS/chat 激活完成: {url[:140]}")
+            return True, f"browser ok: {url[:140]}"
+        return False, f"仍未离开 TOS 门禁, last_url={url[:160]}, detail={last_detail[:160]}, body={body[:100]}"
+    except Exception as e:
+        return False, f"browser_activate_chat_permission 异常: {e}"
 
 
 def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
@@ -2527,8 +2856,30 @@ def register_one(session, shared, worker_id, slot_no):
         raise Exception("验证码阶段失败，已达到最大重试次数")
     profile = fill_profile_and_submit(session, log_callback=log, cancel_callback=cancel)
     sso = wait_for_sso_cookie(session, log_callback=log, cancel_callback=cancel)
+    # 强制 TOS：API 尽力 + 浏览器必须离开 tos-gate（否则 bridge 易 422）
+    api_ok, api_msg = accept_tos_for_token(sso, log_callback=log, max_attempts=4, retry_delay=2.0)
+    browser_ok, browser_msg = browser_activate_chat_permission(
+        session, sso, log_callback=log, cancel_callback=cancel, timeout=90
+    )
+    if not browser_ok:
+        # 再给一次机会：重试浏览器门禁
+        log(f"[!] 浏览器首次未过门禁，重试一次: {browser_msg}")
+        browser_ok, browser_msg = browser_activate_chat_permission(
+            session, sso, log_callback=log, cancel_callback=cancel, timeout=60
+        )
+    if not browser_ok:
+        raise RuntimeError(
+            f"TOS 门禁未通过，账号不可用: browser={browser_msg}; api={api_msg}"
+        )
+    if api_ok:
+        log(f"[+] API TOS + 浏览器已离开 tos-gate: {browser_msg}")
+    else:
+        log(f"[+] 浏览器已离开 tos-gate（API TOS 未确认: {api_msg}）")
     if config.get("enable_nsfw", True):
-        enable_nsfw_for_token(sso, log_callback=log)
+        # NSFW / birth 为增强项；TOS 已强制成功，这里失败不阻断注册
+        nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log)
+        if not nsfw_ok and log:
+            log(f"[!] NSFW/birth 未完全成功（TOS 已通过，继续）: {nsfw_msg}")
     password = profile.get("password", "")
     shared.save_account(f"{email}----{password}----{sso}\n")
     export_result = export_cpa_after_register(

@@ -29,5 +29,11 @@
   "cpa_push_timeout_sec": 240,
   "mint_proxy": "",
   "mint_timeout_sec": 300,
-  "mint_required": true
+  "mint_required": true,
+  "cpa_preprobe_enabled": true,
+  "cpa_preprobe_required": true,
+  "cpa_preprobe_timeout_sec": 45,
+  "cpa_preprobe_refresh_on_invalid": true,
+  "cpa_preprobe_attempts": 3,
+  "cpa_preprobe_retry_delay_sec": 4
 }

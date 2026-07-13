@@ -48,3 +48,8 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Windows client runtime side dirs / batch logs
+clients/windows/cpa_pending/
+clients/windows/cpa_cooldown/
+clients/windows/run_logs/

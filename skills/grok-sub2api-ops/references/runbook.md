@@ -84,3 +84,14 @@ GROK_OAUTH_TOKEN_REFRESH_FAILED
 - 删除 Sub2API 账号不自动等于删除 Mailu 邮箱；两者分别授权。
 - 只删除本任务创建的临时 `config.json`、venv、任务调试端口和已证明归属的浏览器 profile。
 - auth、账号密码记录、数据库备份和审计日志默认保留为受限运行产物，除非用户精确授权删除。
+
+## 客户端 preprobe 旁路目录
+
+| 目录 | 含义 | 动作 |
+|---|---|---|
+| `clients/windows/cpa_auths/` | preprobe pass 的正式 auth | 可 push |
+| `clients/windows/cpa_pending/` | PERMISSION_DENIED / 网络 / 5xx 等 | 15 分钟内复测，禁止当废号删 |
+| `clients/windows/cpa_cooldown/` | 402/429 额度 | 等窗口，禁止永久删除 |
+| `cpa_auth_failed.txt` | 失败摘要（无 token） | 审计 |
+
+批量 finish 脚本解析注册日志时优先 GBK；读 HTTPError body 必须限长，避免 422 超时拖垮整批推送。

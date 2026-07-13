@@ -137,6 +137,7 @@ def test_cpa_export_requires_bridge_probe(tmp_path, monkeypatch):
             page=object(),
             config={
                 "cpa_auth_dir": str(tmp_path),
+                "cpa_preprobe_enabled": False,
                 "cpa_push_enabled": True,
                 "cpa_push_required": True,
                 "cpa_require_probe_passed": True,
@@ -160,6 +161,7 @@ def test_cpa_export_requires_bridge_probe(tmp_path, monkeypatch):
             page=object(),
             config={
                 "cpa_auth_dir": str(tmp_path),
+                "cpa_preprobe_enabled": False,
                 "cpa_push_enabled": True,
                 "cpa_push_required": True,
                 "cpa_require_probe_passed": True,
@@ -181,3 +183,117 @@ def test_windows_main_has_no_global_process_kill():
     assert "googleupdate.exe" not in cleanup.lower()
     assert "export_result = export_cpa_after_register" in source
     assert 'response.get("probe") != "passed"' in source
+
+def test_client_preprobe_decisions(monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        from cpa import preprobe
+
+        class FakeResp:
+            def __init__(self, status_code, payload=None, text=""):
+                self.status_code = status_code
+                self._payload = payload
+                self.text = text if text or payload is None else json.dumps(payload)
+
+            def json(self):
+                if self._payload is None:
+                    raise ValueError("no json")
+                return self._payload
+
+        class FakeSession:
+            def __init__(self):
+                self.trust_env = True
+                self._response = None
+
+            def post(self, *args, **kwargs):
+                return self._response
+
+        auth = {"access_token": "tok", "refresh_token": "ref"}
+
+        sess = FakeSession()
+        monkeypatch.setattr(preprobe.requests, "Session", lambda: sess)
+
+        sess._response = FakeResp(200, {"status": "completed", "output_text": "CLIENT_PROBE_OK"})
+        assert preprobe.probe_auth(auth)["decision"] == "pass"
+
+        sess._response = FakeResp(200, {"status": "in_progress", "output_text": "nope"})
+        assert preprobe.probe_auth(auth)["code"] == "INCOMPLETE_RESPONSE"
+
+        sess._response = FakeResp(403, text='{"error":"permission-denied"}')
+        got = preprobe.probe_auth(auth)
+        assert got["decision"] == "retry"
+        assert got["code"] == "PERMISSION_DENIED"
+
+        sess._response = FakeResp(429, text="free-usage exhausted")
+        assert preprobe.probe_auth(auth)["decision"] == "cooldown"
+
+        sess._response = FakeResp(401, text="invalid_grant refresh revoked")
+        assert preprobe.probe_auth(auth)["decision"] == "refresh"
+
+        assert preprobe.probe_auth({"access_token": "x"})["decision"] == "reject"
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_cpa_export_preprobe_pending_not_push(tmp_path, monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        cpa_export = load_module("windows_cpa_export_preprobe_test", CLIENT / "cpa_export.py")
+        import cpa
+        import oidc_mint
+
+        monkeypatch.setattr(
+            oidc_mint,
+            "mint_with_browser",
+            lambda **kwargs: {
+                "access_token": "not-a-jwt-but-nonempty",
+                "refresh_token": "refresh-token-value",
+                "expires_in": 21600,
+            },
+        )
+        monkeypatch.setattr(oidc_mint, "resolve_proxy", lambda value: value)
+        monkeypatch.setattr(oidc_mint, "set_runtime_proxy", lambda value: None)
+        monkeypatch.setattr(
+            cpa.preprobe,
+            "probe_auth",
+            lambda auth, proxy="", timeout=45: {
+                "decision": "retry",
+                "code": "PERMISSION_DENIED",
+                "status": 403,
+            },
+        )
+        pushed = {"n": 0}
+
+        def boom_push(**kwargs):
+            pushed["n"] += 1
+            return True, 200, json.dumps({"probe": "passed", "action": "created"})
+
+        monkeypatch.setattr(cpa, "push_auth_file", boom_push)
+        out = tmp_path / "cpa_auths"
+        result = cpa_export.export_cpa_for_account(
+            "pending@example.com",
+            "password",
+            page=object(),
+            config={
+                "cpa_auth_dir": str(out),
+                "cpa_preprobe_enabled": True,
+                "cpa_preprobe_required": True,
+                "cpa_push_enabled": True,
+                "cpa_push_required": True,
+                "cpa_require_probe_passed": True,
+                "cpa_remote_base": "https://bridge.example",
+                "cpa_remote_secret": "secret",
+            },
+            log_callback=lambda message: None,
+        )
+        assert result["ok"] is False
+        assert result["preprobe"]["code"] == "PERMISSION_DENIED"
+        assert result.get("side_dir") == "cpa_pending"
+        assert pushed["n"] == 0
+        assert not list(out.glob("xai-*.json"))
+        pending = out.parent / "cpa_pending"
+        assert list(pending.glob("xai-*.json"))
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))

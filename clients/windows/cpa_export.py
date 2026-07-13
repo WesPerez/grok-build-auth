@@ -1,5 +1,5 @@
-"""注册成功钩子：铸造 Grok Build 设备码 OIDC → 写出 CPA (CLIProxyAPI) 的
-xai-<email>.json → 推送到远端 CLIProxyAPI 导入。
+"""注册成功钩子：铸造 Grok Build 设备码 OIDC → 客户端 preprobe → 写出 CPA
+xai-<email>.json → 推送到远端 CLIProxyAPI / hardened bridge。
 
 - 本地写盘目录：config['cpa_auth_dir']（默认 ./cpa_auths）
 - 远端推送：POST config['cpa_remote_base'] + /v0/management/auth-files?name=...
@@ -7,6 +7,11 @@ xai-<email>.json → 推送到远端 CLIProxyAPI 导入。
 
 免费 Grok 4.5 用 base_url=cli-chat-proxy；CLIProxyAPI 请求 grok 时自带
 x-grok-client-version 头，免费号不会 426。
+
+客户端 preprobe（默认开启）：
+在 write_cpa_xai_auth / push 之前直连 Grok CLI /v1/responses。
+只有 decision=pass 才进入正式 cpa_auths 并推送；PERMISSION_DENIED /
+网络抖动 / 429 等写入 cpa_pending 或 cpa_cooldown，不进正式目录、不 push。
 """
 
 from __future__ import annotations
@@ -40,6 +45,79 @@ def _record_failure(out_dir: Path, email: str, reason: str) -> None:
         pass
 
 
+def _preprobe_enabled(cfg: dict) -> bool:
+    # Default ON: avoid writing/pushing tokens that only pass /models.
+    return bool(cfg.get("cpa_preprobe_enabled", True))
+
+
+def _run_preprobe(
+    payload: dict,
+    *,
+    proxy: str,
+    cfg: dict,
+    log: Callable[[str], None],
+) -> tuple[dict, dict]:
+    """Return (probe_result, possibly_refreshed_payload)."""
+    from cpa.preprobe import probe_auth, try_refresh_access_token
+
+    timeout = float(cfg.get("cpa_preprobe_timeout_sec", 45) or 45)
+    attempts = max(1, int(cfg.get("cpa_preprobe_attempts", 3) or 3))
+    retry_delay = float(cfg.get("cpa_preprobe_retry_delay_sec", 4) or 4)
+    soft_retry_codes = {
+        "PROBE_NETWORK_ERROR",
+        "INVALID_RESPONSE",
+        "INCOMPLETE_RESPONSE",
+        "UPSTREAM_ERROR",
+        "PERMISSION_DENIED",
+    }
+    probe: dict = {}
+    for attempt in range(1, attempts + 1):
+        probe = probe_auth(payload, proxy=proxy or "", timeout=timeout)
+        decision = probe.get("decision")
+        code = str(probe.get("code") or "")
+        status = probe.get("status")
+        log(
+            f"[cpa] preprobe attempt={attempt}/{attempts} "
+            f"decision={decision} code={code} status={status}"
+        )
+        if decision == "pass":
+            break
+        if decision == "reject":
+            break
+        if decision in ("cooldown", "refresh"):
+            break
+        if code not in soft_retry_codes:
+            break
+        if attempt < attempts:
+            time.sleep(retry_delay)
+
+    decision = probe.get("decision")
+    code = probe.get("code")
+    status = probe.get("status")
+
+    if decision == "refresh" and bool(cfg.get("cpa_preprobe_refresh_on_invalid", True)):
+        refreshed = try_refresh_access_token(payload, proxy=proxy or "", timeout=30)
+        if refreshed.get("ok") and isinstance(refreshed.get("auth"), dict):
+            payload = refreshed["auth"]
+            probe = probe_auth(payload, proxy=proxy or "", timeout=timeout)
+            decision = probe.get("decision")
+            code = probe.get("code")
+            status = probe.get("status")
+            log(f"[cpa] preprobe after refresh decision={decision} code={code} status={status}")
+        else:
+            log(
+                f"[cpa] preprobe refresh failed code={refreshed.get('code')} "
+                f"status={refreshed.get('status')}"
+            )
+            # Keep original refresh decision for routing.
+            probe = {
+                "decision": "refresh",
+                "code": refreshed.get("code") or "TOKEN_INVALID",
+                "status": refreshed.get("status") or 0,
+            }
+    return probe, payload
+
+
 # ── 主入口 ──
 
 def export_cpa_for_account(
@@ -50,10 +128,10 @@ def export_cpa_for_account(
     config: dict | None = None,
     log_callback: Callable[[str], None] | None = None,
 ) -> dict:
-    """在注册浏览器里铸造 OIDC → 写本地 xai-<email>.json → 推送远端 CLIProxyAPI。
+    """在注册浏览器里铸造 OIDC → preprobe → 写本地 xai-<email>.json → 推送远端。
 
     复用注册成功后仍开着、且已登录 grok 的浏览器铸造，不另开浏览器。
-    返回 {ok, email, path, pushed, push_status?, error?}。
+    返回 {ok, email, path, pushed, push_status?, error?, preprobe?}。
     """
     cfg = config or {}
     log = log_callback or (lambda m: print(m, flush=True))
@@ -73,7 +151,7 @@ def export_cpa_for_account(
 
     out_dir = _resolve_out_dir(cfg)
 
-    # 代理优先级：mint_proxy > proxy > 环境
+    # 代理优先级：mint_proxy > proxy > 环境（preprobe 也走同一条，不用 cpa_push_proxy）
     proxy = (cfg.get("mint_proxy") or cfg.get("proxy") or "").strip()
     if not proxy:
         proxy = (
@@ -140,6 +218,67 @@ def export_cpa_for_account(
             expires_in=tokens.get("expires_in"),
             base_url=base_url,
         )
+    except Exception as exc:  # noqa: BLE001
+        log(f"[!] 组装 CPA payload 失败: {exc}")
+        _record_failure(out_dir, email, f"build: {exc}")
+        if cfg.get("mint_required", False):
+            raise
+        return {"ok": False, "error": str(exc), "email": email}
+
+    # ── 客户端 preprobe：正式落盘 / push 前先证明 chat 可用 ──
+    preprobe_meta: dict[str, Any] | None = None
+    if _preprobe_enabled(cfg):
+        probe, payload = _run_preprobe(
+            payload,
+            proxy=str(resolved or ""),
+            cfg=cfg,
+            log=log,
+        )
+        preprobe_meta = {
+            "decision": probe.get("decision"),
+            "code": probe.get("code"),
+            "status": probe.get("status"),
+        }
+        decision = str(probe.get("decision") or "")
+        if decision != "pass":
+            reason = f"preprobe:{probe.get('code')}:{probe.get('status')}"
+            _record_failure(out_dir, email, reason)
+
+            if decision == "reject":
+                return {
+                    "ok": False,
+                    "email": email,
+                    "error": str(probe.get("code") or "MALFORMED_AUTH"),
+                    "preprobe": preprobe_meta,
+                }
+
+            # retry / cooldown / refresh → 旁路目录，绝不进正式 auth 或 push
+            side_name = "cpa_cooldown" if decision == "cooldown" else "cpa_pending"
+            pending_dir = out_dir.parent / side_name
+            try:
+                pending_path = cpa.write_cpa_xai_auth(pending_dir, payload)
+            except Exception as exc:  # noqa: BLE001
+                log(f"[!] 写 {side_name} 失败: {exc}")
+                if cfg.get("mint_required", False) or cfg.get("cpa_preprobe_required", True):
+                    raise
+                return {
+                    "ok": False,
+                    "email": email,
+                    "error": f"{reason}; write_{side_name}:{exc}",
+                    "preprobe": preprobe_meta,
+                }
+            log(f"[cpa] preprobe 未通过，已旁路到 {side_name}: {pending_path.name} ({reason})")
+            return {
+                "ok": False,
+                "email": email,
+                "path": str(pending_path),
+                "error": str(probe.get("code") or reason),
+                "preprobe": preprobe_meta,
+                "side_dir": side_name,
+            }
+
+    # 只有 pass（或关闭 preprobe）才写正式目录
+    try:
         path = cpa.write_cpa_xai_auth(out_dir, payload)
         filename = Path(path).name
     except Exception as exc:  # noqa: BLE001
@@ -147,12 +286,18 @@ def export_cpa_for_account(
         _record_failure(out_dir, email, f"write: {exc}")
         if cfg.get("mint_required", False):
             raise
-        return {"ok": False, "error": str(exc), "email": email}
+        return {"ok": False, "error": str(exc), "email": email, "preprobe": preprobe_meta}
 
     log(f"[Debug] 已写本地: {path}")
-    result: dict[str, Any] = {"ok": True, "email": email, "path": str(path), "pushed": False}
+    result: dict[str, Any] = {
+        "ok": True,
+        "email": email,
+        "path": str(path),
+        "pushed": False,
+        "preprobe": preprobe_meta or {"decision": "skipped"},
+    }
 
-    # 推送远端 CLIProxyAPI
+    # 推送远端 CLIProxyAPI / bridge（bridge 仍是最终信任边界）
     if cfg.get("cpa_push_enabled", False):
         remote_base = str(cfg.get("cpa_remote_base") or "").strip()
         secret = str(cfg.get("cpa_remote_secret") or "").strip()
@@ -185,6 +330,7 @@ def export_cpa_for_account(
                         result["pushed"] = False
                         result["error"] = "bridge response missing probe=passed"
                 else:
+                    # Safe truncated body for diagnostics; never log tokens from payload.
                     result["push_error"] = text[:300]
                     log(f"[!] [cpa] 推送远端失败 HTTP {status}: {text[:200]}")
                     if cfg.get("cpa_push_required", False):

@@ -1,6 +1,7 @@
 """CPA (CLIProxyAPI) xai auth 组装 / 写盘 / 推送远端。"""
 
 from .client import CpaPushError, push_auth_file
+from .preprobe import probe_auth, try_refresh_access_token
 from .schema import (
     API_BASE_URL,
     CLI_BASE_URL,
@@ -25,6 +26,8 @@ __all__ = [
     "build_cpa_xai_auth",
     "credential_file_name",
     "expired_from_access_token",
+    "probe_auth",
     "push_auth_file",
+    "try_refresh_access_token",
     "write_cpa_xai_auth",
 ]

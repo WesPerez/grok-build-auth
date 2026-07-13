@@ -70,6 +70,24 @@ python scripts/push_auth.py --project-dir <grok-auth> --config <config> --auth <
 
 密码和 API Key只从环境变量、隐藏提示或 `0600` 私有配置读取，不放命令行。
 
+
+## 客户端 preprobe（必读）
+
+Windows 客户端在 `cpa_export.export_cpa_for_account` 铸造 token 后、写正式 `cpa_auths` / push 前，会直连 Grok CLI：
+
+```text
+POST https://cli-chat-proxy.grok.com/v1/responses
+完整 CLI 头（含 X-XAI-Token-Auth + x-grok-client-identifier）
+要求 status=completed 且输出含探测标记
+```
+
+- 配置：`cpa_preprobe_enabled`（默认 true）、`cpa_preprobe_timeout_sec`、`cpa_preprobe_refresh_on_invalid`。
+- **不要**用 `/v1/models` 证明可用性；它假阳性极高。
+- 未 pass：`PERMISSION_DENIED`/网络 → `cpa_pending/`；429/402 → `cpa_cooldown/`；畸形 token → 不落盘。
+- 正式目录与 push 只接受 preprobe pass；bridge 仍是最终信任边界。
+- 详细踩坑与 A/B 证据见 `docs/CLIENT_PREPROBE_AND_BATCH_LESSONS.zh-CN.md`。
+
+注册成功硬门槛还包括浏览器离开 `tos-gate`（`browser_activate_chat_permission`），仅 API `set_tos_accepted` 不够。
 ## 账号判读与恢复
 
 - `429 included free usage / rolling 24-hour window`：额度冷却，不是 token 过期；按 reset 或 24 小时临时跳过，不能永久删除。
@@ -88,3 +106,4 @@ python scripts/push_auth.py --project-dir <grok-auth> --config <config> --auth <
 ## 输出
 
 报告模式、脱敏邮箱、账号 ID、auth 路径、代理 ref（仅注册阶段）、bridge action/probe 或服务器 manifest、指定账号 probe、分组 Responses、429/revoked 残余状态、清理项、commit 和 push 状态。
+
