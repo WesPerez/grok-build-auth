@@ -135,43 +135,8 @@ def account_test(base_url: str, key: str, account: dict[str, Any], timeout: floa
     }
 
 
-def delete_account(base_url: str, key: str, account_id: int, timeout: float) -> bool:
-    account_url = f"{base_url.rstrip('/')}/api/v1/admin/accounts/{int(account_id)}"
-    request = urllib.request.Request(
-        account_url,
-        headers={"x-api-key": key},
-        method="DELETE",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            read_limited(response)
-            if int(response.status) not in (200, 204):
-                return False
-    except urllib.error.HTTPError as exc:
-        read_limited(exc)
-        if int(exc.code or 0) not in (200, 204, 404):
-            return False
-    except Exception:
-        return False
-
-    verify = urllib.request.Request(
-        account_url,
-        headers={"x-api-key": key},
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(verify, timeout=timeout) as response:
-            read_limited(response)
-            return False
-    except urllib.error.HTTPError as exc:
-        read_limited(exc)
-        return int(exc.code or 0) == 404
-    except Exception:
-        return False
-
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Audit every Sub2API Grok account")
+    parser = argparse.ArgumentParser(description="Read-only audit of every Sub2API Grok account")
     parser.add_argument("--base-url", default="http://127.0.0.1:13080")
     parser.add_argument("--admin-key-file", required=True)
     parser.add_argument("--postgres-container", default="sub2api-prod-postgres")
@@ -180,8 +145,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--timeout", type=float, default=90)
     parser.add_argument("--output", required=True)
-    parser.add_argument("--confirm-delete-invalid", action="store_true")
-    parser.add_argument("--backup-file")
     return parser.parse_args()
 
 
@@ -193,10 +156,6 @@ def main() -> int:
         raise RuntimeError("Sub2API admin key file is empty")
     if os.name != "nt" and key_path.stat().st_mode & 0o077:
         raise RuntimeError("Sub2API admin key file must not be group/world accessible")
-    if args.confirm_delete_invalid:
-        backup = Path(args.backup_file or "").expanduser().resolve()
-        if not backup.is_file() or backup.stat().st_size < 1024:
-            raise RuntimeError("deletion requires a non-empty --backup-file restore point")
     accounts = psql_rows(args.postgres_container, args.pg_user, args.pg_db)
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as executor:
@@ -208,22 +167,6 @@ def main() -> int:
             results.append(future.result())
     results.sort(key=lambda item: item["id"])
 
-    deleted: list[int] = []
-    delete_failed: list[int] = []
-    if args.confirm_delete_invalid:
-        by_id = {int(account["id"]): account for account in accounts}
-        for item in results:
-            if item["category"] not in {"token_invalid", "permission_denied"}:
-                continue
-            confirmation = account_test(args.base_url, key, by_id[item["id"]], args.timeout)
-            if confirmation["category"] != item["category"]:
-                item["delete_skipped"] = "confirmation_mismatch"
-                continue
-            if delete_account(args.base_url, key, item["id"], args.timeout):
-                deleted.append(item["id"])
-            else:
-                delete_failed.append(item["id"])
-
     counts: dict[str, int] = {}
     for item in results:
         counts[item["category"]] = counts.get(item["category"], 0) + 1
@@ -231,8 +174,6 @@ def main() -> int:
         "generated_at": int(time.time()),
         "tested": len(results),
         "counts": counts,
-        "deleted_ids": deleted,
-        "delete_failed_ids": delete_failed,
         "results": results,
     }
     output = Path(args.output).expanduser().resolve()
@@ -241,8 +182,8 @@ def main() -> int:
     temp.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(temp, 0o600)
     os.replace(temp, output)
-    print(json.dumps({"tested": len(results), "counts": counts, "deleted": len(deleted), "delete_failed": len(delete_failed)}))
-    return 1 if delete_failed else 0
+    print(json.dumps({"tested": len(results), "counts": counts}))
+    return 0
 
 
 if __name__ == "__main__":

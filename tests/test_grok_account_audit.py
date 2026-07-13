@@ -34,36 +34,8 @@ def test_classify_only_permanent_failures_as_invalid():
     assert MODULE.classify(502, 'bad gateway')[0] == "transient_error"
 
 
-def test_delete_mode_requires_backup_and_confirmation():
+def test_audit_script_has_no_delete_mode():
     source = SCRIPT.read_text(encoding="utf-8")
-    assert "confirm-delete-invalid" in source
-    assert "--backup-file" in source
-    assert "confirmation_mismatch" in source
-    assert 'method="DELETE"' in source
-
-
-def test_delete_account_requires_404_recheck(monkeypatch):
-    methods = []
-
-    def open_request(request, timeout):
-        methods.append(request.get_method())
-        if request.get_method() == "GET":
-            raise urllib.error.HTTPError(request.full_url, 404, "not found", {}, None)
-
-        class Response:
-            status = 204
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-            def read(self, limit):
-                return b""
-
-        return Response()
-
-    monkeypatch.setattr(MODULE.urllib.request, "urlopen", open_request)
-    assert MODULE.delete_account("http://sub2api", "secret", 123, 1) is True
-    assert methods == ["DELETE", "GET"]
+    assert "confirm-delete-invalid" not in source
+    assert "--backup-file" not in source
+    assert 'method="DELETE"' not in source
