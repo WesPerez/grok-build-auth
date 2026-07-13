@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -80,6 +81,82 @@ def parse_summary(log_path: Path) -> dict[str, Any] | None:
     return summary
 
 
+def successful_account_ids(route_dir: Path) -> set[int]:
+    account_ids: set[int] = set()
+    success_path = route_dir / "successes.jsonl"
+    if success_path.is_file():
+        with success_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    record = json.loads(line)
+                    account_id = int(record.get("account_id"))
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                if record.get("action") == "created" and record.get("probe") == "passed":
+                    account_ids.add(account_id)
+    checkpoint_path = route_dir / "cpa_reprobe_checkpoint.json"
+    if checkpoint_path.is_file():
+        try:
+            checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            checkpoint = {}
+        if isinstance(checkpoint, dict):
+            for record in checkpoint.values():
+                if not isinstance(record, dict) or record.get("pushed") is not True:
+                    continue
+                if record.get("action") != "created" or record.get("probe") != "passed":
+                    continue
+                try:
+                    account_ids.add(int(record.get("account_id")))
+                except (ValueError, TypeError):
+                    continue
+    return account_ids
+
+
+def reprobe_routes(
+    *,
+    python: Path,
+    reprobe_script: Path,
+    project: Path,
+    env: dict[str, str],
+    routes: list[dict[str, Any]],
+) -> None:
+    jobs: list[tuple[subprocess.Popen[bytes], Any]] = []
+    for route in routes:
+        route_dir = Path(route["route_dir"])
+        if not any((route_dir / "cpa_pending").glob("xai-*.json")):
+            continue
+        log_path = route_dir / "reprobe.log"
+        log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.chmod(log_path, 0o600)
+        log_handle = os.fdopen(log_fd, "ab", buffering=0)
+        process = subprocess.Popen(
+            [
+                str(python),
+                "-u",
+                str(reprobe_script),
+                "--config",
+                route["config_path"],
+                "--workers",
+                "1",
+                "--attempts",
+                "1",
+                "--retry-delay",
+                "0",
+            ],
+            cwd=project,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        jobs.append((process, log_handle))
+    for process, log_handle in jobs:
+        process.wait()
+        log_handle.close()
+
+
 def build_config(
     *,
     client_root: Path,
@@ -109,6 +186,7 @@ def build_config(
         "target_successes": target,
         "accounts_output_dir": str(route_dir),
         "mail_credentials_file": str(route_dir / "mail_credentials.txt"),
+        "success_records_file": str(route_dir / "successes.jsonl"),
         "enable_nsfw": False,
         "hide_window": True,
         "block_media_fonts": False,
@@ -148,6 +226,7 @@ def main() -> int:
     parser.add_argument("--attempts-per-route", type=int, default=200)
     parser.add_argument("--proxy-ref", action="append", dest="proxy_refs")
     parser.add_argument("--run-id")
+    parser.add_argument("--reprobe-interval", type=int, default=300)
     args = parser.parse_args()
 
     project = Path(args.project_dir).resolve()
@@ -193,6 +272,7 @@ def main() -> int:
     python = project / "clients" / "windows" / ".venv" / "bin" / "python3"
     client = project / "clients" / "windows" / "grok_register_ttk.py"
     preflight = project / "scripts" / "windows_client_preflight.py"
+    reprobe_script = project / "clients" / "windows" / "cpa_reprobe.py"
     env = os.environ.copy()
     env["DISPLAY"] = env.get("DISPLAY") or ":99"
 
@@ -275,16 +355,42 @@ def main() -> int:
     manifest["routes"] = route_specs
     write_private_json(manifest_path, manifest)
 
+    next_reprobe = time.monotonic() + max(30, args.reprobe_interval)
     while any(process.poll() is None for process, _handle, _route in processes):
+        for process, _handle, route in processes:
+            account_ids = successful_account_ids(Path(route["route_dir"]))
+            route["successful_account_ids"] = sorted(account_ids)
+            if len(account_ids) >= int(route["target"]) and process.poll() is None:
+                route["target_reached_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+                process.send_signal(signal.SIGINT)
+        if time.monotonic() >= next_reprobe:
+            reprobe_routes(
+                python=python,
+                reprobe_script=reprobe_script,
+                project=project,
+                env=env,
+                routes=route_specs,
+            )
+            next_reprobe = time.monotonic() + max(30, args.reprobe_interval)
         time.sleep(5)
+
+    reprobe_routes(
+        python=python,
+        reprobe_script=reprobe_script,
+        project=project,
+        env=env,
+        routes=route_specs,
+    )
 
     all_passed = True
     for process, log_handle, route in processes:
         log_handle.close()
         route["exit_code"] = process.returncode
         route["summary"] = parse_summary(Path(route["log_path"]))
-        route["status"] = "passed" if process.returncode == 0 else "failed"
-        if process.returncode != 0:
+        account_ids = successful_account_ids(Path(route["route_dir"]))
+        route["successful_account_ids"] = sorted(account_ids)
+        route["status"] = "passed" if len(account_ids) >= int(route["target"]) else "failed"
+        if route["status"] != "passed":
             all_passed = False
 
     manifest["status"] = "completed" if all_passed else "failed"

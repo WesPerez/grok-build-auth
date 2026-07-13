@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "target_successes": 0,
     "accounts_output_dir": "",
     "mail_credentials_file": "",
+    "success_records_file": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # ===== Sub2API auth 导出 / 免费 Grok 4.5（OIDC，非 Web SSO）=====
     # 注册成功后走设备码 OIDC 铸造 token，写出 Sub2API 的 xai-<email>.json，并可
@@ -3072,6 +3073,8 @@ class SharedState:
         self.mail_cred_file = configured_mail_file or os.path.join(
             os.path.dirname(__file__), "mail_credentials.txt"
         )
+        configured_success_file = str(config.get("success_records_file") or "").strip()
+        self.success_records_file = configured_success_file
         self._issued = 0  # 已发放的名额数（总共发放 count 个）
         self.success_count = 0
         self.fail_count = 0
@@ -3136,6 +3139,19 @@ class SharedState:
                     f.write(f"{email}\t{dev_token}\n")
             except Exception:
                 pass
+
+    def save_success_record(self, record):
+        if not self.success_records_file:
+            return
+        with self._io_lock:
+            fd = os.open(
+                self.success_records_file,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
+            )
+            os.chmod(self.success_records_file, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def register_one(session, shared, worker_id, slot_no):
@@ -3231,17 +3247,22 @@ def register_one(session, shared, worker_id, slot_no):
         raise RuntimeError(f"OAuth/Sub2API auth 导出失败: {export_result.get('error') or export_result}")
     if config.get("cpa_push_enabled", False) and not export_result.get("pushed"):
         raise RuntimeError(f"Sub2API auth 推送失败: {export_result.get('push_error') or export_result}")
+    response = export_result.get("push_response") or {}
     if config.get("cpa_require_probe_passed", False):
-        response = export_result.get("push_response") or {}
         if response.get("probe") != "passed":
             raise RuntimeError(f"bridge 未确认 probe=passed: {response or export_result}")
     if config.get("cpa_require_created", False):
-        response = export_result.get("push_response") or {}
         if response.get("action") != "created":
             raise RuntimeError(
                 f"bridge action 不是 created，不能计为新增账号: {response or export_result}"
             )
-    return email
+    return {
+        "email": email,
+        "account_id": response.get("account_id"),
+        "action": response.get("action"),
+        "probe": response.get("probe"),
+        "recorded_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
 
 
 def register_worker(worker_id, shared):
@@ -3268,9 +3289,10 @@ def register_worker(worker_id, shared):
             retry_count_for_slot = 0
             while True:
                 try:
-                    email = register_one(session, shared, worker_id, slot_no)
+                    success = register_one(session, shared, worker_id, slot_no)
+                    shared.save_success_record(success)
                     total = shared.record_success()
-                    log(f"[+] 注册成功: {email}（累计成功 {total}）")
+                    log(f"[+] 注册成功: {success['email']}（累计成功 {total}）")
                     break
                 except RegistrationCancelled:
                     raise

@@ -15,6 +15,7 @@
   "target_successes": 0,
   "accounts_output_dir": "",
   "mail_credentials_file": "",
+  "success_records_file": "",
   "enable_nsfw": false,
   "hide_window": true,
   "block_media_fonts": false,

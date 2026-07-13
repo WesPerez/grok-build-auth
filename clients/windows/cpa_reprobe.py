@@ -29,6 +29,20 @@ def _push_error_code(body: str) -> str:
     return str(payload.get("error_code") or "") if isinstance(payload, dict) else ""
 
 
+def _bridge_metadata(body: str) -> dict[str, Any]:
+    try:
+        payload = json.loads(body or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    return {
+        "action": payload.get("action"),
+        "account_id": payload.get("account_id"),
+        "probe": payload.get("probe"),
+    }
+
+
 def run(args: argparse.Namespace) -> dict[str, int]:
     root = Path(args.root).resolve()
     checkpoint_path = Path(args.checkpoint or root / "cpa_reprobe_checkpoint.json")
@@ -143,16 +157,22 @@ def run(args: argparse.Namespace) -> dict[str, int]:
                 result["passed"] = 1
                 pushed: bool | None = None
                 terminal_error = ""
+                bridge_meta: dict[str, Any] = {}
                 if args.remote_base and args.remote_secret:
                     ok, status, response_body = cpa.push_auth_file(
                         remote_base=args.remote_base, secret=args.remote_secret,
                         filename=promoted.name, payload=payload, proxy=args.push_proxy or None,
                         verify_tls=not args.insecure, timeout=args.push_timeout,
                     )
+                    bridge_meta = _bridge_metadata(response_body)
+                    if ok and bool(getattr(args, "require_created", False)):
+                        if bridge_meta.get("action") != "created":
+                            ok = False
+                            terminal_error = "BRIDGE_ACTION_NOT_CREATED"
                     pushed = bool(ok)
                     result["pushed" if ok else "push_failed"] = 1
                     probe["push_status"] = status
-                    terminal_error = _push_error_code(response_body)
+                    terminal_error = terminal_error or _push_error_code(response_body)
                     if terminal_error == "STALE_AUTH":
                         result["stale_rejected"] = 1
                 else:
@@ -164,6 +184,7 @@ def run(args: argparse.Namespace) -> dict[str, int]:
                     "decision": decision,
                     "pushed": pushed,
                     "terminal_error": terminal_error or None,
+                    **bridge_meta,
                 })
             elif decision == "cooldown":
                 pushed = False
@@ -284,6 +305,7 @@ def main() -> int:
     parser.add_argument("--retry-delay", type=float, default=2, help="seconds between retryable probe attempts")
     parser.add_argument("--include-verified", action="store_true", help="retry unconfirmed pushes from cpa_auths")
     parser.add_argument("--push-cooldown", action="store_true", help="push authenticated 402/429 accounts; bridge must accept usable_exhausted")
+    parser.add_argument("--require-created", action="store_true", default=None)
     parser.add_argument("--proxy")
     parser.add_argument("--timeout", type=float)
     parser.add_argument("--remote-base")
@@ -316,6 +338,8 @@ def main() -> int:
         args.push_timeout = float(config.get("cpa_push_timeout_sec", 240) or 240)
     if args.insecure is None:
         args.insecure = not bool(config.get("cpa_remote_verify_tls", True))
+    if args.require_created is None:
+        args.require_created = bool(config.get("cpa_require_created", False))
     print(json.dumps(run(args), ensure_ascii=False))
     return 0
 

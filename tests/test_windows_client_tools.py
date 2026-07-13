@@ -261,6 +261,27 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     assert config["max_concurrency"] == 1
     assert config["cpa_require_created"] is True
     assert config["cpa_auth_dir"] == str(tmp_path / "cpa_auths")
+    assert config["success_records_file"] == str(tmp_path / "successes.jsonl")
+
+
+def test_linux_client_runner_counts_only_created_and_probed_ids(tmp_path):
+    runner = load_module(
+        "linux_client_full_success_count_test",
+        SCRIPTS / "run_linux_client_full.py",
+    )
+    (tmp_path / "successes.jsonl").write_text(
+        "\n".join([
+            json.dumps({"account_id": 11, "action": "created", "probe": "passed"}),
+            json.dumps({"account_id": 12, "action": "updated", "probe": "passed"}),
+            json.dumps({"account_id": 13, "action": "created", "probe": "failed"}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "cpa_reprobe_checkpoint.json").write_text(json.dumps({
+        "pending-a": {"account_id": 14, "action": "created", "probe": "passed", "pushed": True},
+        "pending-b": {"account_id": 15, "action": "created", "probe": "passed", "pushed": False},
+    }), encoding="utf-8")
+    assert runner.successful_account_ids(tmp_path) == {11, 14}
 
 
 def test_cpa_reprobe_loads_sensitive_values_from_config(tmp_path, monkeypatch, capsys):
@@ -276,6 +297,7 @@ def test_cpa_reprobe_loads_sensitive_values_from_config(tmp_path, monkeypatch, c
             "cpa_push_proxy": "",
             "cpa_push_timeout_sec": 960,
             "cpa_remote_verify_tls": True,
+            "cpa_require_created": True,
         }), encoding="utf-8")
         captured = {}
         monkeypatch.setattr(reprobe, "run", lambda args: captured.update(vars(args)) or {"scanned": 0})
@@ -284,6 +306,7 @@ def test_cpa_reprobe_loads_sensitive_values_from_config(tmp_path, monkeypatch, c
         assert captured["root"] == str(tmp_path / "route")
         assert captured["remote_secret"] == "secret"
         assert captured["push_timeout"] == 960
+        assert captured["require_created"] is True
         assert json.loads(capsys.readouterr().out)["scanned"] == 0
     finally:
         if str(CLIENT) in sys.path:
