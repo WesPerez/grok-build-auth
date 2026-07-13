@@ -237,6 +237,7 @@ def test_windows_client_supports_isolated_noninteractive_routes():
     assert 'parser.add_argument("--non-interactive"' in source
     assert 'parser.add_argument("--target-successes"' in source
     assert 'config.get("cpa_require_created", False)' in source
+    assert 'config.get("hide_window", False) and not is_linux' in source
 
 
 def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
@@ -259,6 +260,7 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     assert config["target_successes"] == 3
     assert config["client_root"] == str(CLIENT)
     assert config["max_concurrency"] == 1
+    assert config["hide_window"] is False
     assert config["cpa_require_created"] is True
     assert config["cpa_auth_dir"] == str(tmp_path / "cpa_auths")
     assert config["success_records_file"] == str(tmp_path / "successes.jsonl")

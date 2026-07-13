@@ -439,7 +439,8 @@ def create_browser_options():
     options = ChromiumOptions()
     # Linux: 使用 Microsoft Edge 替代 Chrome
     import platform
-    if platform.system() == "Linux":
+    is_linux = platform.system() == "Linux"
+    if is_linux:
         edge_paths = ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"]
         for p in edge_paths:
             import os as _os
@@ -477,8 +478,8 @@ def create_browser_options():
     proxy = config.get("proxy", "")
     if proxy:
         options.set_argument(f"--proxy-server={proxy}")
-    # 隐藏任务浏览器（默认开）：移出屏幕、最小化，并在启动后调用 SW_HIDE。
-    if config.get("hide_window", False):
+    # Windows 隐藏任务浏览器；Linux/Xvfb 本身不可见，最小化会改变页面可见性。
+    if config.get("hide_window", False) and not is_linux:
         options.set_argument("--window-position=-32000,-32000")
         options.set_argument("--start-minimized")
     # 加载 turnstilePatch 扩展（伪造自动化鼠标事件指纹，帮过 Turnstile）

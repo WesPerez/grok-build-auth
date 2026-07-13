@@ -188,7 +188,7 @@ def build_config(
         "mail_credentials_file": str(route_dir / "mail_credentials.txt"),
         "success_records_file": str(route_dir / "successes.jsonl"),
         "enable_nsfw": False,
-        "hide_window": True,
+        "hide_window": False,
         "block_media_fonts": False,
         "stealth_patch": False,
         "cpa_export_enabled": True,
