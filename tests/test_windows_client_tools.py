@@ -264,6 +264,7 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
         target=3,
     )
     assert config["target_successes"] == 3
+    assert config["stealth_patch"] is True
     assert config["client_root"] == str(CLIENT)
     assert config["max_concurrency"] == 1
     assert config["hide_window"] is False
