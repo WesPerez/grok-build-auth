@@ -1,6 +1,6 @@
-# GROKAUTH
+# grok-build-auth
 
-GROKAUTH 用纯 HTTP 或受控浏览器流程完成：
+`grok-build-auth` 用纯 HTTP 或受控浏览器流程完成：
 
 ```text
 x.ai 注册 -> SSO -> Grok Build OAuth -> auth JSON
@@ -16,7 +16,7 @@ x.ai 注册 -> SSO -> Grok Build OAuth -> auth JSON
 - 本页：理解项目、完成本地单账号运行。
 - [完整操作手册](OPERATIONS.zh-CN.md)：服务器批次、外部客户端、bridge、代理池、Sub2API、429 轮询、恢复和回滚。
 
-生产环境优先使用服务器编排器。只有必须使用外部机器的浏览器或出口时，才使用外部客户端 + bridge。
+服务器协议注册与外部 Windows 客户端是并列入口。日常批量通常使用外部客户端 + bridge；只有明确选择服务器协议注册时才运行服务器编排器。服务器不运行 Windows 客户端注册程序。
 
 | 目标 | 入口 | 最终成功标准 |
 |---|---|---|
@@ -30,7 +30,7 @@ Web 注册成功、拿到 SSO、写出本地账号文本，都不等于账号已
 
 - 邮箱验证码、Turnstile 和 x.ai 注册协议。
 - 注册会话 SSO 提取。
-- Grok Build OAuth PKCE，导出 CLIProxyAPI/xAI 兼容 auth JSON。
+- Grok Build OAuth PKCE，导出 Sub2API auth JSON；字段结构保持 CLIProxyAPI/xAI compatible schema。
 - `protocol-yescaptcha` 有界并发注册。
 - `browser-playwright-edge` 单路浏览器 canary。
 - Mailu/IMAP 邮箱创建、批次产物和失败恢复。
@@ -62,7 +62,7 @@ chmod 600 .env
 | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_D1_DB_ID`、`ALIAS_MAIL_DOMAINS` | `-e cloudflare` | 自有 Cloudflare D1 别名邮箱 |
 | `IMAP_SERVER`、`IMAP_USERNAME`、`IMAP_PASSWORD`、`IMAP_EMAIL` | `-e imap` | 自有 IMAP 邮箱 |
 | `HTTPS_PROXY`、`HTTP_PROXY` | 可选 | 本次注册和 OAuth 使用的代理 |
-| `CLIPROXYAPI_AUTH_DIR` | 可选 | auth 输出目录 |
+| `CLIPROXYAPI_AUTH_DIR` | 可选 | Sub2API auth 输出目录；变量名为历史 CLIProxyAPI 兼容键 |
 
 运行：
 
@@ -100,7 +100,7 @@ python3 scripts/register_and_import.py \
 或启动只监听本机回环地址的 Web 控制台：
 
 ```bash
-bash start_web_console.sh --host 127.0.0.1 --port 17860
+bash start_web_console.sh --host 127.0.0.1 --port <console-port>
 ```
 
 ## auth 文件
@@ -122,7 +122,7 @@ bash start_web_console.sh --host 127.0.0.1 --port 17860
 }
 ```
 
-OAuth access token 的实测生命周期约为 `21600` 秒，即 6 小时；refresh token 用于续期。它与免费额度恢复窗口是两件事。
+OAuth access token 的实测生命周期约为 `21600` 秒，即 6 小时；refresh token 用于续期，不会因为闲置 6 小时而按同一周期自然过期。Sub2API 接管后应作为唯一 refresh owner；本地 auth JSON 是交接快照，不应定时刷新或反复回灌。它与免费额度恢复窗口是两件事。
 
 ## 辅助命令
 

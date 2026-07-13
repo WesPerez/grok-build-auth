@@ -1,4 +1,4 @@
-"""CPA (CLIProxyAPI) xai auth 组装 / 写盘 / 推送远端。"""
+"""Sub2API xAI auth 组装、写盘与 bridge 推送（保留 cpa 兼容接口）。"""
 
 from .client import CpaPushError, push_auth_file
 from .preprobe import probe_auth, try_refresh_access_token
@@ -14,6 +14,15 @@ from .schema import (
     expired_from_access_token,
 )
 from .writer import write_cpa_xai_auth
+from .state import (
+    delete_if_fingerprint,
+    fingerprint,
+    identity,
+    operation_lock,
+    push_fingerprint,
+    replace_if_fingerprint,
+    transition,
+)
 
 __all__ = [
     "API_BASE_URL",
@@ -30,4 +39,11 @@ __all__ = [
     "push_auth_file",
     "try_refresh_access_token",
     "write_cpa_xai_auth",
+    "transition",
+    "fingerprint",
+    "identity",
+    "operation_lock",
+    "push_fingerprint",
+    "replace_if_fingerprint",
+    "delete_if_fingerprint",
 ]

@@ -26,7 +26,7 @@ def bridge_health_url(config: dict[str, object]) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Validate the GROKAUTH Windows client without registering")
+    parser = argparse.ArgumentParser(description="Validate the grok-build-auth Windows client without registering")
     parser.add_argument("--config", required=True)
     parser.add_argument("--cdp", default="127.0.0.1:9222")
     parser.add_argument("--skip-cdp", action="store_true")

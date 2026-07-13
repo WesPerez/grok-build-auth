@@ -212,9 +212,15 @@ def test_client_preprobe_decisions(monkeypatch):
 
         sess = FakeSession()
         monkeypatch.setattr(preprobe.requests, "Session", lambda: sess)
+        monkeypatch.setattr(preprobe.secrets, "token_hex", lambda n: "fixed")
 
-        sess._response = FakeResp(200, {"status": "completed", "output_text": "CLIENT_PROBE_OK"})
+        sess._response = FakeResp(200, {"status": "completed", "output_text": "CLIENT_PROBE_OK_fixed"})
         assert preprobe.probe_auth(auth)["decision"] == "pass"
+
+        sess._response = FakeResp(200, {
+            "status": "completed", "input": "Reply exactly: CLIENT_PROBE_OK_fixed", "output": []
+        })
+        assert preprobe.probe_auth(auth)["code"] == "INCOMPLETE_RESPONSE"
 
         sess._response = FakeResp(200, {"status": "in_progress", "output_text": "nope"})
         assert preprobe.probe_auth(auth)["code"] == "INCOMPLETE_RESPONSE"
@@ -230,7 +236,32 @@ def test_client_preprobe_decisions(monkeypatch):
         sess._response = FakeResp(401, text="invalid_grant refresh revoked")
         assert preprobe.probe_auth(auth)["decision"] == "refresh"
 
+        sess._response = FakeResp(401, text="invalid_client")
+        assert preprobe._refresh_with_requests(auth, timeout=1)["code"] == "REFRESH_FAILED"
+
         assert preprobe.probe_auth({"access_token": "x"})["decision"] == "reject"
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_cpa_export_required_preprobe_cannot_be_disabled(tmp_path, monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        cpa_export = load_module("windows_cpa_export_required_test", CLIENT / "cpa_export.py")
+        import oidc_mint
+        monkeypatch.setattr(oidc_mint, "mint_with_browser", lambda **kwargs: {
+            "access_token": "token", "refresh_token": "refresh"
+        })
+        monkeypatch.setattr(oidc_mint, "resolve_proxy", lambda value: value)
+        monkeypatch.setattr(oidc_mint, "set_runtime_proxy", lambda value: None)
+        with pytest.raises(ValueError, match="forbids disabling"):
+            cpa_export.export_cpa_for_account(
+                "required@example.com", "password", page=object(),
+                config={"cpa_auth_dir": str(tmp_path / "cpa_auths"),
+                        "cpa_preprobe_required": True, "cpa_preprobe_enabled": False},
+                log_callback=lambda message: None,
+            )
     finally:
         if str(CLIENT) in sys.path:
             sys.path.remove(str(CLIENT))

@@ -15,14 +15,14 @@ Decision codes (stable, safe to log — never include tokens or full bodies):
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
+import secrets
+from datetime import datetime, timezone
 from typing import Any
 
 import requests
 
 URL = "https://cli-chat-proxy.grok.com/v1/responses"
-MARKER = "CLIENT_PROBE_OK"
+MARKER_PREFIX = "CLIENT_PROBE_OK_"
 
 # Full CLI header set used by production quota probe / real Grok CLI.
 # Missing X-XAI-Token-Auth / x-grok-client-identifier can create false negatives.
@@ -37,7 +37,7 @@ HEADERS = {
 
 
 def probe_auth(auth: dict[str, Any], *, proxy: str = "", timeout: float = 45) -> dict[str, Any]:
-    """Probe one CPA-shaped auth payload against Grok CLI /responses.
+    """Probe one Sub2API auth payload against Grok CLI /responses.
 
     Returns a dict with at least:
       decision: pass|reject|retry|cooldown|refresh
@@ -54,13 +54,14 @@ def probe_auth(auth: dict[str, Any], *, proxy: str = "", timeout: float = 45) ->
     session.trust_env = False
     proxies = {"http": proxy, "https": proxy} if proxy else None
 
+    marker = MARKER_PREFIX + secrets.token_hex(16)
     try:
         response = session.post(
             URL,
             headers={**HEADERS, "Authorization": f"Bearer {token}"},
             json={
                 "model": "grok-4.5",
-                "input": f"Reply exactly: {MARKER}",
+                "input": f"Reply exactly: {marker}",
                 "max_output_tokens": 16,
                 "store": False,
                 "stream": False,
@@ -87,8 +88,8 @@ def probe_auth(auth: dict[str, Any], *, proxy: str = "", timeout: float = 45) ->
             data = response.json()
         except ValueError:
             return {"decision": "retry", "code": "INVALID_RESPONSE", "status": status}
-        encoded = json.dumps(data, ensure_ascii=False)
-        if data.get("status") == "completed" and MARKER in encoded:
+        texts = _assistant_output_texts(data)
+        if data.get("status") == "completed" and any(text.strip() == marker for text in texts):
             return {"decision": "pass", "code": "PROBE_PASSED", "status": status}
         return {"decision": "retry", "code": "INCOMPLETE_RESPONSE", "status": status}
 
@@ -115,6 +116,27 @@ def probe_auth(auth: dict[str, Any], *, proxy: str = "", timeout: float = 45) ->
     return {"decision": "retry", "code": "UPSTREAM_ERROR", "status": status}
 
 
+def _assistant_output_texts(data: Any) -> list[str]:
+    """Extract only assistant message output_text; never inspect echoed input."""
+    if not isinstance(data, dict):
+        return []
+    out: list[str] = []
+    # Some compatible endpoints expose a top-level convenience field.
+    if isinstance(data.get("output_text"), str):
+        out.append(data["output_text"])
+    for item in data.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") != "message":
+            continue
+        if str(item.get("role") or "assistant") != "assistant":
+            continue
+        for content in item.get("content") or []:
+            if isinstance(content, dict) and content.get("type") == "output_text":
+                text = content.get("text")
+                if isinstance(text, str):
+                    out.append(text)
+    return out
+
+
 def try_refresh_access_token(
     auth: dict[str, Any],
     *,
@@ -129,32 +151,10 @@ def try_refresh_access_token(
     if not refresh:
         return {"ok": False, "code": "MALFORMED_AUTH", "status": 0}
 
-    try:
-        import sys
-        root = Path(__file__).resolve().parents[3]
-        if str(root) not in sys.path:
-            sys.path.insert(0, str(root))
-        from xconsole_client.xai_oauth import refresh_access_token  # type: ignore
-    except Exception:
-        return _refresh_with_requests(auth, proxy=proxy, timeout=timeout)
-
-    try:
-        token = refresh_access_token(refresh, proxy=proxy or None, timeout=timeout)
-        if not isinstance(token, dict) or not token.get("access_token"):
-            return {"ok": False, "code": "TOKEN_INVALID", "status": 0}
-        new_auth = dict(auth)
-        new_auth["access_token"] = token["access_token"]
-        if token.get("refresh_token"):
-            new_auth["refresh_token"] = token["refresh_token"]
-        if token.get("id_token"):
-            new_auth["id_token"] = token["id_token"]
-        if token.get("expires_in") is not None:
-            new_auth["expires_in"] = token.get("expires_in")
-        return {"ok": True, "auth": new_auth, "code": "REFRESHED", "status": 200}
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc).lower()
-        code = "TOKEN_INVALID" if ("revok" in msg or "invalid_grant" in msg) else "REFRESH_FAILED"
-        return {"ok": False, "code": code, "status": 0, "error_type": type(exc).__name__}
+    # Use the local structured exchange so invalid_grant/revoked is preserved.
+    # The shared helper intentionally hides response bodies and cannot safely
+    # distinguish a revoked token from a transient HTTP failure.
+    return _refresh_with_requests(auth, proxy=proxy, timeout=timeout)
 
 
 def _refresh_with_requests(
@@ -164,7 +164,8 @@ def _refresh_with_requests(
     timeout: float = 30,
 ) -> dict[str, Any]:
     refresh = str(auth.get("refresh_token") or "").strip()
-    client_id = str(auth.get("client_id") or "app").strip() or "app"
+    from .schema import CLIENT_ID
+    client_id = str(auth.get("client_id") or CLIENT_ID).strip() or CLIENT_ID
     session = requests.Session()
     session.trust_env = False
     proxies = {"http": proxy, "https": proxy} if proxy else None
@@ -192,8 +193,7 @@ def _refresh_with_requests(
     low = body.lower()
     if resp.status_code != 200:
         code = "TOKEN_INVALID" if (
-            resp.status_code == 401
-            or "revok" in low
+            "revok" in low
             or "invalid_grant" in low
         ) else "REFRESH_FAILED"
         return {"ok": False, "code": code, "status": resp.status_code}
@@ -204,12 +204,20 @@ def _refresh_with_requests(
     access = str(token.get("access_token") or "").strip()
     if not access:
         return {"ok": False, "code": "TOKEN_INVALID", "status": resp.status_code}
-    new_auth = dict(auth)
-    new_auth["access_token"] = access
-    if token.get("refresh_token"):
-        new_auth["refresh_token"] = token["refresh_token"]
-    if token.get("id_token"):
-        new_auth["id_token"] = token["id_token"]
-    if token.get("expires_in") is not None:
-        new_auth["expires_in"] = token.get("expires_in")
+    new_auth = _rebuild_refreshed_auth(auth, token)
     return {"ok": True, "auth": new_auth, "code": "REFRESHED", "status": resp.status_code}
+
+
+def _rebuild_refreshed_auth(auth: dict[str, Any], token: dict[str, Any]) -> dict[str, Any]:
+    from .schema import build_cpa_xai_auth
+    return build_cpa_xai_auth(
+        email=str(auth.get("email") or ""),
+        access_token=str(token["access_token"]),
+        refresh_token=str(token.get("refresh_token") or auth.get("refresh_token") or ""),
+        id_token=str(token.get("id_token") or auth.get("id_token") or "") or None,
+        expires_in=int(token["expires_in"]) if token.get("expires_in") is not None else None,
+        base_url=str(auth.get("base_url") or ""),
+        token_endpoint=str(auth.get("token_endpoint") or "https://auth.x.ai/oauth2/token"),
+        redirect_uri=str(auth.get("redirect_uri") or "http://127.0.0.1:56121/callback"),
+        last_refresh=datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )

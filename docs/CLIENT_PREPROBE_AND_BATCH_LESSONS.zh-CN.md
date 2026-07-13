@@ -2,7 +2,7 @@
 
 ## 背景
 
-本会话目标：Windows 客户端注册 Grok 账号 → 铸造 CPA auth → 推送 hardened bridge / Sub2API。
+本会话目标：Windows 客户端注册 Grok 账号 → 铸造 Sub2API auth → 推送 hardened bridge / Sub2API。auth 字段结构保持 CLIProxyAPI-compatible schema。
 服务器 agent 指出：真正的可用性门禁是 **Grok CLI `/v1/responses`**，不是 `/v1/models`；
 客户端应把第一层 probe 前移，避免把大量不可用账号打到 bridge。
 
@@ -42,7 +42,7 @@ HTTP 200 + status=completed + 响应 JSON 含标记文本
 1. 仅 API `set_tos_accepted` 不够。
 2. 必须浏览器 `browser_activate_chat_permission`：写 SSO cookie → 点同意 → **URL 离开 tos-gate**。
 3. 点击评分必须避开 “Acceptable Use Policy” 链接误点。
-4. 注册成功判定：`export_cpa` 成功；若开启 push，还要求 bridge `probe=passed`。
+4. 注册成功判定：兼容入口 `export_cpa` 成功；若开启 push，还要求 bridge `probe=passed`。
 
 即使浏览器已离 gate，chat 资格仍可能延迟；因此 preprobe 的 `PERMISSION_DENIED` 应进 **pending** 复测，不能当废号立刻删除。
 
@@ -55,7 +55,7 @@ HTTP 200 + status=completed + 响应 JSON 含标记文本
 | 进度卡死 | watcher/waiter 空转 | 任务 PID 归属清晰，只杀本任务进程 |
 | `/models` 批量 verify | 假阳性高 | 用 `/responses` preprobe |
 | 422 读作废号 | 误删可恢复账号 | PERMISSION_DENIED→pending；429→cooldown；revoked 才删 |
-| 管理口代理 | 走 mint 代理导致怪错 | push 默认直连（`cpa_push_proxy=""`） |
+| 管理口代理 | 走 mint 代理导致怪错 | Sub2API auth push 默认直连（兼容键 `cpa_push_proxy=""`） |
 | 并发 Chrome | 15 路约 150 Chrome | 批后清理本任务自动化浏览器；不杀用户浏览器 |
 | 配置误删 | 清历史时差点删 config | **config.json 必须保留**；只清本任务产物 |
 
@@ -68,6 +68,10 @@ HTTP 200 + status=completed + 响应 JSON 含标记文本
 | retry | PERMISSION_DENIED / NETWORK / 5xx | `cpa_pending/` | 否 | 批后 15 分钟内复测 |
 | cooldown | RATE_LIMITED (402/429) | `cpa_cooldown/` | 否 | 等额度窗口，非废号 |
 | refresh | TOKEN_INVALID | 先 refresh 一次；仍失败→pending | 否 | 明确 revoked 才删 |
+
+`cpa_auths/`、`cpa_pending/`、`cpa_cooldown/` 和 `cpa_*` 是现有代码兼容名称；面向业务统一称为 Sub2API auth。
+
+`cpa_auths/` 中的文件是交接快照，不是 Sub2API 当前 token 的镜像。Sub2API 接管后可能轮换 refresh token，本地文件不会自动反向同步；没有精确 push-failed checkpoint 时禁止用 `--include-verified` 批量重推。不要新增客户端定时刷新任务与 Sub2API 竞争 refresh token。
 
 **原则**：
 

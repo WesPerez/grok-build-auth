@@ -1,4 +1,4 @@
-# GROKAUTH 完整操作手册
+# grok-build-auth 完整操作手册
 
 本文是服务器注册、外部客户端、bridge、代理池和 Sub2API 的唯一操作手册。示例中的 `<...>` 都必须替换为本机值；密钥只允许保存在权限为 `0600` 的私有配置或 secret manager 中。
 
@@ -17,30 +17,30 @@
 有两条生产路径：
 
 ```text
-服务器路径（推荐）
-GROKAUTH -> Mailu/IMAP -> x.ai 注册 -> OAuth
+服务器协议路径（可选）
+grok-build-auth -> Mailu/IMAP -> x.ai 注册 -> OAuth
          -> 单 auth preprobe -> 备份/导入/收口 -> group postprobe
 
-外部客户端路径
+外部 Windows 客户端路径（常用）
 grok_register_ttk.py -> bridge 邮箱 API -> x.ai 注册 -> OAuth
-                     -> CPA JSON push -> bridge 隔离/探针/入组 -> Sub2API
+                     -> Sub2API auth push -> bridge 探针/导入/入组 -> Sub2API
 ```
 
 | 场景 | 选择 |
 |---|---|
-| 服务器已有 Mailu、YesCaptcha、Sub2API | 服务器路径 |
-| 需要外部 Windows 浏览器或外部网络出口 | 外部客户端路径 |
+| 明确选择纯协议、服务器邮箱和服务器代理池 | 服务器协议路径 |
+| 日常批量，或需要 Windows 浏览器/外部网络出口 | 外部客户端路径 |
 | 只研究协议或生成本地 auth | `run.py` 单账号路径 |
 
-服务器编排有更完整的备份、token-hash 幂等、manifest 和双探针，日常生产优先使用它。
+两条路径均受支持，但不在同一台服务器混跑：服务器只运行协议编排器；Windows 客户端在外部机器运行并通过 bridge 推送。只有旧的“先 quarantine 入库、再探针筛选”流程废弃。
 
 ## 2. 组件和信任边界
 
 | 组件 | 当前职责 | 代码位置 |
 |---|---|---|
-| GROKAUTH | 注册、OAuth、批次、探针、导入编排 | 本仓库 |
-| 外部客户端 | 浏览器注册、OAuth、CPA JSON 推送 | `clients/windows/` |
-| bridge | 邮箱兼容 API、CPA 接收、隔离探针和入组 | `bridge/bridge.py` |
+| grok-build-auth | 服务器协议注册、OAuth、批次、探针、导入编排 | 本仓库 |
+| 外部客户端 | 浏览器注册、OAuth、Sub2API auth 推送 | `clients/windows/` |
+| bridge | 邮箱兼容 API、Sub2API auth 接收、探针、导入和入组 | `bridge/bridge.py` |
 | Sub2API | 账号池、分组、轮询、Grok CLI 请求兼容和 OpenAI 兼容 API | 独立仓库/部署 |
 
 Windows 调试现场中的日志、真实 auth、账号密码、代理节点和一次性 patch/test 脚本没有纳入仓库。仓库只保留经过脱敏和收口的正式入口。
@@ -54,10 +54,10 @@ Windows 调试现场中的日志、真实 auth、账号密码、代理节点和�
 - Sub2API 中已有独立 Grok 分组、可用 Grok API Key，并包含原生 Grok CLI 请求兼容。
 - 所有系统时钟正确，否则 JWT、OAuth 和冷却时间会误判。
 
-安装 GROKAUTH：
+安装 `grok-build-auth`：
 
 ```bash
-cd /path/to/grok-build-auth
+cd /root/grok-build-auth
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-lock.txt
@@ -68,7 +68,7 @@ pip install -r requirements-lock.txt
 ### 4.1 初始化私有目录
 
 ```bash
-cd /path/to/grok-build-auth
+cd /root/grok-build-auth
 mkdir -p private
 chmod 700 private
 cp private.example/runtime.env.example private/runtime.env
@@ -189,7 +189,7 @@ GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=true
 
 ```bash
 python3 scripts/check_proxy_pool.py \
-  --private-dir /path/to/grok-build-auth/private \
+  --private-dir /root/grok-build-auth/private \
   --attempts 3 \
   --timeout 10
 ```
@@ -202,10 +202,10 @@ python3 scripts/check_proxy_pool.py \
 
 | 服务 | 配置 | 监听范围 | 用途 |
 |---|---|---|---|
-| `v2ray.service` | `/etc/v2ray/config.json` | 公网 VMess/mKCP UDP 31535；共享 SOCKS 10808/10810 | 其他客户端和服务器日常代理 |
-| `v2ray-grok-pool.service` | `/etc/v2ray/grok_pool.json` | 仅本机 `127.0.0.1:10900-10907` | GROKAUTH 注册、OAuth 和 preprobe 代理池 |
+| `v2ray.service` | 从 `systemctl cat v2ray.service` 发现 | 以主配置实际 inbound 为准 | 其他客户端和服务器日常代理 |
+| `v2ray-grok-pool.service` | 从 `systemctl cat v2ray-grok-pool.service` 发现 | 以专用配置实际 loopback inbound 为准 | grok-build-auth 注册、OAuth 和 preprobe 代理池 |
 
-严禁在 `v2ray.service.d/*.conf` 中把主服务 `ExecStart` 覆盖为 `grok_pool.json`。这会让公网 UDP 31535、10808 和 10810 全部消失，其他客户端立即断线。
+严禁在 `v2ray.service.d/*.conf` 中把主服务 `ExecStart` 覆盖为 Grok 专用代理池配置。这会替换主服务的全部 inbound，其他客户端会立即断线。
 
 只读检查：
 
@@ -217,8 +217,8 @@ python3 scripts/check_v2ray_isolation.py
 
 - `v2ray.service` 的 `ExecStart` 指向 `/etc/v2ray/config.json`。
 - `v2ray-grok-pool.service` 指向 `/etc/v2ray/grok_pool.json`。
-- 主服务 UDP 31535、TCP 10808/10810 存在。
-- 代理池 10900–10907 只能绑定 `127.0.0.1`；禁止 Docker 网关、`0.0.0.0` 或公网监听。
+- 主服务配置声明的全部既有 inbound 仍存在。
+- 代理池配置声明的全部 inbound 只能绑定 loopback；禁止 Docker 网关、`0.0.0.0` 或公网监听。
 - 每个本机 inbound 必须按端口严格路由到对应 `proxy-01` 至 `proxy-08`。
 - 注册专用模式下 Sub2API 账号 `proxy_id` 应为空，节点故障不会影响生产调用。
 - 两份配置均通过 `v2ray test`。
@@ -227,7 +227,7 @@ python3 scripts/check_v2ray_isolation.py
 
 ### 4.5 运行服务器流程
 
-加 `--confirm-production-write` 前，操作者必须明确确认：当前目录是目标 GROKAUTH 项目；`SUB2API_URL`、PostgreSQL 容器和数据库是目标部署；目标分组是独立 `grok`；本次账号数和 worker 数正确；已授权创建邮箱、注册上游账号、写入 Sub2API 和建立数据库恢复点。任一项不明确时先停在预检，不执行生产写入。
+加 `--confirm-production-write` 前，操作者必须明确确认：当前目录是 `/root/grok-build-auth`；`SUB2API_URL`、PostgreSQL 容器和数据库是目标部署；目标分组经配置和 Sub2API 元数据核对为独立 `grok`，不得假定固定组 ID；本次账号数和 worker 数正确；已授权创建邮箱、注册上游账号、写入 Sub2API 和建立数据库恢复点。任一项不明确时先停在预检，不执行生产写入。
 
 推荐单账号 canary：
 
@@ -266,7 +266,10 @@ python3 scripts/register_and_import.py \
 ### 4.6 Web 控制台
 
 ```bash
-bash start_web_console.sh --host 127.0.0.1 --port 17860
+set -a
+. private/console.env
+set +a
+bash start_web_console.sh --host "$GROK_CONSOLE_HOST" --port "$GROK_CONSOLE_PORT"
 ```
 
 控制台必须只监听 loopback。若通过 Nginx 暴露，必须使用 Basic Auth 或等效强认证，并保留长请求超时。不要匿名公开生产操作接口。
@@ -352,7 +355,7 @@ python3 scripts/register_and_import.py \
 安装：
 
 ```bash
-cd /path/to/grok-build-auth/clients/windows
+cd /root/grok-build-auth/clients/windows
 python -m pip install -r requirements.txt
 copy config.example.json config.json
 ```
@@ -402,10 +405,12 @@ copy config.example.json config.json
 
 注意：
 
+- 面向业务统一称为 Sub2API auth。`cpa_*`、`cpa_auths/` 和 `cpa_export` 是现有客户端的兼容键、目录和模块名；不要仅为改名破坏已有配置或脚本。
+
 - `proxy` 必须是客户端本机实际监听地址，不能照抄服务器的 `127.0.0.1:<port>`。
 - bridge 健康检查不是 `/health` 时，通过 `bridge_health_path` 填写实际公网路径，例如 `/bridge-health`。
 - `mint_proxy` 为空时复用注册代理。
-- 邮箱 API 和 CPA push 当前可使用同一 bridge 管理凭据，但应长期拆分权限。
+- 邮箱 API 和 Sub2API auth push 当前可使用同一 bridge 管理凭据，但应长期拆分权限。
 - `config.json` 含管理密钥，权限必须为 `0600`，不得打包分享或提交 Git。
 - `mint_timeout_sec` 应覆盖 device flow 和协议 fallback；60 秒在网络波动时偏紧。
 
@@ -423,7 +428,7 @@ python grok_register_ttk.py
 Linux/Xvfb 示例：
 
 ```bash
-cd /path/to/grok-register
+cd /root/grok-build-auth/clients/windows
 DISPLAY=:99 bash -c 'echo 1 | .venv/bin/python3 grok_register_ttk.py'
 ```
 
@@ -482,9 +487,9 @@ Windows UI 排障要点：
 3. 保存账号和 SSO。
 4. 尝试 device OAuth；失败时复用 SSO 走协议 OAuth。
 5. 要求同时得到 access token 和 refresh token。
-6. 写出 `cpa_auths/xai-<email>.json`。
-7. 将同一 JSON push 到 bridge。
-8. bridge 先隔离账号、执行指定账号探针，通过后才进入 Grok 分组。
+6. 客户端 preprobe 通过后写出 `cpa_auths/xai-<email>.json`；目录名是兼容名称。
+7. 将同一 Sub2API auth JSON push 到 bridge。
+8. bridge 在写库前执行上游 preprobe，通过后才 create/update；导入后再执行指定账号 test，失败时按新建/更新路径回滚或恢复。
 
 ### 5.5 Bridge HTTP 契约
 
@@ -508,14 +513,14 @@ GET /api/mail/<message-id>
 Authorization: Bearer <mailbox-jwt>
 ```
 
-CPA push：
+Sub2API auth push（CLIProxyAPI-compatible schema）：
 
 ```http
 POST /v0/management/auth-files?name=xai-<email>.json
 X-Management-Key: <bridge-management-secret>
 Content-Type: application/json
 
-<CPA xAI auth JSON>
+<Sub2API xAI OAuth auth JSON>
 ```
 
 请求体最大 1 MiB。状态含义：
@@ -525,24 +530,25 @@ Content-Type: application/json
 | 200 | 返回 `status=ok`、`account_id`、`probe=passed`，账号已通过指定账号探针并入组 |
 | 400 | email/token 结构不完整、token 临近过期或缺 `sub` |
 | 401 | 邮箱 API Bearer 错误或邮箱 JWT 失效 |
-| 403 | CPA 管理密钥错误 |
+| 403 | bridge 管理密钥错误 |
 | 413 | 请求体超限 |
-| 422 | 账号在探针窗口内未通过，保持无分组且不可调度 |
+| 422 | 探针未通过或 `STALE_AUTH`；结合 `error_code`、`imported`、`action` 和账号 ID 判断是否发生过导入后回滚，不可只凭状态码推断零写入 |
 | 500 | Sub2API 创建、更新、查询或服务端依赖失败 |
 
-### 5.6 Bridge 的隔离、探针和入组
+### 5.6 Bridge 的探针、导入和入组
 
 当前 bridge 按邮箱生成稳定账号名。收到 auth 后：
 
 1. 校验 email、access token、refresh token、JWT `exp` 和 `sub`。
-2. 创建或更新账号时先设置 `group_ids=[]`、`schedulable=false`。
-3. 强制写入 `https://cli-chat-proxy.grok.com/v1`。
-4. 调用 Sub2API 指定账号 Responses test。
-5. 每 30 秒重试，最长 180 秒。
-6. 通过后绑定 Grok 分组并设置 `schedulable=true`。
-7. 返回 `probe=passed`。
+2. 在数据库写入前直连 Grok CLI `/responses` 做 preprobe；未通过返回结构化 422，不创建或更新账号。
+3. 查询同身份现有账号；候选 refresh token 与数据库不同且 access JWT 明显更旧时返回 `STALE_AUTH`，零写入，防止历史 AUTH 覆盖已轮换凭据。
+4. preprobe 通过后，按稳定账号身份 create/update 为无组、不可调度候选；同时把 access JWT `exp` 规范化为 Sub2API 使用的 `expires_at`。
+5. 调用 Sub2API 指定账号 Responses test 做 postimport 验证。测试可能触发 token refresh 和 refresh token 轮换。
+6. 测试通过后只更新分组和调度，不再提交测试前的 credentials；提升前后必须核对 access/refresh token hash 和 `_token_version` 未回退。
+7. postimport 失败时，新建账号必须按精确 ID 回滚；更新账号恢复旧元数据时必须保留测试期间已经产生的更新凭据。回滚失败必须显式报错，不能声称零写入。
+8. 成功返回 `probe=passed`、`imported=true`、`action` 和 `account_id`。
 
-同邮箱重推会更新同一账号，适合 OAuth token 更新和 422 后恢复。注意：更新已有可用账号时会先隔离；若本次 probe 失败，它会暂时退出生产池，这是 fail closed 行为。
+同邮箱重推会更新同一账号，适合 OAuth token 更新和确认可恢复错误后的幂等重推。任何 422 都必须结合响应字段和数据库精确状态核对。
 
 ### 5.7 外部客户端成功判定
 
@@ -550,7 +556,7 @@ Content-Type: application/json
 
 必须同时确认：
 
-- 本地 CPA JSON 已生成且权限安全。
+- 本地 Sub2API auth JSON 已生成且权限安全。
 - 日志明确显示 push HTTP 200。
 - bridge 响应含 `account_id` 和 `probe=passed`。
 - Sub2API 账号为 active、schedulable、唯一 Grok 分组、官方 CLI base URL。
@@ -561,10 +567,19 @@ Content-Type: application/json
 - 邮箱 API 401：检查 `cloudflare_auth_mode=bearer` 和管理凭据。
 - 验证码失败：客户端最多更换邮箱重试 3 次。
 - OAuth 失败：保留邮箱、密码和 SSO，从已有账号补 OAuth，不要重新建号。
-- push 422：账号已隔离。先读取指定账号 probe 的真实错误：资格传播或暂时上游故障可等待后重推同一 CPA JSON；`invalid_grant`、`Refresh token has been revoked` 或 `GROK_OAUTH_TOKEN_REFRESH_FAILED` 必须先重新登录铸造 OAuth；429 则等待 reset/cooldown。不能无分类地重复注册。
+- push 422：读取 `error_code`、`imported`、`action` 和账号 ID，再核对数据库。`STALE_AUTH` 表示本地 AUTH 已落后于 Sub2API，禁止重推；资格传播或暂时上游故障只允许从明确的失败 checkpoint 重试当前凭据。`invalid_grant`、`Refresh token has been revoked` 或 `GROK_OAUTH_TOKEN_REFRESH_FAILED` 必须先重新登录铸造 OAuth；429/402 额度用尽仍算可恢复可用状态。不能无分类地重复注册或删除账号。
 - push 超时：先查 bridge 日志和 Sub2API 账号，不能假定服务端没有写入；确认后再幂等重推。
 - push 403：核对 management secret，不要把密钥放到命令行历史。
 - push 500：查看 bridge journal、Sub2API 和 PostgreSQL；不要直接重复注册新账号。
+
+### 5.9 AUTH 快照和 refresh 所有权
+
+- `access_token` 实测约 6 小时；`refresh_token` 不会因为账号闲置 6 小时或几天未调用而按此周期自然过期。
+- xAI 刷新响应可能轮换 `refresh_token`。Sub2API 成功接管账号后，由其后台刷新器和请求内刷新共同维护数据库中的当前 token；不要再建立独立客户端 cron 与 Sub2API 争用同一轮换链。
+- `cpa_auths/xai-*.json` 是注册、恢复和首次交接的本地快照，不会从 Sub2API 反向同步。交接成功后可按敏感审计材料保留，但不能作为持续刷新权威，也不能在 checkpoint 缺失时批量回灌。
+- `cpa_reprobe.py --include-verified` 只重试 checkpoint 明确记录为 push 失败、且完整凭据 fingerprint 仍一致的文件。没有精确失败 checkpoint 的 verified AUTH 会跳过，不探测、不刷新、不推送。
+- 客户端若确实完成 refresh，会先原子写回当前 AUTH 文件，再进行二次 probe 和 push；verified AUTH 明确 revoked 时保留文件和记录，不自动删除。
+- revoked token 无法靠定时刷新恢复。长期应保留账号密码、可收信邮箱和 SSO 供 remint；恢复时重新登录铸造 OAuth，并更新原 Sub2API 账号，不创建重复账号。SSO 的服务端寿命未知，不能把它视为永久凭据。
 
 ## 6. Sub2API 客户端调用
 
@@ -637,6 +652,8 @@ token 过期 -> refresh token 续期
 额度耗尽 -> 等待 reset/cooldown，期间换其他账号
 ```
 
+Sub2API 启动后会立即检查，并按配置周期（当前默认 5 分钟）扫描 active OAuth 账号；Grok 在距离过期至少 1 小时时进入后台刷新窗口，请求路径也会按需刷新。该机制已经覆盖 `grok`，无需额外定时任务。若看到“原 access token 约 6 小时后突然 revoked”，应优先检查数据库 refresh token 是否被旧 AUTH 覆盖，而不是把 6 小时误判为 refresh token 生命周期。
+
 错误判读：
 
 | 状态 | 优先判断 |
@@ -662,7 +679,7 @@ token 过期 -> refresh token 续期
 
 回滚前必须确认备份、目标账号和允许的中断窗口。应用版本回滚与账号 URL 回滚必须配套：旧版若不原生补齐 CLI headers，就不能让账号继续直连官方 CLI URL；此时应先停止 Grok 专用 Key，再恢复经过验证的旧完整部署。不要只恢复 sidecar 或只改数据库而忽略 Redis/outbox。
 
-数据库恢复、删除账号、停止服务、删除镜像或清理邮箱都属于高风险操作，必须明确指定目标。只能清理由本批 manifest 精确证明归属的邮箱或产物。
+数据库恢复、删除账号、停止服务、删除镜像或清理邮箱都属于高风险操作。执行前创建数据库恢复点，导出候选账号 ID 清单并逐 ID 核对证据；只能处理用户已授权且由本批 manifest、auth 到账号映射或数据库结果精确证明归属的目标。
 
 ## 9. 安全要求和当前安全债
 

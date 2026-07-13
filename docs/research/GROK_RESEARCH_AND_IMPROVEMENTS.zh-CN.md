@@ -4,7 +4,7 @@
 
 ## 结论
 
-当前 GROKAUTH + Sub2API 主链的职责划分总体正确：GROKAUTH 负责注册、SSO、OAuth 和凭据生成，Sub2API 负责账号导入、调度、刷新和请求代理。不要整体替换为外部注册机。
+当前 `grok-build-auth` + Sub2API 主链的职责划分总体正确：`grok-build-auth` 负责注册、SSO、OAuth 和凭据生成，Sub2API 负责账号导入、调度、刷新和请求代理。不要整体替换为外部注册机。
 
 应优先修复核心正确性，再吸收外部项目的工程优点。最高优先级是：检查邮箱 RPC 业务结果、解析建号 Server Action 业务结果、自动执行真实上游探针。动态 IP 和验证码优化排在这些正确性门禁之后。
 
@@ -12,9 +12,9 @@
 
 ### 当前状态
 
-- GROKAUTH 只读取一个全局 `HTTP(S)_PROXY`，所有账号共用，没有节点池、按账号选点、出口 IP 探测或 IP 记录。
+- `grok-build-auth` 只读取一个全局 `HTTP(S)_PROXY`，所有账号共用，没有节点池、按账号选点、出口 IP 探测或 IP 记录。
 - Sub2API 支持账号绑定静态 `ProxyID`，但生产 4 个 Grok 账号目前都未绑定代理，实际共享服务器出口。
-- `grok_bytao` 为每个账号生成不同 Resin session/account，并给 Chromium 建认证代理桥。这一思路有价值，但不能直接复制：它没有验证不同 session 是否真的对应不同出口；CPA/OIDC mint 未继承注册时的 runtime proxy；代理失败还会回退直连。
+- `grok_bytao` 为每个账号生成不同 Resin session/account，并给 Chromium 建认证代理桥。这一思路有价值，但不能直接复制：它没有验证不同 session 是否真的对应不同出口；Sub2API auth/OIDC mint 未继承注册时的 runtime proxy；代理失败还会回退直连。
 
 ### 推荐设计
 
@@ -31,7 +31,7 @@
 
 ### 已确认的三种路径
 
-- 当前 GROKAUTH / `grok-build-auth`：付费 YesCaptcha，默认 `TurnstileTaskProxylessM1`，每次注册至少一次；OAuth 成功复用注册 SSO/cookie 时可免第二次，否则再次付费。
+- 当前 `grok-build-auth`：付费 YesCaptcha，默认 `TurnstileTaskProxylessM1`，每次注册至少一次；OAuth 成功复用注册 SSO/cookie 时可免第二次，否则再次付费。
 - `grok_reg-share` / `grok_bytao`：有头 Chromium + `turnstilePatch` + 页面真实点击/读取 token，不依赖付费打码，但依赖浏览器环境和页面结构。
 - 邮箱 OTP：各项目通过临时邮箱、自建 Cloudflare 邮箱或 IMAP 拉信，不属于付费验证码打码。
 
@@ -79,7 +79,7 @@
 - `grok_reg-share` 的注册与 mint 有界队列、每线程隔离 Chromium、cookie/SSO 复用、device token polling 有限重试。
 - `grok_bytao` 的账号级动态代理 session 概念、认证代理桥、Cloudflare 邮箱兼容和远程管理 API 上传，但必须补全链路代理继承、出口验证、TLS/allowlist、幂等和审计。
 - `grok-build-auth` 的纯 HTTP 协议链、动态 Next.js action 抓取、SSO 快路径和 PKCE OAuth。
-- CPA auth 的 schema 校验、`refresh_token` 必需、固定 Build 通道、临时文件 + `fsync` + `os.replace` + `0600` 原子写。
+- Sub2API auth 的 CLIProxyAPI-compatible schema 校验、`refresh_token` 必需、固定 Build 通道、临时文件 + `fsync` + `os.replace` + `0600` 原子写。
 
 ## 不应照搬
 

@@ -41,17 +41,17 @@ DEFAULT_CONFIG = {
     "register_count": 1,
     "max_concurrency": 2,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    # ===== CPA (CLIProxyAPI) 导出 / 免费 Grok 4.5（OIDC，非 Web SSO）=====
-    # 注册成功后走设备码 OIDC 铸造 token，写出 CLIProxyAPI 的 xai-<email>.json，并可
-    # 推送到远端 CLIProxyAPI 导入。免费号用 cli-chat-proxy，CLIProxyAPI 请求 grok 时
+    # ===== Sub2API auth 导出 / 免费 Grok 4.5（OIDC，非 Web SSO）=====
+    # 注册成功后走设备码 OIDC 铸造 token，写出 Sub2API 的 xai-<email>.json，并可
+    # 推送到远端 Sub2API bridge 导入。免费号用 cli-chat-proxy，Sub2API 请求 grok 时
     # 自带 x-grok-client-version 头，不会 426。SSO cookie 不能替代 OIDC。
-    "cpa_export_enabled": True,          # 注册成功后是否铸造 OIDC 并写 CPA 认证文件
+    "cpa_export_enabled": True,          # 注册成功后是否铸造 OIDC 并写 Sub2API auth
     "cpa_auth_dir": "./cpa_auths",       # 本地写盘目录（xai-<email>.json）
     "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",  # 写进 auth 的 base_url；付费用 https://api.x.ai/v1
-    # 远端推送到 CLIProxyAPI（POST /v0/management/auth-files）
-    "cpa_push_enabled": False,           # 是否推送到远端 CLIProxyAPI
-    "cpa_remote_base": "",               # 远端 CLIProxyAPI 地址，如 http://127.0.0.1:8317
-    "cpa_remote_secret": "",             # 远端管理密钥（CLIProxyAPI remote-management.secret-key）
+    # 远端推送到 Sub2API bridge（POST /v0/management/auth-files）
+    "cpa_push_enabled": False,           # 是否推送到远端 Sub2API bridge
+    "cpa_remote_base": "",               # 远端 Sub2API bridge 地址
+    "cpa_remote_secret": "",             # 远端 Sub2API bridge 管理密钥
     "cpa_remote_verify_tls": True,       # https 远端是否校验证书
     "cpa_push_proxy": "",                # 推送用代理；空=直连（不走 mint 代理）
     "cpa_push_required": True,           # 推送失败不得计为完整成功
@@ -269,8 +269,8 @@ def get_user_agent():
 
 
 def export_cpa_after_register(email, password, session=None, sso="", log_callback=None):
-    """注册成功后铸造 Grok Build OIDC，写出 CPA (CLIProxyAPI) 的 xai-<email>.json，
-    并按配置推送到远端 CLIProxyAPI 导入。
+    """注册成功后铸造 Grok Build OIDC，写出 Sub2API auth 的 xai-<email>.json，
+    并按配置推送到远端 Sub2API bridge 导入。
 
     走独立 Chromium 完成设备码确认，再轮询 token；本地写到 config['cpa_auth_dir']，
     远端推送到 config['cpa_remote_base'] 的 /v0/management/auth-files。
@@ -307,11 +307,11 @@ def export_cpa_after_register(email, password, session=None, sso="", log_callbac
 
     if result.get("ok"):
         tail = " 并已推送远端" if result.get("pushed") else ""
-        log(f"[+] CPA 认证已写出: {result.get('path')}{tail}")
+        log(f"[+] Sub2API auth 已写出: {result.get('path')}{tail}")
     elif result.get("skipped"):
         log(f"[cpa] 跳过: {result.get('reason')}")
     else:
-        log(f"[!] CPA 导出未成功: {result.get('error') or result}")
+        log(f"[!] Sub2API auth 导出未成功: {result.get('error') or result}")
     return result
 
 
@@ -1203,15 +1203,12 @@ def set_tos_accepted(session, log_callback=None, timeout=30):
 
 
 def accept_tos_for_token(token, cf_clearance="", log_callback=None, max_attempts=4, retry_delay=2.0):
-    """强制接受 TOS：优先 config.proxy，失败再直连。"""
+    """尝试接受 TOS；配置代理后所有尝试固定走该代理，不回退直连。"""
     user_agent = get_user_agent()
     last_message = "set_tos_accepted 未执行"
     proxy_url = str(config.get("proxy") or "").strip()
     proxy_dict = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-    modes = []
-    if proxy_dict:
-        modes.append(("proxy", proxy_dict))
-    modes.append(("direct", None))
+    modes = [("proxy", proxy_dict)] if proxy_dict else [("direct", None)]
     schedule = []
     while len(schedule) < max_attempts:
         for item in modes:
@@ -2856,7 +2853,7 @@ def register_one(session, shared, worker_id, slot_no):
         raise Exception("验证码阶段失败，已达到最大重试次数")
     profile = fill_profile_and_submit(session, log_callback=log, cancel_callback=cancel)
     sso = wait_for_sso_cookie(session, log_callback=log, cancel_callback=cancel)
-    # 强制 TOS：API 尽力 + 浏览器必须离开 tos-gate（否则 bridge 易 422）
+    # TOS 是辅助激活信号；最终账号可用性由 OAuth 后的客户端 preprobe 判定。
     api_ok, api_msg = accept_tos_for_token(sso, log_callback=log, max_attempts=4, retry_delay=2.0)
     browser_ok, browser_msg = browser_activate_chat_permission(
         session, sso, log_callback=log, cancel_callback=cancel, timeout=90
@@ -2867,14 +2864,12 @@ def register_one(session, shared, worker_id, slot_no):
         browser_ok, browser_msg = browser_activate_chat_permission(
             session, sso, log_callback=log, cancel_callback=cancel, timeout=60
         )
-    if not browser_ok:
-        raise RuntimeError(
-            f"TOS 门禁未通过，账号不可用: browser={browser_msg}; api={api_msg}"
-        )
-    if api_ok:
+    if api_ok and browser_ok:
         log(f"[+] API TOS + 浏览器已离开 tos-gate: {browser_msg}")
-    else:
+    elif browser_ok:
         log(f"[+] 浏览器已离开 tos-gate（API TOS 未确认: {api_msg}）")
+    else:
+        log(f"[!] TOS 激活未确认，继续由客户端 preprobe 做最终门禁: browser={browser_msg}; api={api_msg}")
     if config.get("enable_nsfw", True):
         # NSFW / birth 为增强项；TOS 已强制成功，这里失败不阻断注册
         nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log)
@@ -2886,9 +2881,9 @@ def register_one(session, shared, worker_id, slot_no):
         email, password, session=session, sso=sso, log_callback=log
     )
     if not export_result.get("ok"):
-        raise RuntimeError(f"OAuth/CPA 导出失败: {export_result.get('error') or export_result}")
+        raise RuntimeError(f"OAuth/Sub2API auth 导出失败: {export_result.get('error') or export_result}")
     if config.get("cpa_push_enabled", False) and not export_result.get("pushed"):
-        raise RuntimeError(f"CPA 推送失败: {export_result.get('push_error') or export_result}")
+        raise RuntimeError(f"Sub2API auth 推送失败: {export_result.get('push_error') or export_result}")
     if config.get("cpa_require_probe_passed", False):
         response = export_result.get("push_response") or {}
         if response.get("probe") != "passed":
@@ -2998,12 +2993,12 @@ def main():
     if config.get("cpa_export_enabled", True):
         push = "开" if config.get("cpa_push_enabled", False) else "关"
         cli_log(
-            f"[*] CPA 导出: 开启 | 目录: {config.get('cpa_auth_dir', './cpa_auths')} "
+            f"[*] Sub2API auth 导出: 开启 | 目录: {config.get('cpa_auth_dir', './cpa_auths')} "
             f"| 远端推送: {push}"
             + (f" -> {config.get('cpa_remote_base')}" if config.get("cpa_push_enabled") else "")
         )
     else:
-        cli_log("[*] CPA 导出: 关闭（仅写 accounts_*.txt）")
+        cli_log("[*] Sub2API auth 导出: 关闭（仅写 accounts_*.txt）")
     try:
         raw = input("请输入并发数量（同时开几个浏览器，直接回车=1）: ").strip()
     except (KeyboardInterrupt, EOFError):

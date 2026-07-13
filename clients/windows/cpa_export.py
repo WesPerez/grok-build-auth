@@ -1,11 +1,11 @@
-"""注册成功钩子：铸造 Grok Build 设备码 OIDC → 客户端 preprobe → 写出 CPA
-xai-<email>.json → 推送到远端 CLIProxyAPI / hardened bridge。
+"""注册成功钩子：铸造 Grok Build 设备码 OIDC → 客户端 preprobe → 写出 Sub2API
+xai-<email>.json → 推送到远端 hardened bridge。
 
 - 本地写盘目录：config['cpa_auth_dir']（默认 ./cpa_auths）
 - 远端推送：POST config['cpa_remote_base'] + /v0/management/auth-files?name=...
   认证 X-Management-Key: config['cpa_remote_secret']
 
-免费 Grok 4.5 用 base_url=cli-chat-proxy；CLIProxyAPI 请求 grok 时自带
+免费 Grok 4.5 用 base_url=cli-chat-proxy；Sub2API 请求 grok 时自带
 x-grok-client-version 头，免费号不会 426。
 
 客户端 preprobe（默认开启）：
@@ -47,7 +47,11 @@ def _record_failure(out_dir: Path, email: str, reason: str) -> None:
 
 def _preprobe_enabled(cfg: dict) -> bool:
     # Default ON: avoid writing/pushing tokens that only pass /models.
-    return bool(cfg.get("cpa_preprobe_enabled", True))
+    required = bool(cfg.get("cpa_preprobe_required", False))
+    enabled = bool(cfg.get("cpa_preprobe_enabled", True))
+    if required and not enabled:
+        raise ValueError("cpa_preprobe_required=true forbids disabling cpa_preprobe")
+    return enabled
 
 
 def _run_preprobe(
@@ -219,7 +223,7 @@ def export_cpa_for_account(
             base_url=base_url,
         )
     except Exception as exc:  # noqa: BLE001
-        log(f"[!] 组装 CPA payload 失败: {exc}")
+        log(f"[!] 组装 Sub2API auth payload 失败: {exc}")
         _record_failure(out_dir, email, f"build: {exc}")
         if cfg.get("mint_required", False):
             raise
@@ -256,7 +260,8 @@ def export_cpa_for_account(
             side_name = "cpa_cooldown" if decision == "cooldown" else "cpa_pending"
             pending_dir = out_dir.parent / side_name
             try:
-                pending_path = cpa.write_cpa_xai_auth(pending_dir, payload)
+                target = "cooldown" if decision == "cooldown" else "pending"
+                pending_path = cpa.transition(out_dir.parent, payload, target)
             except Exception as exc:  # noqa: BLE001
                 log(f"[!] 写 {side_name} 失败: {exc}")
                 if cfg.get("mint_required", False) or cfg.get("cpa_preprobe_required", True):
@@ -279,7 +284,7 @@ def export_cpa_for_account(
 
     # 只有 pass（或关闭 preprobe）才写正式目录
     try:
-        path = cpa.write_cpa_xai_auth(out_dir, payload)
+        path = cpa.transition(out_dir.parent, payload, "verified", verified_dir=out_dir)
         filename = Path(path).name
     except Exception as exc:  # noqa: BLE001
         log(f"[!] 写本地文件失败: {exc}")
@@ -297,7 +302,7 @@ def export_cpa_for_account(
         "preprobe": preprobe_meta or {"decision": "skipped"},
     }
 
-    # 推送远端 CLIProxyAPI / bridge（bridge 仍是最终信任边界）
+    # 推送远端 Sub2API bridge（bridge 仍是最终信任边界）
     if cfg.get("cpa_push_enabled", False):
         remote_base = str(cfg.get("cpa_remote_base") or "").strip()
         secret = str(cfg.get("cpa_remote_secret") or "").strip()

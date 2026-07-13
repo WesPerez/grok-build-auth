@@ -1,10 +1,11 @@
 # Private Runtime Directory
 
-Create `private/runtime.env` from `runtime.env.example`, then set:
+Create the required private files from the matching templates, for example
+`private/runtime.env`, `private/bridge.env`, and `private/console.env`, then set:
 
 ```bash
 chmod 700 private
-chmod 600 private/runtime.env
+chmod 600 private/*.env
 ```
 
 `private/` is ignored as a whole. It contains live credentials, generated
