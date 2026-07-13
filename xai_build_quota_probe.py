@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Probe Grok Build/CLI free usage quota from CLIProxyAPI xAI auth files.
+"""Probe Grok Build/CLI free usage quota from Sub2API xAI auth files.
 
 This does NOT print tokens. It sends a tiny non-streaming request to the
 Grok Build endpoint and reads quota signals from response headers or 429 body.
@@ -185,7 +185,7 @@ def probe(path: Path, timeout: float, proxy: str = "") -> dict[str, Any]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe xAI/Grok Build free quota from auth JSON files")
-    parser.add_argument("--auth-dir", required=True, help="CLIProxyAPI auth directory")
+    parser.add_argument("--auth-dir", required=True, help="Sub2API auth directory")
     parser.add_argument("--include-disabled", action="store_true", help="Also probe disabled auth files")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--json", action="store_true", help="Print JSON instead of a table")

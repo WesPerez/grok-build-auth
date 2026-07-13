@@ -1,4 +1,4 @@
-"""把 CPA xai auth JSON 推送到远端 CLIProxyAPI 导入。
+"""把 cpa 兼容的 xAI auth JSON 推送到远端 Sub2API bridge 导入。
 
 对齐 router-for-me/CLIProxyAPI 管理 API：
   POST {base}/v0/management/auth-files?name=xai-<email>.json
@@ -50,7 +50,7 @@ def push_auth_file(
     verify_tls: bool = True,
     timeout: float = 30.0,
 ) -> tuple[bool, int, str]:
-    """把一个 auth 文件推送到远端 CLIProxyAPI。返回 (ok, status, text)。"""
+    """把一个 auth 文件推送到远端 Sub2API bridge。返回 (ok, status, text)。"""
     base = (remote_base or "").strip().rstrip("/")
     if not base:
         raise CpaPushError("cpa_remote_base 未配置")

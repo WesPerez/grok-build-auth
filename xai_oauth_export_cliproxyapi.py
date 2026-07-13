@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Export an existing xAI OAuth record to CLIProxyAPI auth format.
+"""Export an existing xAI OAuth record as Sub2API auth with a CLIProxyAPI-compatible schema.
 
 Example:
 
@@ -21,12 +21,12 @@ from xconsole_client.xai_oauth import (
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="Export xAI OAuth JSON to CLIProxyAPI auth JSON")
+    p = argparse.ArgumentParser(description="Export xAI OAuth JSON to Sub2API auth JSON")
     p.add_argument("--record", required=True, help="Explicit path to a legacy OAuth JSON record")
     p.add_argument(
         "--cliproxyapi-auth-dir",
         required=True,
-        help="CLIProxyAPI auth dir, e.g. ./cliproxyapi_auth",
+        help="Sub2API auth dir, e.g. ./cliproxyapi_auth",
     )
     p.add_argument("--cliproxyapi-base-url", default=CLIPROXYAPI_GROK_BASE_URL)
     p.add_argument("--disabled", action="store_true", help="Write exported auth as disabled")

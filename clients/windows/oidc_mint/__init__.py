@@ -5,7 +5,7 @@
   - browser_confirm：独立 Chromium 完成设备码确认
   - proxyutil：代理解析
 
-输出成什么格式（CPA / 其它）由上层的 cpa_export 负责，这里不掺和。
+输出成 Sub2API auth 或其他格式由上层的 cpa_export 负责，这里不掺和。
 """
 
 from .browser_confirm import mint_with_browser, shutdown_mint_browsers

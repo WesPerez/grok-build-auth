@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""grok-build-auth — 一键注册 x.ai 账号 + SSO + Grok Build OAuth（CLIProxyAPI 可用）
+"""grok-build-auth — 一键注册 x.ai 账号 + SSO + Grok Build OAuth（Sub2API 可用）
 
 流程:
   1) 协议注册（邮箱验证 + Turnstile + create_account）
   2) 提取 SSO
   3) xAI OAuth PKCE（含 grok-cli:access）
-  4) 导出 CLIProxyAPI auth：cli-chat-proxy.grok.com + grok-cli headers
+  4) 导出 Sub2API auth：cli-chat-proxy.grok.com + grok-cli headers
      → 可直接用 grok-4.5 走 Build/CLI 编码通道
 
 环境变量（按需设置）:
@@ -13,7 +13,7 @@
     TEMPMAIL_API_KEY       Tempmail.lol API key (邮箱后端)
     CLOUDFLARE_API_TOKEN   Cloudflare API token (alias_mail 邮箱后端)
     IMAP_SERVER / IMAP_USERNAME / IMAP_PASSWORD / IMAP_EMAIL  自建 IMAP 邮箱后端
-    CLIPROXYAPI_AUTH_DIR   CLIProxyAPI data/auth 目录（可选）
+    CLIPROXYAPI_AUTH_DIR   Sub2API auth 目录（历史兼容变量名，可选）
     HTTPS_PROXY / HTTP_PROXY  代理（OAuth 换 token / Playwright 可选）
 """
 from __future__ import annotations
@@ -233,8 +233,8 @@ def register_one(
                 )
                 result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
                 if not result["cliproxyapi_auth"] or not Path(result["cliproxyapi_auth"]).is_file():
-                    raise RuntimeError("OAuth completed without a CLIProxyAPI auth file")
-                _log(index, "Build OAuth OK; CLIProxyAPI auth written")
+                    raise RuntimeError("OAuth completed without a Sub2API auth file")
+                _log(index, "Build OAuth OK; Sub2API auth written")
             return result
 
         # 1. warm-up + scrape
@@ -308,7 +308,7 @@ def register_one(
             "error": None,
         }
 
-        # 6. OAuth → CLIProxyAPI Grok Build path (coding-ready)
+        # 6. OAuth → Sub2API Grok Build path (coding-ready)
         if do_oauth:
             auth_dir = Path(cliproxyapi_auth_dir) if cliproxyapi_auth_dir else default_cliproxyapi_auth_dir()
             # Reuse signup session cookies so OAuth can skip password login when possible.
@@ -353,10 +353,10 @@ def register_one(
                     oauth = complete_oauth()
             result["cliproxyapi_auth"] = str(oauth.cliproxyapi_path) if oauth.cliproxyapi_path else None
             if not result["cliproxyapi_auth"] or not Path(result["cliproxyapi_auth"]).is_file():
-                raise RuntimeError("OAuth completed without a CLIProxyAPI auth file")
+                raise RuntimeError("OAuth completed without a Sub2API auth file")
             _log(
                 index,
-                "Build OAuth OK; CLIProxyAPI auth written",
+                "Build OAuth OK; Sub2API auth written",
             )
         else:
             if not sso:
@@ -392,7 +392,7 @@ def main() -> int:
     global _total, _t0
     default_auth = str(default_cliproxyapi_auth_dir())
     p = argparse.ArgumentParser(
-        description="grok-build-auth: x.ai register + SSO + Grok Build OAuth (CLIProxyAPI-ready)",
+        description="grok-build-auth: x.ai register + SSO + Grok Build OAuth (Sub2API-ready)",
     )
     p.add_argument("-n", "--count", type=int, choices=[1], default=1, help="账号数量（服务器版仅允许 1）")
     p.add_argument("-t", "--threads", type=int, choices=[1], default=1, help="并发线程数（服务器版仅允许 1）")
@@ -421,12 +421,12 @@ def main() -> int:
     p.add_argument(
         "--no-oauth",
         action="store_true",
-        help="只注册+SSO，不走 Build OAuth / CLIProxyAPI 导出",
+        help="只注册+SSO，不走 Build OAuth / Sub2API auth 导出",
     )
     p.add_argument(
         "--cliproxyapi-auth-dir",
         default=default_auth,
-        help=f"CLIProxyAPI auth 目录（默认: {default_auth}）",
+        help=f"Sub2API auth 目录（默认: {default_auth}）",
     )
     p.add_argument(
         "--cliproxyapi-base-url",

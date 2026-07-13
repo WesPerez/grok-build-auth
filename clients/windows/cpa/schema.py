@@ -1,7 +1,7 @@
-"""CPA (CLIProxyAPI) xAI auth JSON 组装，对齐 router-for-me/CLIProxyAPI
+"""Sub2API xAI auth JSON 组装，使用 router-for-me/CLIProxyAPI-compatible schema。
 internal/auth/xai/token.go 的 TokenStorage 结构。
 
-生成的 xai-<email>.json 可被 CLIProxyAPI 直接加载；CLIProxyAPI 请求 grok 时会
+生成的 xai-<email>.json 可被兼容实现直接加载；Sub2API 请求 grok 时会
 自带 x-grok-client-version 头（xai_executor.go 硬编码 0.2.93），免费 Build 账号
 不会 426。
 """
@@ -26,7 +26,7 @@ DEFAULT_BASE_URL = CLI_BASE_URL
 
 
 def _sanitize_file_segment(value: str) -> str:
-    """对齐 CPA CredentialFileName 的清洗规则。"""
+    """对齐兼容 schema 的 CredentialFileName 清洗规则。"""
     value = (value or "").strip()
     if not value:
         return ""
@@ -45,7 +45,7 @@ def _sanitize_file_segment(value: str) -> str:
 
 
 def credential_file_name(email: str = "", sub: str = "") -> str:
-    """返回 CPA 认证文件名：xai-<email>.json。"""
+    """返回 Sub2API auth 文件名：xai-<email>.json。"""
     email_s = _sanitize_file_segment(email)
     if email_s:
         return f"xai-{email_s}.json"
@@ -95,7 +95,7 @@ def build_cpa_xai_auth(
     if not access_token:
         raise ValueError("access_token is required")
     if not refresh_token:
-        raise ValueError("refresh_token is required (CPA 无法在缺 refresh_token 时续期)")
+        raise ValueError("refresh_token is required (Sub2API 无法在缺 refresh_token 时续期)")
 
     try:
         exp_s, exp_in, sub_jwt = expired_from_access_token(access_token)

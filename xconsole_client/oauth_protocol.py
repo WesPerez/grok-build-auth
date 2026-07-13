@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Protocolized xAI OAuth login (no browser) for Grok Build / CLIProxyAPI.
+"""Protocolized xAI OAuth login (no browser) for Grok Build / Sub2API.
 
 After account signup (or with email/password), this module:
 
@@ -8,7 +8,7 @@ After account signup (or with email/password), this module:
   3. Solves Cloudflare Turnstile via YesCaptcha
   4. Calls auth_mgmt.AuthManagement/CreateSession (gRPC-web)
   5. Follows cookieSetterUrl + OAuth redirects to capture authorization code
-  6. Exchanges code for tokens and exports CLIProxyAPI Grok Build auth JSON
+  6. Exchanges code for tokens and exports Sub2API Grok Build auth JSON
 
 CreateSessionRequest wire layout (reverse-engineered 2026-07):
 
@@ -731,7 +731,7 @@ def login_with_protocol(
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
 ) -> OAuthLoginResult:
-    """Convenience wrapper: protocol OAuth + optional CLIProxyAPI Build export.
+    """Convenience wrapper: protocol OAuth + optional Sub2API auth export.
 
     If *auth_client* (XConsoleAuthClient) is provided after signup, its live
     curl_cffi session is reused so accounts.x.ai cookies stay attached.

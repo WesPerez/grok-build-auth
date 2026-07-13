@@ -402,7 +402,7 @@ def save_cliproxyapi_auth_record(
     base_url: str = CLIPROXYAPI_GROK_BASE_URL,
     headers: Optional[Dict[str, str]] = None,
 ) -> Path:
-    """Write a CLIProxyAPI-ready ``xai-<email>.json`` auth file."""
+    """Write a Sub2API-ready ``xai-<email>.json`` auth file."""
 
     record = build_cliproxyapi_auth_record(
         token,
@@ -836,7 +836,7 @@ def complete_build_oauth(
 
 
 def default_cliproxyapi_auth_dir() -> Path:
-    """Resolve CLIProxyAPI auth directory.
+    """Resolve the Sub2API auth directory from the historical compatibility setting.
 
     Order:
       1. ``CLIPROXYAPI_AUTH_DIR`` environment variable
@@ -864,19 +864,19 @@ def main() -> None:
         "--cliproxyapi-auth-dir",
         default=None,
         help=(
-            "Also write CLIProxyAPI-ready xai-<email>.json into this auth dir. "
+            "Also write Sub2API-ready xai-<email>.json into this auth dir. "
             "The exported record defaults to Grok CLI chat proxy, not api.x.ai credits."
         ),
     )
     p.add_argument(
         "--cliproxyapi-base-url",
         default=CLIPROXYAPI_GROK_BASE_URL,
-        help="Base URL for the optional CLIProxyAPI auth export.",
+        help="Base URL for the optional Sub2API auth export.",
     )
     p.add_argument(
         "--cliproxyapi-disabled",
         action="store_true",
-        help="Mark the optional CLIProxyAPI auth export as disabled.",
+        help="Mark the optional Sub2API auth export as disabled.",
     )
     p.add_argument("--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "")
     args = p.parse_args()

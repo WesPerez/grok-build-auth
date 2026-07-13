@@ -1,4 +1,4 @@
-"""原子写 CPA xAI auth 文件（mode 0600）。"""
+"""原子写 Sub2API xAI auth 文件（mode 0600）。"""
 
 from __future__ import annotations
 
