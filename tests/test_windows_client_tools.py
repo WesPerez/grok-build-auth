@@ -179,10 +179,138 @@ def test_cpa_export_requires_bridge_probe(tmp_path, monkeypatch):
 def test_windows_main_has_no_global_process_kill():
     source = (CLIENT / "grok_register_ttk.py").read_text(encoding="utf-8-sig")
     cleanup = source.split("def cleanup_stray_chrome", 1)[1].split("def create_browser_options", 1)[0]
+    chat_canary = source.split("def browser_chat_canary", 1)[1].split("def enable_nsfw_for_token", 1)[0]
     assert "process_iter" not in cleanup
     assert "googleupdate.exe" not in cleanup.lower()
     assert "export_result = export_cpa_after_register" in source
     assert 'response.get("probe") != "passed"' in source
+    assert "surface_deadline" in chat_canary
+    assert 'result.get("assistantMatch")' in chat_canary
+    assert 'result.get("occurrences")' not in chat_canary
+    assert "网页对话首次提交返回 PERMISSION_DENIED/403" in chat_canary
+
+
+def test_windows_example_defaults_to_single_hidden_worker():
+    config = json.loads((CLIENT / "config.example.json").read_text(encoding="utf-8"))
+    assert config["register_count"] == 1
+    assert config["max_concurrency"] == 1
+    assert config["hide_window"] is True
+
+
+def test_oauth_device_transport_fallback_preserves_proxy(monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        from oidc_mint import oauth_device
+
+        monkeypatch.setattr(
+            oauth_device.crequests,
+            "post",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                oauth_device.CurlRequestException(
+                    "tls handshake failed",
+                    oauth_device.CurlECode.SSL_CONNECT_ERROR,
+                )
+            ),
+        )
+        calls = []
+
+        class Response:
+            status_code = 200
+            text = ""
+
+            def json(self):
+                return {"device_code": "d", "user_code": "u"}
+
+        class Session:
+            trust_env = True
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def post(self, *args, **kwargs):
+                calls.append((args, kwargs, self.trust_env))
+                return Response()
+
+        monkeypatch.setattr(oauth_device.std_requests, "Session", Session)
+        monkeypatch.setattr(oauth_device, "resolve_proxy", lambda value: value)
+        status, body = oauth_device._post_form(
+            "https://auth.example/device",
+            {"client_id": "client"},
+            timeout=12,
+            proxy="http://127.0.0.1:10808",
+        )
+        assert status == 200 and body["device_code"] == "d"
+        assert len(calls) == 1
+        assert calls[0][1]["proxies"] == {
+            "http": "http://127.0.0.1:10808",
+            "https": "http://127.0.0.1:10808",
+        }
+        assert calls[0][1]["timeout"] == 12
+        assert calls[0][2] is False
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_oauth_device_timeout_does_not_replay_post(monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        from oidc_mint import oauth_device
+
+        timeout_error = oauth_device.CurlRequestException(
+            "operation timed out",
+            oauth_device.CurlECode.OPERATION_TIMEDOUT,
+        )
+        monkeypatch.setattr(
+            oauth_device.crequests,
+            "post",
+            lambda *args, **kwargs: (_ for _ in ()).throw(timeout_error),
+        )
+        monkeypatch.setattr(
+            oauth_device.std_requests,
+            "Session",
+            lambda: pytest.fail("ambiguous POST failures must not be replayed"),
+        )
+        with pytest.raises(oauth_device.CurlRequestException) as caught:
+            oauth_device._post_form(
+                "https://auth.example/device",
+                {"client_id": "client"},
+            )
+        assert caught.value is timeout_error
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_oauth_device_http_response_does_not_change_transport(monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        from oidc_mint import oauth_device
+
+        class Response:
+            status_code = 403
+            text = "denied"
+
+            def json(self):
+                return {"error": "access_denied"}
+
+        monkeypatch.setattr(oauth_device.crequests, "post", lambda *args, **kwargs: Response())
+        monkeypatch.setattr(
+            oauth_device.std_requests,
+            "Session",
+            lambda: pytest.fail("HTTP responses must not trigger transport fallback"),
+        )
+        status, body = oauth_device._post_form(
+            "https://auth.example/device",
+            {"client_id": "client"},
+        )
+        assert status == 403 and body["error"] == "access_denied"
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
 
 def test_client_preprobe_decisions(monkeypatch):
     sys.path.insert(0, str(CLIENT))
@@ -204,8 +332,10 @@ def test_client_preprobe_decisions(monkeypatch):
             def __init__(self):
                 self.trust_env = True
                 self._response = None
+                self.last_kwargs = None
 
             def post(self, *args, **kwargs):
+                self.last_kwargs = kwargs
                 return self._response
 
         auth = {"access_token": "tok", "refresh_token": "ref"}
@@ -216,6 +346,7 @@ def test_client_preprobe_decisions(monkeypatch):
 
         sess._response = FakeResp(200, {"status": "completed", "output_text": "CLIENT_PROBE_OK_fixed"})
         assert preprobe.probe_auth(auth)["decision"] == "pass"
+        assert sess.last_kwargs["json"]["max_output_tokens"] == 64
 
         sess._response = FakeResp(200, {
             "status": "completed", "input": "Reply exactly: CLIENT_PROBE_OK_fixed", "output": []
@@ -285,15 +416,17 @@ def test_cpa_export_preprobe_pending_not_push(tmp_path, monkeypatch):
         )
         monkeypatch.setattr(oidc_mint, "resolve_proxy", lambda value: value)
         monkeypatch.setattr(oidc_mint, "set_runtime_proxy", lambda value: None)
-        monkeypatch.setattr(
-            cpa.preprobe,
-            "probe_auth",
-            lambda auth, proxy="", timeout=45: {
+        probes = {"n": 0}
+
+        def permission_denied(auth, proxy="", timeout=45):
+            probes["n"] += 1
+            return {
                 "decision": "retry",
                 "code": "PERMISSION_DENIED",
                 "status": 403,
-            },
-        )
+            }
+
+        monkeypatch.setattr(cpa.preprobe, "probe_auth", permission_denied)
         pushed = {"n": 0}
 
         def boom_push(**kwargs):
@@ -321,6 +454,7 @@ def test_cpa_export_preprobe_pending_not_push(tmp_path, monkeypatch):
         assert result["ok"] is False
         assert result["preprobe"]["code"] == "PERMISSION_DENIED"
         assert result.get("side_dir") == "cpa_pending"
+        assert probes["n"] == 1
         assert pushed["n"] == 0
         assert not list(out.glob("xai-*.json"))
         pending = out.parent / "cpa_pending"

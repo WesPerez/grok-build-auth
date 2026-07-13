@@ -382,7 +382,7 @@ copy config.example.json config.json
   "proxy": "<client-local-proxy-url>",
   "register_count": 1,
   "max_concurrency": 1,
-  "hide_window": false,
+  "hide_window": true,
   "block_media_fonts": false,
 
   "cpa_export_enabled": true,
@@ -410,6 +410,7 @@ copy config.example.json config.json
 - `proxy` 必须是客户端本机实际监听地址，不能照抄服务器的 `127.0.0.1:<port>`。
 - bridge 健康检查不是 `/health` 时，通过 `bridge_health_path` 填写实际公网路径，例如 `/bridge-health`。
 - `mint_proxy` 为空时复用注册代理。
+- `hide_window=true` 保持 headed Chromium，但在 Windows 使用 `SW_HIDE` 隐藏任务窗口，不占用任务栏或抢占前台；不要改成 headless 绕过真实页面流程。
 - 邮箱 API 和 Sub2API auth push 当前可使用同一 bridge 管理凭据，但应长期拆分权限。
 - `config.json` 含管理密钥，权限必须为 `0600`，不得打包分享或提交 Git。
 - `mint_timeout_sec` 应覆盖 device flow 和协议 fallback；60 秒在网络波动时偏紧。
@@ -484,12 +485,14 @@ Windows UI 排障要点：
 
 1. 通过 bridge 创建 Mailu 邮箱并取得 1 小时邮箱 JWT。
 2. 浏览器通过客户端代理完成 x.ai 注册和邮箱验证码。
-3. 保存账号和 SSO。
-4. 尝试 device OAuth；失败时复用 SSO 走协议 OAuth。
-5. 要求同时得到 access token 和 refresh token。
-6. 客户端 preprobe 通过后写出 `cpa_auths/xai-<email>.json`；目录名是兼容名称。
-7. 将同一 Sub2API auth JSON push 到 bridge。
-8. bridge 在写库前执行上游 preprobe，通过后才 create/update；导入后再执行指定账号 test，失败时按新建/更新路径回滚或恢复。
+3. 取得 SSO；此时尚不写正式账号记录或 Sub2API auth。
+4. 强制确认浏览器离开 TOS gate，并通过同源 `/rest/auth/set-birth-date` HTTP 200。
+5. 在真实网页聊天框提交随机 canary，只接受 assistant 角色中的精确回复；网页 403 立即失败。
+6. 浏览器门禁通过后保存本地恢复记录并尝试 device OAuth；`curl_cffi` 明确发生 TLS 握手错误时，保持同一代理和证书校验改用标准 `requests`；超时、接收失败等可能已到达服务端的请求不重放；失败时再复用 SSO 走协议 OAuth。
+7. 要求同时得到 access token 和 refresh token。
+8. 客户端 preprobe 通过后写出 `cpa_auths/xai-<email>.json`；目录名是兼容名称。首次 `PERMISSION_DENIED/403` 立即进入 pending，不做延迟复测；网络、无效响应和普通上游错误仍可按配置短重试。
+9. 将同一 Sub2API auth JSON push 到 bridge。
+10. bridge 在写库前执行上游 preprobe，通过后才 create/update；导入后再执行指定账号 test，失败时按新建/更新路径回滚或恢复。
 
 ### 5.5 Bridge HTTP 契约
 

@@ -464,7 +464,7 @@ def _probe_auth_once(auth_data, timeout=45):
         "model": "grok-4.5",
         "input": f"Reply exactly: {marker}",
         "stream": False,
-        "max_output_tokens": 16,
+        "max_output_tokens": 64,
         "store": False,
     }).encode()
     req = urllib.request.Request(

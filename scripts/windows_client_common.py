@@ -92,7 +92,7 @@ def responses_probe(
     payload = json.dumps({
         "model": model,
         "input": "Reply exactly: WINDOWS_CLIENT_OK",
-        "max_output_tokens": 16,
+        "max_output_tokens": 64,
         "store": False,
     }).encode()
     request = urllib.request.Request(

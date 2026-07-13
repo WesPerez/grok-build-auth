@@ -39,7 +39,7 @@ DEFAULT_CONFIG = {
     "proxy": "http://127.0.0.1:7890",
     "enable_nsfw": True,
     "register_count": 1,
-    "max_concurrency": 2,
+    "max_concurrency": 1,
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
     # ===== Sub2API auth 导出 / 免费 Grok 4.5（OIDC，非 Web SSO）=====
     # 注册成功后走设备码 OIDC 铸造 token，写出 Sub2API 的 xai-<email>.json，并可
@@ -63,7 +63,7 @@ DEFAULT_CONFIG = {
     # 以下优化默认关闭 = 与最初脚本一致；实测三者都不影响 Turnstile 通过，可按需开启。
     # （注：Blink 层禁图会导致验证过不去，已弃用；省图片带宽改由 block_media_fonts 承担）
     "block_media_fonts": False,  # 网络层拦截图片/字体/媒体省带宽（省带宽主力，不影响验证）
-    "hide_window": False,        # 把浏览器窗口移到屏幕外隐藏
+    "hide_window": True,         # 使用 SW_HIDE 隐藏任务浏览器，不抢占前台
     "stealth_patch": False,      # 内联 turnstilePatch 全局注入
 }
 
@@ -366,6 +366,56 @@ def _kill_chrome_session(pid=None, port=None):
         _kill_proc_tree(tp)
 
 
+def _hide_chrome_session_windows(pid=None, port=None):
+    """Hide top-level windows owned by this task's Chromium session on Windows."""
+    if os.name != "nt":
+        return 0
+
+    targets = set()
+    if port:
+        marker = f"--remote-debugging-port={port}"
+        for proc in psutil.process_iter(["name", "cmdline"]):
+            try:
+                if (proc.info.get("name") or "").lower() != "chrome.exe":
+                    continue
+                if marker not in " ".join(proc.info.get("cmdline") or []):
+                    continue
+                targets.add(proc.pid)
+                targets.update(child.pid for child in proc.children(recursive=True))
+            except Exception:
+                continue
+    if pid:
+        try:
+            proc = psutil.Process(pid)
+            targets.add(proc.pid)
+            targets.update(child.pid for child in proc.children(recursive=True))
+        except Exception:
+            targets.add(pid)
+    if not targets:
+        return 0
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        hidden = [0]
+        user32 = ctypes.windll.user32
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def enum_window(hwnd, _lparam):
+            owner_pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner_pid))
+            if owner_pid.value in targets and user32.IsWindowVisible(hwnd):
+                user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                hidden[0] += 1
+            return True
+
+        user32.EnumWindows(enum_window, 0)
+        return hidden[0]
+    except Exception:
+        return 0
+
+
 def cleanup_stray_chrome(log_callback=None, rounds=4):
     """不做全局进程扫描。
 
@@ -418,9 +468,10 @@ def create_browser_options():
     proxy = config.get("proxy", "")
     if proxy:
         options.set_argument(f"--proxy-server={proxy}")
-    # 隐藏窗口（可选，默认关）：仅移出屏幕、不缩小尺寸
+    # 隐藏任务浏览器（默认开）：移出屏幕、最小化，并在启动后调用 SW_HIDE。
     if config.get("hide_window", False):
         options.set_argument("--window-position=-32000,-32000")
+        options.set_argument("--start-minimized")
     # 加载 turnstilePatch 扩展（伪造自动化鼠标事件指纹，帮过 Turnstile）
     if os.path.exists(EXTENSION_PATH):
         options.add_extension(EXTENSION_PATH)
@@ -1568,7 +1619,252 @@ return {
         return False, f"browser_activate_chat_permission 异常: {e}"
 
 
-def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
+def browser_set_birth_date(
+    browser_session,
+    log_callback=None,
+    cancel_callback=None,
+    attempts=3,
+    retry_delay=2.0,
+):
+    """Set the birth date through the authenticated grok.com browser session."""
+    log = log_callback or (lambda *_: None)
+    if browser_session is None or getattr(browser_session, "page", None) is None:
+        return False, "browser session 不可用"
+
+    page = browser_session.page
+    last_message = "browser birth 未执行"
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        raise_if_cancelled(cancel_callback)
+        try:
+            if "grok.com" not in str(getattr(page, "url", "") or "").lower():
+                page.get("https://grok.com/")
+                sleep_with_cancel(1.0, cancel_callback)
+            result = page.run_js(
+                r"""
+return fetch('/rest/auth/set-birth-date', {
+  method: 'POST',
+  credentials: 'include',
+  headers: {'content-type': 'application/json'},
+  body: JSON.stringify({birthDate: arguments[0]}),
+}).then(async (response) => ({
+  ok: response.ok,
+  status: response.status,
+  body: (await response.text()).slice(0, 160),
+})).catch((error) => ({
+  ok: false,
+  status: 0,
+  error: String(error).slice(0, 160),
+}));
+""",
+                generate_random_birthdate(),
+            )
+            status = int(result.get("status") or 0) if isinstance(result, dict) else 0
+            if isinstance(result, dict) and result.get("ok") and 200 <= status < 300:
+                log(f"[+] 浏览器出生日期已设置（第 {attempt} 次，HTTP {status}）")
+                return True, "ok"
+            last_message = f"browser set_birth_date HTTP {status}"
+            log(f"[!] 浏览器出生日期设置失败（第 {attempt} 次）: {last_message}")
+        except Exception as exc:
+            last_message = f"browser_set_birth_date 异常: {exc}"
+            log(f"[!] 浏览器出生日期设置异常（第 {attempt} 次）: {exc}")
+        if attempt < max(1, int(attempts)):
+            try:
+                page.get("https://grok.com/")
+                sleep_with_cancel(1.0, cancel_callback)
+                browser_session.refresh_page()
+                page = browser_session.page
+            except Exception:
+                pass
+            sleep_with_cancel(retry_delay, cancel_callback)
+    return False, last_message
+
+
+def browser_chat_canary(
+    browser_session,
+    log_callback=None,
+    cancel_callback=None,
+    timeout=60,
+):
+    """Send a browser chat canary and require an assistant reply marker."""
+    log = log_callback or (lambda *_: None)
+    if browser_session is None or getattr(browser_session, "page", None) is None:
+        return False, "browser session 不可用"
+
+    page = browser_session.page
+    marker = "WEB_CANARY_" + secrets.token_hex(12)
+    try:
+        page.get("https://grok.com/")
+        surface_deadline = time.time() + min(30, max(10, int(timeout or 60) // 2))
+        surface_state = {}
+        while time.time() < surface_deadline:
+            raise_if_cancelled(cancel_callback)
+            try:
+                surface_state = page.run_js(
+                    r"""
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+const send = document.querySelector('button[data-testid="chat-submit"]');
+return {
+  ready: Boolean(editor),
+  hasEditor: Boolean(editor),
+  hasSend: Boolean(send),
+  sendDisabled: Boolean(send && send.disabled),
+  readyState: document.readyState,
+  url: location.href,
+};
+"""
+                )
+            except Exception as exc:
+                surface_state = {"error": type(exc).__name__, "url": str(getattr(page, "url", ""))}
+            if isinstance(surface_state, dict) and surface_state.get("ready"):
+                break
+            current_url = str((surface_state or {}).get("url") or getattr(page, "url", ""))
+            if "tos-gate" in current_url or "/login" in current_url:
+                return False, f"网页对话界面被门禁阻断: {current_url[:160]}"
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
+            detail = surface_state if isinstance(surface_state, dict) else {}
+            return False, (
+                "网页对话界面等待超时: "
+                f"url={str(detail.get('url') or getattr(page, 'url', ''))[:140]}, "
+                f"readyState={detail.get('readyState')}, editor={detail.get('hasEditor')}, "
+                f"send={detail.get('hasSend')}, disabled={detail.get('sendDisabled')}"
+            )
+
+        editor_result = page.run_js(
+            r"""
+const marker = arguments[0];
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+if (!editor) return {sent: false, reason: 'no-editor', url: location.href};
+const value = 'Reply exactly: ' + marker;
+editor.focus();
+if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+  const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value');
+  if (descriptor && descriptor.set) descriptor.set.call(editor, value);
+  else editor.value = value;
+} else {
+  editor.textContent = value;
+}
+editor.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+editor.dispatchEvent(new Event('change', {bubbles: true}));
+return {filled: true, url: location.href};
+""",
+            marker,
+        )
+        if not isinstance(editor_result, dict) or not editor_result.get("filled"):
+            return False, f"网页对话填写失败: {(editor_result or {}).get('reason', 'unknown')}"
+        send_deadline = time.time() + 10
+        send_result = {}
+        while time.time() < send_deadline:
+            raise_if_cancelled(cancel_callback)
+            send_result = page.run_js(
+                r"""
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const send = document.querySelector('button[data-testid="chat-submit"]');
+if (!send || !visible(send) || send.disabled) return {sent: false, reason: 'chat-submit-unavailable'};
+send.click();
+return {sent: true, via: 'chat-submit', url: location.href};
+"""
+            )
+            if isinstance(send_result, dict) and send_result.get("sent"):
+                break
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
+            return False, f"网页对话发送失败: {(send_result or {}).get('reason', 'unknown')}"
+
+        submit_deadline = time.time() + 5
+        while time.time() < submit_deadline:
+            raise_if_cancelled(cancel_callback)
+            submitted = page.run_js(
+                r"""
+const marker = arguments[0];
+const userSelectors = [
+  '[data-message-author-role="user"]',
+  '[data-role="user"]',
+  '[data-testid*="user-message"]',
+];
+const userMatch = userSelectors.some((selector) =>
+  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
+);
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find((node) => {
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+});
+const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
+const body = document.body && document.body.innerText || '';
+return {
+  submitted: userMatch || (!editorText.includes(marker) && body.includes(marker)),
+  permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
+  url: location.href,
+};
+""",
+                marker,
+            )
+            if isinstance(submitted, dict) and submitted.get("permissionDenied"):
+                return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
+            if isinstance(submitted, dict) and submitted.get("submitted"):
+                break
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
+            return False, "网页对话未确认真实提交"
+
+        deadline = time.time() + max(20, int(timeout or 60))
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            result = page.run_js(
+                r"""
+const marker = arguments[0];
+const assistantSelectors = [
+  '[data-message-author-role="assistant"]',
+  '[data-role="assistant"]',
+  '[data-testid*="assistant"]',
+];
+const assistantMatch = assistantSelectors.some((selector) =>
+  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
+);
+const body = document.body && document.body.innerText || '';
+return {
+  assistantMatch,
+  permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
+  url: location.href,
+};
+""",
+                marker,
+            )
+            if isinstance(result, dict) and result.get("permissionDenied"):
+                return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
+            if isinstance(result, dict) and result.get("assistantMatch"):
+                log("[+] 网页对话 canary 已收到 assistant 精确回复")
+                return True, "ok"
+            sleep_with_cancel(1.5, cancel_callback)
+        return False, "网页对话 canary 等待 assistant 回复超时"
+    except Exception as exc:
+        return False, f"browser_chat_canary 异常: {exc}"
+
+
+def enable_nsfw_for_token(
+    token,
+    cf_clearance="",
+    log_callback=None,
+    tos_already_accepted=False,
+    birth_already_set=False,
+):
     proxies = get_proxies()
     user_agent = get_user_agent()
     try:
@@ -1582,12 +1878,14 @@ def enable_nsfw_for_token(token, cf_clearance="", log_callback=None):
                     "cookie": "; ".join(cookie_parts),
                 }
             )
-            ok, message = set_tos_accepted(session, log_callback)
-            if not ok:
-                return False, message
-            ok, message = set_birth_date(session, log_callback)
-            if not ok:
-                return False, message
+            if not tos_already_accepted:
+                ok, message = set_tos_accepted(session, log_callback)
+                if not ok:
+                    return False, message
+            if not birth_already_set:
+                ok, message = set_birth_date(session, log_callback)
+                if not ok:
+                    return False, message
             ok, message = update_nsfw_settings(session, log_callback)
             if not ok:
                 return False, message
@@ -1683,6 +1981,11 @@ class BrowserSession:
                         pass
                 self._apply_bandwidth_rules()
                 self._apply_stealth_patch()
+                if config.get("hide_window", False):
+                    for _ in range(5):
+                        if _hide_chrome_session_windows(self._pid, self._port):
+                            break
+                        time.sleep(0.2)
                 if attempt > 1:
                     self._log(f"[Debug] 浏览器第 {attempt} 次启动成功")
                 return self.browser, self.page
@@ -2853,7 +3156,7 @@ def register_one(session, shared, worker_id, slot_no):
         raise Exception("验证码阶段失败，已达到最大重试次数")
     profile = fill_profile_and_submit(session, log_callback=log, cancel_callback=cancel)
     sso = wait_for_sso_cookie(session, log_callback=log, cancel_callback=cancel)
-    # TOS 是辅助激活信号；最终账号可用性由 OAuth 后的客户端 preprobe 判定。
+    # TOS、生日和网页对话均为硬门禁；OAuth 后的客户端 preprobe 是最终可用性门禁。
     api_ok, api_msg = accept_tos_for_token(sso, log_callback=log, max_attempts=4, retry_delay=2.0)
     browser_ok, browser_msg = browser_activate_chat_permission(
         session, sso, log_callback=log, cancel_callback=cancel, timeout=90
@@ -2864,15 +3167,39 @@ def register_one(session, shared, worker_id, slot_no):
         browser_ok, browser_msg = browser_activate_chat_permission(
             session, sso, log_callback=log, cancel_callback=cancel, timeout=60
         )
+    if not browser_ok:
+        raise RuntimeError(
+            f"TOS 门禁未通过，账号不可用: browser={browser_msg}; api={api_msg}"
+        )
+    birth_ok, birth_msg = browser_set_birth_date(
+        session,
+        log_callback=log,
+        cancel_callback=cancel,
+        attempts=3,
+        retry_delay=2.0,
+    )
+    if not birth_ok:
+        raise RuntimeError(f"出生日期设置未通过，账号不可用: {birth_msg}")
+    chat_ok, chat_msg = browser_chat_canary(
+        session,
+        log_callback=log,
+        cancel_callback=cancel,
+        timeout=60,
+    )
+    if not chat_ok:
+        raise RuntimeError(f"网页对话验证未通过，账号不可用: {chat_msg}")
     if api_ok and browser_ok:
         log(f"[+] API TOS + 浏览器已离开 tos-gate: {browser_msg}")
     elif browser_ok:
         log(f"[+] 浏览器已离开 tos-gate（API TOS 未确认: {api_msg}）")
-    else:
-        log(f"[!] TOS 激活未确认，继续由客户端 preprobe 做最终门禁: browser={browser_msg}; api={api_msg}")
     if config.get("enable_nsfw", True):
-        # NSFW / birth 为增强项；TOS 已强制成功，这里失败不阻断注册
-        nsfw_ok, nsfw_msg = enable_nsfw_for_token(sso, log_callback=log)
+        # NSFW 为增强项；TOS 和 birth 已强制成功，这里失败不阻断注册。
+        nsfw_ok, nsfw_msg = enable_nsfw_for_token(
+            sso,
+            log_callback=log,
+            tos_already_accepted=browser_ok,
+            birth_already_set=birth_ok,
+        )
         if not nsfw_ok and log:
             log(f"[!] NSFW/birth 未完全成功（TOS 已通过，继续）: {nsfw_msg}")
     password = profile.get("password", "")
@@ -2957,7 +3284,7 @@ def run_registration_concurrent(count, concurrency):
         os.path.dirname(__file__),
         f"accounts_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
     )
-    max_concurrency = max(1, int(config.get("max_concurrency", 2) or 2))
+    max_concurrency = max(1, int(config.get("max_concurrency", 1) or 1))
     concurrency = max(1, min(concurrency, count, max_concurrency))
     shared = SharedState(count, accounts_output_file)
     cli_log(f"[*] 开始并发注册，目标 {count} 个，并发 {concurrency} 个浏览器")

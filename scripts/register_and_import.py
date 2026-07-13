@@ -787,7 +787,7 @@ def run_postimport_group_probe(config: dict[str, str], timeout: float = 60.0) ->
         data=json.dumps({
             "model": "grok-4.5",
             "input": "Reply exactly: IMPORT_OK",
-            "max_output_tokens": 16,
+            "max_output_tokens": 64,
             "store": False,
         }).encode("utf-8"),
         headers={

@@ -10,7 +10,10 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import requests as std_requests
+from curl_cffi.const import CurlECode
 from curl_cffi import requests as crequests
+from curl_cffi.requests.exceptions import RequestException as CurlRequestException
 
 from .proxyutil import resolve_proxy
 
@@ -37,18 +40,34 @@ def _post_form(
 ) -> tuple[int, dict[str, Any] | str]:
     resolved_proxy = resolve_proxy(proxy)
     proxies = {"http": resolved_proxy, "https": resolved_proxy} if resolved_proxy else None
-    response = crequests.post(
-        url,
-        data=form,
-        headers={
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Accept": "application/json",
-            "User-Agent": "grok-reg-oidc-minter/1.0",
-        },
-        timeout=timeout,
-        proxies=proxies,
-        impersonate="chrome",
-    )
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+        "User-Agent": "grok-reg-oidc-minter/1.0",
+    }
+    try:
+        response = crequests.post(
+            url,
+            data=form,
+            headers=headers,
+            timeout=timeout,
+            proxies=proxies,
+            impersonate="chrome",
+        )
+    except CurlRequestException as exc:
+        if exc.code != CurlECode.SSL_CONNECT_ERROR:
+            raise
+        # curl_cffi intermittently fails TLS handshakes under Windows concurrency.
+        # Keep the same proxy and certificate verification while changing transport.
+        with std_requests.Session() as session:
+            session.trust_env = False
+            response = session.post(
+                url,
+                data=form,
+                headers=headers,
+                timeout=timeout,
+                proxies=proxies,
+            )
     try:
         return int(response.status_code), response.json()
     except (json.JSONDecodeError, ValueError):

@@ -62,7 +62,7 @@ def probe_auth(auth: dict[str, Any], *, proxy: str = "", timeout: float = 45) ->
             json={
                 "model": "grok-4.5",
                 "input": f"Reply exactly: {marker}",
-                "max_output_tokens": 16,
+                "max_output_tokens": 64,
                 "store": False,
                 "stream": False,
             },

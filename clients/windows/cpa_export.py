@@ -72,7 +72,6 @@ def _run_preprobe(
         "INVALID_RESPONSE",
         "INCOMPLETE_RESPONSE",
         "UPSTREAM_ERROR",
-        "PERMISSION_DENIED",
     }
     probe: dict = {}
     for attempt in range(1, attempts + 1):
