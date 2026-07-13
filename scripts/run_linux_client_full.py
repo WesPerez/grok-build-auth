@@ -167,6 +167,8 @@ def build_config(
     route_dir: Path,
     attempts: int,
     target: int,
+    email_provider: str = "cloudflare",
+    duckmail_domain: str = "",
 ) -> dict[str, Any]:
     return {
         "client_root": str(client_root),
@@ -178,7 +180,8 @@ def build_config(
         "cloudflare_path_accounts": "/admin/new_address",
         "cloudflare_path_token": "/api/token",
         "cloudflare_path_messages": "/api/mails",
-        "email_provider": "cloudflare",
+        "email_provider": email_provider,
+        "duckmail_domain": duckmail_domain,
         "defaultDomains": domain,
         "proxy": proxy,
         "register_count": attempts,
@@ -226,6 +229,10 @@ def main() -> int:
     parser.add_argument("--attempts-per-route", type=int, default=200)
     parser.add_argument("--proxy-ref", action="append", dest="proxy_refs")
     parser.add_argument("--proxy-url", action="append", dest="proxy_urls")
+    parser.add_argument(
+        "--email-provider", choices=("cloudflare", "duckmail"), default="cloudflare"
+    )
+    parser.add_argument("--duckmail-domain", default="")
     parser.add_argument("--run-id")
     parser.add_argument("--reprobe-interval", type=int, default=300)
     args = parser.parse_args()
@@ -307,6 +314,8 @@ def main() -> int:
             route_dir=route_dir,
             attempts=args.attempts_per_route,
             target=target,
+            email_provider=args.email_provider,
+            duckmail_domain=args.duckmail_domain,
         )
         write_private_json(config_path, config)
         preflight_result = subprocess.run(

@@ -272,6 +272,8 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     runner_source = (SCRIPTS / "run_linux_client_full.py").read_text(encoding="utf-8")
     assert 'parser.add_argument("--proxy-url"' in runner_source
     assert "use either --proxy-ref or --proxy-url" in runner_source
+    assert '"--email-provider"' in runner_source
+    assert '"duckmail_domain": duckmail_domain' in runner_source
     assert config["client_root"] == str(CLIENT)
     assert config["max_concurrency"] == 1
     assert config["hide_window"] is False

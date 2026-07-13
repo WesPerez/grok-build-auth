@@ -887,6 +887,20 @@ def pick_domain(api_key=None):
     domains = get_domains(api_key=api_key)
     if not domains:
         raise Exception("DuckMail 娌℃湁杩斿洖浠讳綍鍙敤鍩熷悕")
+    preferred = str(config.get("duckmail_domain") or "").strip().lower()
+    if preferred:
+        match = next(
+            (
+                item
+                for item in domains
+                if str(item.get("domain") or "").strip().lower() == preferred
+                and item.get("isVerified")
+            ),
+            None,
+        )
+        if not match:
+            raise Exception(f"DuckMail 指定域名不可用: {preferred}")
+        return match["domain"]
     private = [d for d in domains if d.get("ownerId")]
     verified_private = [d for d in private if d.get("isVerified")]
     if verified_private:
