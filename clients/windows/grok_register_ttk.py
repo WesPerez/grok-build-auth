@@ -2164,11 +2164,16 @@ def _native_click_matching(page, selector, phrases):
         )
         if score > 0:
             ranked.append((score, -len(text), element, text))
-    if not ranked:
-        return ""
-    _, _, element, text = max(ranked, key=lambda item: (item[0], item[1]))
-    element.click(by_js=False, timeout=2.0)
-    return text
+    for _, _, element, text in sorted(
+        ranked, key=lambda item: (item[0], item[1]), reverse=True
+    ):
+        try:
+            element.scroll.to_see()
+            element.click(by_js=False, timeout=2.0)
+            return text
+        except Exception:
+            continue
+    return ""
 
 
 def _native_find_input(page, selector):
