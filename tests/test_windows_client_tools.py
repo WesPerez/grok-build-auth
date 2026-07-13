@@ -181,14 +181,20 @@ def test_windows_main_has_no_global_process_kill():
     source = (CLIENT / "grok_register_ttk.py").read_text(encoding="utf-8-sig")
     cleanup = source.split("def cleanup_stray_chrome", 1)[1].split("def create_browser_options", 1)[0]
     chat_canary = source.split("def browser_chat_canary", 1)[1].split("def enable_nsfw_for_token", 1)[0]
+    browser_gate = source.split("def browser_activate_chat_permission", 1)[1].split("def browser_set_birth_date", 1)[0]
     assert "process_iter" not in cleanup
     assert "googleupdate.exe" not in cleanup.lower()
     assert "export_result = export_cpa_after_register" in source
     assert 'response.get("probe") != "passed"' in source
     assert "surface_deadline" in chat_canary
+    assert "editor_deadline" in chat_canary
+    assert "has_chat_editor" in browser_gate
+    assert "chat_ready_stable" in browser_gate
     assert 'result.get("assistantMatch")' in chat_canary
     assert 'result.get("occurrences")' not in chat_canary
     assert "网页对话首次提交返回 PERMISSION_DENIED/403" in chat_canary
+    assert "for chat_attempt in range(1, 4)" in source
+    assert "网页对话前门禁回退" in source
 
 
 def test_windows_example_defaults_to_single_hidden_worker():

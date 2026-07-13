@@ -1518,6 +1518,24 @@ return {
                 return True
         return False
 
+    def has_chat_editor():
+        try:
+            return bool(
+                page.run_js(
+                    r"""
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+return Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).some(visible);
+"""
+                )
+            )
+        except Exception:
+            return False
+
     def chat_ready(url, body=""):
         low = str(url or "").lower()
         b = str(body or "").lower()
@@ -1530,7 +1548,13 @@ return {
             return False
         if "服务条款" in b and ("接受" in b or "同意" in b):
             return False
-        return has_sso_cookie()
+        return has_sso_cookie() and has_chat_editor()
+
+    def chat_ready_stable(url, body=""):
+        if not chat_ready(url, body):
+            return False
+        sleep_with_cancel(1.5, cancel_callback)
+        return chat_ready(current_url(), page_body())
 
     def hard_click_pass_gate(stage):
         nonlocal last_detail, page
@@ -1590,7 +1614,7 @@ return {
                 raise_if_cancelled(cancel_callback)
                 url = current_url()
                 body = page_body()
-                if chat_ready(url, body):
+                if chat_ready_stable(url, body):
                     log(f"[+] 浏览器已离开 TOS 门禁: {url[:140]}")
                     return True, f"browser left gate: {url[:140]}"
                 if is_gate_url(url) or ("accept" in body.lower() and "term" in body.lower()) or ("同意" in body) or ("接受" in body):
@@ -1598,7 +1622,7 @@ return {
                     sleep_with_cancel(1.4, cancel_callback)
                     url2 = current_url()
                     body2 = page_body()
-                    if chat_ready(url2, body2):
+                    if chat_ready_stable(url2, body2):
                         log(f"[+] 浏览器点击后离开 TOS 门禁: {url2[:140]}")
                         return True, f"browser left gate after click: {url2[:140]}"
                 else:
@@ -1607,7 +1631,7 @@ return {
                     sleep_with_cancel(1.2, cancel_callback)
                     url2 = current_url()
                     body2 = page_body()
-                    if chat_ready(url2, body2):
+                    if chat_ready_stable(url2, body2):
                         log(f"[+] 浏览器页面激活完成: {url2[:140]}")
                         return True, f"browser ready: {url2[:140]}"
                     # if redirected to gate, keep looping
@@ -1621,7 +1645,7 @@ return {
         # final check
         url = current_url()
         body = page_body()
-        if chat_ready(url, body):
+        if chat_ready_stable(url, body):
             log(f"[+] 浏览器 TOS/chat 激活完成: {url[:140]}")
             return True, f"browser ok: {url[:140]}"
         return False, f"仍未离开 TOS 门禁, last_url={url[:160]}, detail={last_detail[:160]}, body={body[:100]}"
@@ -1778,12 +1802,14 @@ return {filled: true, url: location.href};
             )
             if isinstance(editor_result, dict) and editor_result.get("filled"):
                 break
-            current_url = str((editor_result or {}).get("url") or getattr(page, "url", ""))
+            editor_detail = editor_result if isinstance(editor_result, dict) else {}
+            current_url = str(editor_detail.get("url") or getattr(page, "url", ""))
             if "tos-gate" in current_url or "/login" in current_url:
                 return False, f"网页对话填写时被门禁阻断: {current_url[:160]}"
             sleep_with_cancel(0.5, cancel_callback)
         else:
-            return False, f"网页对话填写失败: {(editor_result or {}).get('reason', 'unknown')}"
+            editor_detail = editor_result if isinstance(editor_result, dict) else {}
+            return False, f"网页对话填写失败: {editor_detail.get('reason', 'unknown')}"
         send_deadline = time.time() + 10
         send_result = {}
         while time.time() < send_deadline:
@@ -3227,12 +3253,38 @@ def register_one(session, shared, worker_id, slot_no):
     )
     if not birth_ok:
         raise RuntimeError(f"出生日期设置未通过，账号不可用: {birth_msg}")
-    chat_ok, chat_msg = browser_chat_canary(
-        session,
-        log_callback=log,
-        cancel_callback=cancel,
-        timeout=60,
-    )
+    chat_ok = False
+    chat_msg = "网页对话验证未执行"
+    for chat_attempt in range(1, 4):
+        chat_ok, chat_msg = browser_chat_canary(
+            session,
+            log_callback=log,
+            cancel_callback=cancel,
+            timeout=60,
+        )
+        if chat_ok:
+            break
+        if chat_attempt >= 3 or not any(
+            marker in str(chat_msg) for marker in ("tos-gate", "门禁阻断")
+        ):
+            break
+        log(f"[!] 网页对话前门禁回退，重新激活后重试 {chat_attempt}/2: {chat_msg}")
+        browser_ok, browser_msg = browser_activate_chat_permission(
+            session, sso, log_callback=log, cancel_callback=cancel, timeout=60
+        )
+        if not browser_ok:
+            chat_msg = f"重新激活 TOS 门禁失败: {browser_msg}"
+            break
+        birth_ok, birth_msg = browser_set_birth_date(
+            session,
+            log_callback=log,
+            cancel_callback=cancel,
+            attempts=2,
+            retry_delay=1.0,
+        )
+        if not birth_ok:
+            chat_msg = f"重新激活后出生日期设置失败: {birth_msg}"
+            break
     if not chat_ok:
         raise RuntimeError(f"网页对话验证未通过，账号不可用: {chat_msg}")
     if api_ok and browser_ok:
