@@ -1901,7 +1901,11 @@ const assistantSelectors = [
   '[data-testid*="assistant"]',
 ];
 const assistantMatch = assistantSelectors.some((selector) =>
-  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').trim() === marker)
+  Array.from(document.querySelectorAll(selector)).some((node) => {
+    const text = (node.innerText || '').trim();
+    const numbers = text.match(/\d+/g) || [];
+    return text.length <= 80 && numbers.length === 1 && numbers[0] === marker;
+  })
 );
 const body = document.body && document.body.innerText || '';
 return {
