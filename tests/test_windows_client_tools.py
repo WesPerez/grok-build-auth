@@ -192,6 +192,8 @@ def test_windows_main_has_no_global_process_kill():
     assert "What is {left} + {right}?" in chat_canary
     assert "WEB_CANARY_" not in chat_canary
     assert "numbers.length === 1" in chat_canary
+    assert "native_registration_interactions" in source
+    assert "_native_type" in source
     assert "has_chat_editor" in browser_gate
     assert "chat_ready_stable" in browser_gate
     assert 'result.get("assistantMatch")' in chat_canary
@@ -269,6 +271,7 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     )
     assert config["target_successes"] == 3
     assert config["stealth_patch"] is True
+    assert config["native_registration_interactions"] is True
     runner_source = (SCRIPTS / "run_linux_client_full.py").read_text(encoding="utf-8")
     assert 'parser.add_argument("--proxy-url"' in runner_source
     assert "use either --proxy-ref or --proxy-url" in runner_source

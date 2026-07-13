@@ -194,6 +194,7 @@ def build_config(
         "hide_window": False,
         "block_media_fonts": False,
         "stealth_patch": True,
+        "native_registration_interactions": True,
         "cpa_export_enabled": True,
         "cpa_auth_dir": str(route_dir / "cpa_auths"),
         "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",

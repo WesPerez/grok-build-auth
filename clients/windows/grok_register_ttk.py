@@ -75,6 +75,8 @@ DEFAULT_CONFIG = {
     "block_media_fonts": False,  # 网络层拦截图片/字体/媒体省带宽（省带宽主力，不影响验证）
     "hide_window": True,         # 使用 SW_HIDE 隐藏任务浏览器，不抢占前台
     "stealth_patch": False,      # 内联 turnstilePatch 全局注入
+    "native_registration_interactions": False,
+    "duckmail_domain": "",
 }
 
 config = DEFAULT_CONFIG.copy()
@@ -2118,6 +2120,72 @@ class BrowserSession:
         return self.page
 
 
+def _native_visible_elements(page, selector, writable=False):
+    try:
+        result = []
+        for element in page.eles(f"css:{selector}", timeout=0.5):
+            try:
+                if element.states.is_displayed and element.states.is_enabled:
+                    if writable and (
+                        element.attr("readonly") is not None
+                        or element.attr("disabled") is not None
+                    ):
+                        continue
+                    result.append(element)
+            except Exception:
+                continue
+        return result
+    except Exception:
+        return []
+
+
+def _native_element_text(element):
+    parts = []
+    try:
+        parts.append(str(element.text or ""))
+    except Exception:
+        pass
+    for name in ("aria-label", "title", "value", "data-testid", "name", "placeholder"):
+        try:
+            parts.append(str(element.attr(name) or ""))
+        except Exception:
+            pass
+    return " ".join(parts).strip()
+
+
+def _native_click_matching(page, selector, phrases):
+    ranked = []
+    for element in _native_visible_elements(page, selector):
+        text = _native_element_text(element)
+        compact = re.sub(r"\s+", "", text).lower()
+        score = max(
+            (weight for phrase, weight in phrases if phrase in compact),
+            default=0,
+        )
+        if score > 0:
+            ranked.append((score, -len(text), element, text))
+    if not ranked:
+        return ""
+    _, _, element, text = max(ranked, key=lambda item: (item[0], item[1]))
+    element.click(by_js=False, timeout=2.0)
+    return text
+
+
+def _native_find_input(page, selector):
+    elements = _native_visible_elements(page, selector, writable=True)
+    return elements[0] if elements else None
+
+
+def _native_type(page, element, value):
+    element.clear(by_js=False)
+    element.focus()
+    page.actions.type(str(value), interval=random.uniform(0.035, 0.075))
+    sleep_with_cancel(random.uniform(0.25, 0.55))
+    actual = str(element.property("value") or element.attr("value") or "")
+    if actual.strip() != str(value).strip():
+        raise RuntimeError("native input value mismatch")
+
+
 def click_email_signup_button(session, timeout=10, log_callback=None, cancel_callback=None):
     page = session.page
     deadline = time.time() + timeout
@@ -2125,6 +2193,24 @@ def click_email_signup_button(session, timeout=10, log_callback=None, cancel_cal
         raise_if_cancelled(cancel_callback)
         if log_callback:
             log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
+
+        if config.get("native_registration_interactions", False):
+            clicked = _native_click_matching(
+                page,
+                'button,a,[role="button"]',
+                (
+                    ("使用邮箱注册", 100),
+                    ("signupwithemail", 95),
+                    ("continuewithemail", 90),
+                ),
+            )
+            if clicked:
+                if log_callback:
+                    log_callback(f"[Debug] 已原生点击「使用邮箱注册」按钮: {clicked}")
+                sleep_with_cancel(2, cancel_callback)
+                return True
+            sleep_with_cancel(0.5, cancel_callback)
+            continue
 
         clicked = page.run_js(r"""
 function isVisible(node) {
@@ -2242,6 +2328,74 @@ def fill_email_and_submit(session, timeout=45, log_callback=None, cancel_callbac
         raise Exception("获取邮箱失败")
     if log_callback:
         log_callback(f"[Debug] 已创建邮箱: {email}")
+    if config.get("native_registration_interactions", False):
+        deadline = time.time() + timeout
+        last_reclick = 0.0
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            email_input = _native_find_input(
+                page,
+                'input[data-testid="email"],input[name="email"],input[type="email"],input[autocomplete="email"],input[placeholder*="mail" i],input[aria-label*="mail" i]',
+            )
+            if not email_input:
+                if time.time() - last_reclick >= 3:
+                    try:
+                        click_email_signup_button(
+                            session,
+                            timeout=2,
+                            log_callback=log_callback,
+                            cancel_callback=cancel_callback,
+                        )
+                    except Exception:
+                        pass
+                    last_reclick = time.time()
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
+            _native_type(page, email_input, email)
+            submit_methods = ("enter", "button")
+            for method in submit_methods:
+                if method == "enter":
+                    email_input.input("\n", by_js=False)
+                    clicked = "enter"
+                else:
+                    clicked = _native_click_matching(
+                        page,
+                        'button[type="submit"],button,[role="button"],input[type="submit"]',
+                        (
+                            ("注册", 100),
+                            ("signup", 95),
+                            ("continue", 90),
+                            ("继续", 90),
+                            ("next", 80),
+                            ("下一步", 80),
+                            ("确认", 70),
+                            ("submit", 60),
+                        ),
+                    )
+                    if not clicked:
+                        continue
+                transition_deadline = min(deadline, time.time() + 5)
+                while time.time() < transition_deadline:
+                    raise_if_cancelled(cancel_callback)
+                    still_email = _native_find_input(
+                        page,
+                        'input[data-testid="email"],input[name="email"],input[type="email"],input[autocomplete="email"]',
+                    )
+                    otp_ready = bool(
+                        _native_find_input(
+                            page,
+                            'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"]',
+                        )
+                    )
+                    if otp_ready or not still_email:
+                        if log_callback:
+                            log_callback(
+                                f"[Debug] 已原生填写邮箱并提交，页面已迁移: {clicked}"
+                            )
+                        return email, dev_token
+                    sleep_with_cancel(0.35, cancel_callback)
+            sleep_with_cancel(0.5, cancel_callback)
+        raise Exception("未找到邮箱输入框或注册按钮")
     deadline = time.time() + timeout
     last_diag_time = 0
     last_reclick_time = 0
@@ -2499,6 +2653,14 @@ def fill_code_and_submit(session, email, dev_token, timeout=180, log_callback=No
     page = session.page
 
     def _resend_code():
+        if config.get("native_registration_interactions", False):
+            return bool(
+                _native_click_matching(
+                    page,
+                    'button,a,[role="button"]',
+                    (("重新发送", 100), ("resend", 95), ("再次发送", 90)),
+                )
+            )
         page.run_js(
             r"""
 const nodes = Array.from(document.querySelectorAll('button, a, [role="button"]'));
@@ -2520,8 +2682,79 @@ return false;
     )
     if not code:
         raise Exception("获取验证码失败")
-    clean_code = str(code).replace("-", "").strip()
+    clean_code = re.sub(r"[\s-]+", "", str(code)).upper()
+    if not re.fullmatch(r"[A-Z0-9]{6}", clean_code):
+        raise Exception("验证码格式无效，预期为 6 位字母数字")
     deadline = time.time() + timeout
+
+    if config.get("native_registration_interactions", False):
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            candidates = _native_visible_elements(
+                page,
+                'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],input[inputmode="numeric"]',
+                writable=True,
+            )
+            aggregate = None
+            for candidate in candidates:
+                try:
+                    max_length = int(candidate.attr("maxlength") or 0)
+                except (TypeError, ValueError):
+                    max_length = 0
+                if max_length != 1:
+                    aggregate = candidate
+                    break
+            if aggregate:
+                _native_type(page, aggregate, clean_code)
+            else:
+                boxes = []
+                for candidate in _native_visible_elements(
+                    page, 'form input[maxlength="1"]', writable=True
+                ):
+                    try:
+                        max_length = int(candidate.attr("maxlength") or 0)
+                    except (TypeError, ValueError):
+                        max_length = 0
+                    if max_length == 1:
+                        boxes.append(candidate)
+                if len(boxes) < len(clean_code):
+                    sleep_with_cancel(0.5, cancel_callback)
+                    continue
+                for box, character in zip(boxes, clean_code):
+                    _native_type(page, box, character)
+            clicked = _native_click_matching(
+                page,
+                'button[type="submit"],button,[role="button"]',
+                (
+                    ("确认邮箱", 100),
+                    ("confirm", 95),
+                    ("continue", 90),
+                    ("继续", 90),
+                    ("next", 80),
+                    ("下一步", 80),
+                ),
+            )
+            if log_callback:
+                log_callback(
+                    f"[Debug] 已原生填写验证码并提交: {clicked or 'auto-submit'}"
+                )
+            transition_deadline = min(deadline, time.time() + 10)
+            while time.time() < transition_deadline:
+                raise_if_cancelled(cancel_callback)
+                if _native_find_input(
+                    page,
+                    'input[data-testid="password"],input[name="password"],input[type="password"],input[autocomplete="new-password"]',
+                ):
+                    return code
+                otp_remaining = _native_visible_elements(
+                    page,
+                    'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],form input[maxlength="1"]',
+                    writable=True,
+                )
+                if not otp_remaining:
+                    return code
+                sleep_with_cancel(0.4, cancel_callback)
+        raise Exception("验证码已获取，但原生填写/提交失败")
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2639,17 +2872,18 @@ return 'clicked';
     raise Exception("验证码已获取，但自动填写/提交失败")
 
 
-def getTurnstileToken(session, log_callback=None, cancel_callback=None):
+def getTurnstileToken(session, log_callback=None, cancel_callback=None, reset=True):
     page = session.page
     if page is None:
         raise Exception("页面未就绪，无法执行 Turnstile")
 
-    try:
-        page.run_js(
-            "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
-        )
-    except Exception:
-        pass
+    if reset:
+        try:
+            page.run_js(
+                "try { if (window.turnstile && typeof turnstile.reset === 'function') turnstile.reset(); } catch(e) {}"
+            )
+        except Exception:
+            pass
 
     for _ in range(0, 20):
         raise_if_cancelled(cancel_callback)
@@ -2748,6 +2982,84 @@ def fill_profile_and_submit(session, timeout=120, log_callback=None, cancel_call
     page = session.page
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
+    if config.get("native_registration_interactions", False):
+        given_input = family_input = password_input = None
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            given_input = _native_find_input(
+                page,
+                'input[data-testid="givenName"],input[name="givenName"],input[autocomplete="given-name"],input[aria-label*="名"]',
+            )
+            family_input = _native_find_input(
+                page,
+                'input[data-testid="familyName"],input[name="familyName"],input[autocomplete="family-name"],input[aria-label*="姓"]',
+            )
+            password_input = _native_find_input(
+                page,
+                'input[data-testid="password"],input[name="password"],input[type="password"],input[autocomplete="new-password"]',
+            )
+            if given_input and family_input and password_input:
+                break
+            sleep_with_cancel(0.5, cancel_callback)
+        if not (given_input and family_input and password_input):
+            raise Exception("最终注册页资料输入框未就绪")
+        _native_type(page, given_input, given_name)
+        _native_type(page, family_input, family_name)
+        _native_type(page, password_input, password)
+        turnstile_retry_at = time.time() + 15
+        turnstile_attempted = False
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            state = page.run_js(
+                r"""
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const present = Boolean(cfInput)
+  || Boolean(document.querySelector('iframe[src*="turnstile"],div.cf-turnstile,[data-sitekey]'));
+const tokenLength = String((cfInput && cfInput.value) || '').trim().length;
+return {present, tokenLength, ready: !present || tokenLength >= 80};
+"""
+            )
+            if isinstance(state, dict) and state.get("ready"):
+                clicked = _native_click_matching(
+                    page,
+                    'button[type="submit"],button,[role="button"],input[type="submit"]',
+                    (
+                        ("完成注册", 100),
+                        ("创建账户", 100),
+                        ("createaccount", 95),
+                        ("signup", 90),
+                    ),
+                )
+                if clicked:
+                    if log_callback:
+                        log_callback(f"[Debug] 已原生填写注册资料并提交: {clicked}")
+                    transition_deadline = min(deadline, time.time() + 15)
+                    while time.time() < transition_deadline:
+                        raise_if_cancelled(cancel_callback)
+                        if not _native_find_input(
+                            page,
+                            'input[data-testid="password"],input[name="password"],input[type="password"],input[autocomplete="new-password"]',
+                        ):
+                            return {
+                                "given_name": given_name,
+                                "family_name": family_name,
+                                "password": password,
+                            }
+                        sleep_with_cancel(0.4, cancel_callback)
+            if not turnstile_attempted and time.time() >= turnstile_retry_at:
+                try:
+                    getTurnstileToken(
+                        session,
+                        log_callback=log_callback,
+                        cancel_callback=cancel_callback,
+                        reset=False,
+                    )
+                except Exception as exc:
+                    if log_callback:
+                        log_callback(f"[Debug] 原生资料页 Turnstile 重试失败: {exc}")
+                turnstile_attempted = True
+            sleep_with_cancel(0.8, cancel_callback)
+        raise Exception("最终注册页原生资料填写/提交失败")
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
@@ -2990,6 +3302,22 @@ def wait_for_sso_cookie(session, timeout=120, log_callback=None, cancel_callback
     final_no_submit_since = None
     final_no_submit_timeout = 25
 
+    def read_sso_cookie():
+        cookies = page.cookies(all_domains=True, all_info=True) or []
+        values = {}
+        for item in cookies:
+            if isinstance(item, dict):
+                name = str(item.get("name", "")).strip()
+                value = str(item.get("value", "")).strip()
+            else:
+                name = str(getattr(item, "name", "")).strip()
+                value = str(getattr(item, "value", "")).strip()
+            if name:
+                last_seen_names.add(name)
+            if name in ("sso", "sso-rw") and value:
+                values[name] = value
+        return values.get("sso") or values.get("sso-rw") or ""
+
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
         try:
@@ -2999,10 +3327,50 @@ def wait_for_sso_cookie(session, timeout=120, log_callback=None, cancel_callback
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
+            token = read_sso_cookie()
+            if token:
+                if log_callback:
+                    log_callback("[Debug] 已获取到 sso cookie")
+                return token
+
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             now = time.time()
             if now - last_submit_retry >= 2.5:
-                retried = page.run_js(
+                if config.get("native_registration_interactions", False):
+                    native_state = page.run_js(
+                        r"""
+const text = (document.body && document.body.innerText || '').replace(/\s+/g, '').toLowerCase();
+const finalPage = text.includes('完成注册') || text.includes('completeyoursignup') || text.includes('completesignup');
+if (!finalPage) return {state: 'not-final-page'};
+const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+const present = Boolean(cfInput)
+  || Boolean(document.querySelector('iframe[src*="turnstile"],div.cf-turnstile,[data-sitekey],script[src*="turnstile"]'));
+const tokenLength = String((cfInput && cfInput.value) || '').trim().length;
+return {state: (!present || tokenLength >= 80) ? 'ready' : 'wait-cf', tokenLength};
+"""
+                    )
+                    if isinstance(native_state, dict) and native_state.get("state") == "ready":
+                        clicked = _native_click_matching(
+                            page,
+                            'button[type="submit"],button,[role="button"],input[type="submit"]',
+                            (
+                                ("完成注册", 100),
+                                ("创建账户", 100),
+                                ("createaccount", 95),
+                                ("signup", 90),
+                            ),
+                        )
+                        retried = (
+                            "final-page-clicked-submit"
+                            if clicked
+                            else "final-page-no-submit"
+                        )
+                    elif isinstance(native_state, dict) and native_state.get("state") == "wait-cf":
+                        retried = f"final-page-wait-cf:{native_state.get('tokenLength', 0)}"
+                    else:
+                        retried = "not-final-page"
+                else:
+                    retried = page.run_js(
                     r"""
 function isVisible(node) {
     if (!node) return false;
@@ -3051,7 +3419,7 @@ submitBtn.focus();
 submitBtn.click();
 return 'final-page-clicked-submit';
                     """
-                )
+                    )
                 last_submit_retry = now
                 if log_callback and (retried == "final-page-clicked-submit" or (isinstance(retried, str) and retried.startswith("final-page-no-submit"))):
                     log_callback(f"[Debug] 最终页状态: {retried}")
@@ -3108,7 +3476,7 @@ return String(cfInput.value || '').trim().length;
                 if name:
                     last_seen_names.add(name)
 
-                if name == "sso" and value:
+                if name in ("sso", "sso-rw") and value:
                     if log_callback:
                         log_callback("[Debug] 已获取到 sso cookie")
                     return value
