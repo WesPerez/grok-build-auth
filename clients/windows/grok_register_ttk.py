@@ -2689,7 +2689,9 @@ return false;
     if not code:
         raise Exception("获取验证码失败")
     clean_code = re.sub(r"[\s-]+", "", str(code)).upper()
-    if not re.fullmatch(r"[A-Z0-9]{6}", clean_code):
+    if config.get("native_registration_interactions", False) and not re.fullmatch(
+        r"[A-Z0-9]{6}", clean_code
+    ):
         raise Exception("验证码格式无效，预期为 6 位字母数字")
     deadline = time.time() + timeout
 
