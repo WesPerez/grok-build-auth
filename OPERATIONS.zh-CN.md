@@ -311,7 +311,9 @@ jq '{status, imported_ids, preimport_auth_probes, exact_account_state, postimpor
 - 预探针通过数量等于实际导入 auth 数量
 - `imported_ids` 数量匹配
 - `exact_account_state` 通过平台、类型、状态、分组、base URL、凭据和代理检查
-- `postimport_account_probes.passed=true`，且每个导入账号都出现 SSE `test_complete success=true`
+- `postimport_account_probes.passed=true`；正常账号出现 SSE `test_complete success=true`，明确
+  402/429、`free-usage-exhausted` 或 rolling 24-hour quota 的账号记录为
+  `availability=usable_exhausted`、`code=RATE_LIMITED`，仍视为可用并保留
 - `postimport_group_probe.status=200`
 - postprobe 为 completed 且输出匹配
 

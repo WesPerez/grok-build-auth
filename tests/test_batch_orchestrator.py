@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -369,8 +370,89 @@ def test_postimport_account_probes_require_each_sse_completion(monkeypatch):
     result = MODULE.run_postimport_account_probes({"SUB2API_URL": "http://sub2api"}, [11, 12])
     assert result["tested"] == 2
     assert result["passed"] is False
+    assert result["usable_count"] == 1
+    assert result["usable_exhausted_count"] == 0
+    assert result["failed_count"] == 1
     assert result["results"][0]["completed"] is True
+    assert result["results"][0]["availability"] == "usable"
     assert result["results"][1]["error"] == "upstream failed"
+    assert result["results"][1]["availability"] == "unknown_error"
+
+
+def test_postimport_account_probes_accept_sse_quota_as_usable_exhausted(monkeypatch):
+    body = (
+        b'data: {"type":"error","error":"Grok Responses API returned 429: '
+        b'subscription:free-usage-exhausted rolling 24-hour limit"}\n\n'
+    )
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def read(self, limit):
+            return body
+
+    class Opener:
+        def open(self, request, timeout):
+            return Response()
+
+    monkeypatch.setattr(MODULE, "make_admin_token", lambda config: "admin-jwt")
+    monkeypatch.setattr(MODULE.urllib.request, "build_opener", lambda *handlers: Opener())
+    result = MODULE.run_postimport_account_probes({"SUB2API_URL": "http://sub2api"}, [101048])
+
+    assert result["passed"] is True
+    assert result["usable_count"] == 0
+    assert result["usable_exhausted_count"] == 1
+    assert result["failed_count"] == 0
+    assert result["results"][0]["availability"] == "usable_exhausted"
+    assert result["results"][0]["code"] == "RATE_LIMITED"
+
+
+@pytest.mark.parametrize("status", [402, 429])
+def test_postimport_account_probes_accept_outer_quota_status(monkeypatch, status):
+    class Opener:
+        def open(self, request, timeout):
+            raise MODULE.urllib.error.HTTPError(
+                request.full_url, status, "quota", {}, io.BytesIO(b'{"code":"quota exhausted"}'),
+            )
+
+    monkeypatch.setattr(MODULE, "make_admin_token", lambda config: "admin-jwt")
+    monkeypatch.setattr(MODULE.urllib.request, "build_opener", lambda *handlers: Opener())
+    result = MODULE.run_postimport_account_probes({"SUB2API_URL": "http://sub2api"}, [12])
+
+    assert result["passed"] is True
+    assert result["usable_exhausted_count"] == 1
+    assert result["results"][0]["status"] == status
+    assert result["results"][0]["code"] == "RATE_LIMITED"
+
+
+def test_record_manifest_backup_preserves_history_and_deduplicates(tmp_path):
+    manifest_path = tmp_path / "manifest.json"
+    manifest = {
+        "batch_id": "batch",
+        "backup_history": [{"path": "old.dump", "bytes": 1, "sha256": "old"}],
+    }
+    backup = {"path": "new.dump", "bytes": 2, "sha256": "new"}
+
+    MODULE.record_manifest_backup(
+        manifest, manifest_path, backup,
+        kind="pre_grok_reconcile", source="test",
+    )
+    MODULE.record_manifest_backup(
+        manifest, manifest_path, backup,
+        kind="pre_grok_reconcile", source="test",
+    )
+
+    saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert saved["backup"]["kind"] == "pre_grok_reconcile"
+    assert saved["backup"]["retention_status"] == "retain_until_batch_finalized"
+    assert saved["backup"]["deleted_at"] is None
+    assert [item["sha256"] for item in saved["backup_history"]] == ["new", "old"]
 
 
 def test_proxy_pool_is_direct_when_not_configured():

@@ -476,7 +476,45 @@ def backup_database(config: dict[str, str], backup_dir: Path) -> dict[str, Any]:
         path.unlink(missing_ok=True)
         raise BatchError("Sub2API backup failed before reconciliation")
     path.chmod(0o600)
-    return {"path": str(path), "bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    with path.open("rb") as handle:
+        verify = subprocess.run([
+            "docker", "exec", "-i", config["SUB2API_POSTGRES_CONTAINER"],
+            "pg_restore", "-l",
+        ], stdin=handle, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=False)
+    if verify.returncode != 0:
+        path.unlink(missing_ok=True)
+        raise BatchError("Sub2API backup failed pg_restore list verification")
+    return {
+        "path": str(path),
+        "bytes": path.stat().st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "pg_restore_list_verified": True,
+        "pg_restore_list_verified_at": utc_now(),
+    }
+
+
+def record_manifest_backup(
+    manifest: dict[str, Any], manifest_path: Path, backup: dict[str, Any],
+    *, kind: str, source: str,
+) -> None:
+    required = {"path", "bytes", "sha256"}
+    if not isinstance(backup, dict) or not required.issubset(backup):
+        raise BatchError("Sub2API backup metadata is incomplete")
+    record = dict(backup)
+    record.update({
+        "kind": kind,
+        "source": source,
+        "created_at": record.get("created_at") or utc_now(),
+        "retention_status": "retain_until_batch_finalized",
+        "deleted_at": None,
+    })
+    history = [
+        item for item in (manifest.get("backup_history") or [])
+        if isinstance(item, dict) and item.get("sha256") != record["sha256"]
+    ]
+    manifest["backup"] = record
+    manifest["backup_history"] = [record, *history]
+    atomic_json(manifest_path, manifest)
 
 
 def grok_group_id(config: dict[str, str]) -> int:
@@ -859,14 +897,50 @@ def run_postimport_account_probes(
                 completed = True
             if event.get("type") in {"error", "test_error"}:
                 error = str(event.get("error") or event.get("message") or "")[:300]
+        availability, code = classify_postimport_account_probe(status, raw, completed)
         results.append({
             "account_id": account_id,
             "status": status,
             "completed": completed,
             "error": error,
+            "availability": availability,
+            "code": code,
         })
-    passed = all(item["status"] == 200 and item["completed"] for item in results)
-    return {"tested": len(results), "passed": passed, "results": results}
+    usable_count = sum(item["availability"] == "usable" for item in results)
+    usable_exhausted_count = sum(item["availability"] == "usable_exhausted" for item in results)
+    failed_count = len(results) - usable_count - usable_exhausted_count
+    return {
+        "tested": len(results),
+        "passed": failed_count == 0,
+        "usable_count": usable_count,
+        "usable_exhausted_count": usable_exhausted_count,
+        "failed_count": failed_count,
+        "results": results,
+    }
+
+
+def classify_postimport_account_probe(status: int, body: str, completed: bool) -> tuple[str, str]:
+    if completed:
+        return "usable", "TEST_COMPLETED"
+    low = (body or "").lower()
+    if status in {402, 429} or any(value in low for value in (
+        "free-usage", "rolling 24", "resource_exhausted", "spending-limit",
+        "run out of credit", "quota exhausted", "resource has been exhausted",
+    )):
+        return "usable_exhausted", "RATE_LIMITED"
+    if any(value in low for value in (
+        "invalid_grant", "refresh token has been revoked", "grok_oauth_token_refresh_failed",
+    )):
+        return "token_invalid", "REFRESH_REVOKED"
+    if "permission-denied" in low or "access to the chat endpoint is denied" in low:
+        return "permission_denied", "PERMISSION_DENIED"
+    if status == 401 or "invalid credentials" in low:
+        return "transient_error", "TOKEN_REFRESH_REQUIRED"
+    if status == 403:
+        return "transient_error", "UPSTREAM_FORBIDDEN"
+    if status == 0 or status >= 500:
+        return "transient_error", f"HTTP_{status}"
+    return "unknown_error", f"HTTP_{status}"
 
 
 def main() -> int:
@@ -1280,6 +1354,17 @@ def main() -> int:
         backup = backup_database(config, batch_dir / "backup")
         import_payload = {"reconciled_existing": True, "backup": backup, "imported_ids": []}
 
+    backup = import_payload.get("backup")
+    if missing_auth_paths:
+        record_manifest_backup(
+            manifest, manifest_path, backup,
+            kind="pre_sub2api_import", source="sub2api_import_helper",
+        )
+    else:
+        record_manifest_backup(
+            manifest, manifest_path, backup,
+            kind="pre_grok_reconcile", source="register_and_import.backup_database",
+        )
     atomic_json(import_result_path, import_payload)
     resolved = resolve_existing_account_ids(config, auth_paths)
     if len(resolved) != len(auth_paths):
@@ -1347,7 +1432,6 @@ def main() -> int:
         "completed_at": utc_now(), "last_activity_at": utc_now(),
         "import_result": str(import_result_path),
         "imported_ids": all_ids,
-        "backup": import_payload.get("backup", {}),
         "exact_account_state": exact_state,
         "upstream_usability_probes": "preimport-passed; account-postimport-passed; group-postimport-passed",
     })
