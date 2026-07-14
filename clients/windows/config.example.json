@@ -21,6 +21,7 @@
   "hide_window": true,
   "block_media_fonts": false,
   "stealth_patch": false,
+  "server_client_mode": false,
   "native_registration_interactions": false,
   "cpa_export_enabled": true,
   "cpa_auth_dir": "./cpa_auths",

@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
     "block_media_fonts": False,  # 网络层拦截图片/字体/媒体省带宽（省带宽主力，不影响验证）
     "hide_window": True,         # 使用 SW_HIDE 隐藏任务浏览器，不抢占前台
     "stealth_patch": False,      # 内联 turnstilePatch 全局注入
+    "server_client_mode": False,
     "native_registration_interactions": False,
     "duckmail_domain": "",
 }
@@ -91,6 +92,18 @@ class RegistrationCancelled(Exception):
 
 class AccountRetryNeeded(Exception):
     pass
+
+
+def server_client_mode_enabled():
+    return sys.platform.startswith("linux") and bool(
+        config.get("server_client_mode", False)
+    )
+
+
+def native_registration_enabled():
+    return server_client_mode_enabled() and bool(
+        config.get("native_registration_interactions", False)
+    )
 
 
 def load_config():
@@ -1387,6 +1400,7 @@ def browser_activate_chat_permission(browser_session, sso_token, log_callback=No
 
     page = browser_session.page
     token = str(sso_token).strip()
+    server_mode = server_client_mode_enabled()
     last_detail = ""
 
     def current_url():
@@ -1410,14 +1424,15 @@ def browser_activate_chat_permission(browser_session, sso_token, log_callback=No
     def inject_sso_cookies():
         cookies = [
             {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso-rw", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
             {"name": "sso", "value": token, "domain": ".grok.com", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso-rw", "value": token, "domain": ".grok.com", "path": "/", "secure": True, "httpOnly": True},
             {"name": "sso", "value": token, "domain": "accounts.x.ai", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso-rw", "value": token, "domain": "accounts.x.ai", "path": "/", "secure": True, "httpOnly": True},
             {"name": "sso", "value": token, "domain": "grok.com", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso-rw", "value": token, "domain": "grok.com", "path": "/", "secure": True, "httpOnly": True},
         ]
+        if server_mode:
+            cookies.extend(
+                {"name": "sso-rw", "value": token, "domain": domain, "path": "/", "secure": True, "httpOnly": True}
+                for domain in (".x.ai", ".grok.com", "accounts.x.ai", "grok.com")
+            )
         try:
             page.set.cookies(cookies)
         except Exception:
@@ -1432,6 +1447,7 @@ def browser_activate_chat_permission(browser_session, sso_token, log_callback=No
         detail = page.run_js(
             r"""
 const marker = arguments[0];
+const serverMode = Boolean(arguments[1]);
 function isVisible(node) {
   if (!node) return false;
   const style = window.getComputedStyle(node);
@@ -1455,7 +1471,7 @@ function score(t) {
   const s = raw.toLowerCase().replace(/\s+/g, '');
   let n = 0;
   // policy/document links are NOT accept buttons
-  if (s.includes('privacy') || s.includes('terms') || s.includes('policy') || s.includes('acceptableuse')) n -= 200;
+  if (serverMode && (s.includes('privacy') || s.includes('terms') || s.includes('policy') || s.includes('acceptableuse'))) n -= 200;
   if (s.includes('acceptableusepolicy') || s.includes('privacypolicy') || s.includes('termsofservice') || s.includes('policy') && (s.includes('view') || s.includes('read') || raw.length > 28)) n -= 150;
   if (s.includes('服务条款') || s.includes('使用政策') || s.includes('隐私政策')) n -= 80;
   if (s.includes('acceptandcontinue') || s.includes('acceptcontinue') || s.includes('iaccept') || s.includes('acceptall')) n += 100;
@@ -1477,6 +1493,7 @@ const selectors = [
   '[role="button"]',
   'div[role="button"]',
 ];
+if (!serverMode) selectors.push('a[href]');
 const seen = new Set();
 const nodes = [];
 for (const sel of selectors) {
@@ -1504,6 +1521,26 @@ if (!ranked.length) {
 }
 const best = ranked[0];
 try { best.n.scrollIntoView({block:'center', inline:'center'}); } catch (e) {}
+if (!serverMode) {
+  try { best.n.focus(); } catch (e) {}
+  try { best.n.click(); } catch (e) {
+    try {
+      best.n.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window}));
+    } catch (e2) {}
+  }
+  for (const box of Array.from(document.querySelectorAll('input[type="checkbox"]'))) {
+    if (isVisible(box) && !box.checked && !box.disabled) {
+      try { box.click(); } catch (e) {}
+    }
+  }
+  return {
+    state: 'clicked',
+    text: best.t.slice(0, 100),
+    score: best.s,
+    url: location.href,
+    body,
+  };
+}
 best.n.setAttribute('data-grok-gate-target', marker);
 let checkboxCount = 0;
 for (const box of Array.from(document.querySelectorAll('input[type="checkbox"]'))) {
@@ -1523,7 +1560,10 @@ return {
 };
 """,
             marker,
+            server_mode,
         )
+        if not server_mode:
+            return detail
         if not isinstance(detail, dict) or detail.get("state") != "targeted":
             return detail
         try:
@@ -1603,13 +1643,15 @@ return Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')
             return False
         if "服务条款" in b and ("接受" in b or "同意" in b):
             return False
-        return has_sso_cookie() and has_chat_editor()
+        return has_sso_cookie() and (not server_mode or has_chat_editor())
 
     def chat_ready_stable(url, body=""):
         if not chat_ready(url, body):
             return False
         sleep_with_cancel(1.5, cancel_callback)
         return chat_ready(current_url(), page_body())
+
+    chat_ready_check = chat_ready_stable if server_mode else chat_ready
 
     def hard_click_pass_gate(stage):
         nonlocal last_detail, page
@@ -1669,7 +1711,7 @@ return Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')
                 raise_if_cancelled(cancel_callback)
                 url = current_url()
                 body = page_body()
-                if chat_ready_stable(url, body):
+                if chat_ready_check(url, body):
                     log(f"[+] 浏览器已离开 TOS 门禁: {url[:140]}")
                     return True, f"browser left gate: {url[:140]}"
                 if is_gate_url(url) or ("accept" in body.lower() and "term" in body.lower()) or ("同意" in body) or ("接受" in body):
@@ -1677,7 +1719,7 @@ return Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')
                     sleep_with_cancel(1.4, cancel_callback)
                     url2 = current_url()
                     body2 = page_body()
-                    if chat_ready_stable(url2, body2):
+                    if chat_ready_check(url2, body2):
                         log(f"[+] 浏览器点击后离开 TOS 门禁: {url2[:140]}")
                         return True, f"browser left gate after click: {url2[:140]}"
                 else:
@@ -1686,7 +1728,7 @@ return Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')
                     sleep_with_cancel(1.2, cancel_callback)
                     url2 = current_url()
                     body2 = page_body()
-                    if chat_ready_stable(url2, body2):
+                    if chat_ready_check(url2, body2):
                         log(f"[+] 浏览器页面激活完成: {url2[:140]}")
                         return True, f"browser ready: {url2[:140]}"
                     # if redirected to gate, keep looping
@@ -1700,7 +1742,7 @@ return Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')
         # final check
         url = current_url()
         body = page_body()
-        if chat_ready_stable(url, body):
+        if chat_ready_check(url, body):
             log(f"[+] 浏览器 TOS/chat 激活完成: {url[:140]}")
             return True, f"browser ok: {url[:140]}"
         return False, f"仍未离开 TOS 门禁, last_url={url[:160]}, detail={last_detail[:160]}, body={body[:100]}"
@@ -1768,6 +1810,194 @@ return fetch('/rest/auth/set-birth-date', {
     return False, last_message
 
 
+def _browser_chat_canary_legacy(
+    browser_session,
+    log_callback=None,
+    cancel_callback=None,
+    timeout=60,
+):
+    """Run the established Windows browser canary without server-only changes."""
+    log = log_callback or (lambda *_: None)
+    if browser_session is None or getattr(browser_session, "page", None) is None:
+        return False, "browser session 不可用"
+
+    page = browser_session.page
+    marker = "WEB_CANARY_" + secrets.token_hex(12)
+    try:
+        page.get("https://grok.com/")
+        surface_deadline = time.time() + min(30, max(10, int(timeout or 60) // 2))
+        surface_state = {}
+        while time.time() < surface_deadline:
+            raise_if_cancelled(cancel_callback)
+            try:
+                surface_state = page.run_js(
+                    r"""
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+const send = document.querySelector('button[data-testid="chat-submit"]');
+return {
+  ready: Boolean(editor),
+  hasEditor: Boolean(editor),
+  hasSend: Boolean(send),
+  sendDisabled: Boolean(send && send.disabled),
+  readyState: document.readyState,
+  url: location.href,
+};
+"""
+                )
+            except Exception as exc:
+                surface_state = {
+                    "error": type(exc).__name__,
+                    "url": str(getattr(page, "url", "")),
+                }
+            if isinstance(surface_state, dict) and surface_state.get("ready"):
+                break
+            current_url = str(
+                (surface_state or {}).get("url") or getattr(page, "url", "")
+            )
+            if "tos-gate" in current_url or "/login" in current_url:
+                return False, f"网页对话界面被门禁阻断: {current_url[:160]}"
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
+            detail = surface_state if isinstance(surface_state, dict) else {}
+            return False, (
+                "网页对话界面等待超时: "
+                f"url={str(detail.get('url') or getattr(page, 'url', ''))[:140]}, "
+                f"readyState={detail.get('readyState')}, editor={detail.get('hasEditor')}, "
+                f"send={detail.get('hasSend')}, disabled={detail.get('sendDisabled')}"
+            )
+
+        editor_result = page.run_js(
+            r"""
+const marker = arguments[0];
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+if (!editor) return {sent: false, reason: 'no-editor', url: location.href};
+const value = 'Reply exactly: ' + marker;
+editor.focus();
+if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+  const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value');
+  if (descriptor && descriptor.set) descriptor.set.call(editor, value);
+  else editor.value = value;
+} else {
+  editor.textContent = value;
+}
+editor.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+editor.dispatchEvent(new Event('change', {bubbles: true}));
+return {filled: true, url: location.href};
+""",
+            marker,
+        )
+        if not isinstance(editor_result, dict) or not editor_result.get("filled"):
+            return False, (
+                f"网页对话填写失败: {(editor_result or {}).get('reason', 'unknown')}"
+            )
+        send_deadline = time.time() + 10
+        send_result = {}
+        while time.time() < send_deadline:
+            raise_if_cancelled(cancel_callback)
+            send_result = page.run_js(
+                r"""
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const send = document.querySelector('button[data-testid="chat-submit"]');
+if (!send || !visible(send) || send.disabled) return {sent: false, reason: 'chat-submit-unavailable'};
+send.click();
+return {sent: true, via: 'chat-submit', url: location.href};
+"""
+            )
+            if isinstance(send_result, dict) and send_result.get("sent"):
+                break
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
+            return False, (
+                f"网页对话发送失败: {(send_result or {}).get('reason', 'unknown')}"
+            )
+
+        submit_deadline = time.time() + 5
+        while time.time() < submit_deadline:
+            raise_if_cancelled(cancel_callback)
+            submitted = page.run_js(
+                r"""
+const marker = arguments[0];
+const userSelectors = [
+  '[data-message-author-role="user"]',
+  '[data-role="user"]',
+  '[data-testid*="user-message"]',
+];
+const userMatch = userSelectors.some((selector) =>
+  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
+);
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find((node) => {
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+});
+const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
+const body = document.body && document.body.innerText || '';
+return {
+  submitted: userMatch || (!editorText.includes(marker) && body.includes(marker)),
+  permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
+  url: location.href,
+};
+""",
+                marker,
+            )
+            if isinstance(submitted, dict) and submitted.get("permissionDenied"):
+                return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
+            if isinstance(submitted, dict) and submitted.get("submitted"):
+                break
+            sleep_with_cancel(0.5, cancel_callback)
+        else:
+            return False, "网页对话未确认真实提交"
+
+        deadline = time.time() + max(20, int(timeout or 60))
+        while time.time() < deadline:
+            raise_if_cancelled(cancel_callback)
+            result = page.run_js(
+                r"""
+const marker = arguments[0];
+const assistantSelectors = [
+  '[data-message-author-role="assistant"]',
+  '[data-role="assistant"]',
+  '[data-testid*="assistant"]',
+];
+const assistantMatch = assistantSelectors.some((selector) =>
+  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
+);
+const body = document.body && document.body.innerText || '';
+return {
+  assistantMatch,
+  permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
+  url: location.href,
+};
+""",
+                marker,
+            )
+            if isinstance(result, dict) and result.get("permissionDenied"):
+                return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
+            if isinstance(result, dict) and result.get("assistantMatch"):
+                log("[+] 网页对话 canary 已收到 assistant 精确回复")
+                return True, "ok"
+            sleep_with_cancel(1.5, cancel_callback)
+        return False, "网页对话 canary 等待 assistant 回复超时"
+    except Exception as exc:
+        return False, f"browser_chat_canary 异常: {exc}"
+
+
 def browser_chat_canary(
     browser_session,
     log_callback=None,
@@ -1775,6 +2005,13 @@ def browser_chat_canary(
     timeout=60,
 ):
     """Send a natural browser chat canary and require the exact answer."""
+    if not server_client_mode_enabled():
+        return _browser_chat_canary_legacy(
+            browser_session,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            timeout=timeout,
+        )
     log = log_callback or (lambda *_: None)
     if browser_session is None or getattr(browser_session, "page", None) is None:
         return False, "browser session 不可用"
@@ -2211,7 +2448,7 @@ def click_email_signup_button(session, timeout=10, log_callback=None, cancel_cal
         if log_callback:
             log_callback("[Debug] 尝试查找“使用邮箱注册”按钮...")
 
-        if config.get("native_registration_interactions", False):
+        if native_registration_enabled():
             clicked = _native_click_matching(
                 page,
                 'button,a,[role="button"]',
@@ -2345,7 +2582,7 @@ def fill_email_and_submit(session, timeout=45, log_callback=None, cancel_callbac
         raise Exception("获取邮箱失败")
     if log_callback:
         log_callback(f"[Debug] 已创建邮箱: {email}")
-    if config.get("native_registration_interactions", False):
+    if native_registration_enabled():
         deadline = time.time() + timeout
         last_reclick = 0.0
         while time.time() < deadline:
@@ -2670,7 +2907,7 @@ def fill_code_and_submit(session, email, dev_token, timeout=180, log_callback=No
     page = session.page
 
     def _resend_code():
-        if config.get("native_registration_interactions", False):
+        if native_registration_enabled():
             return bool(
                 _native_click_matching(
                     page,
@@ -2699,14 +2936,15 @@ return false;
     )
     if not code:
         raise Exception("获取验证码失败")
-    clean_code = re.sub(r"[\s-]+", "", str(code)).upper()
-    if config.get("native_registration_interactions", False) and not re.fullmatch(
-        r"[A-Z0-9]{6}", clean_code
-    ):
-        raise Exception("验证码格式无效，预期为 6 位字母数字")
+    if server_client_mode_enabled():
+        clean_code = re.sub(r"[\s-]+", "", str(code)).upper()
+        if not re.fullmatch(r"[A-Z0-9]{6}", clean_code):
+            raise Exception("验证码格式无效，预期为 6 位字母数字")
+    else:
+        clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
 
-    if config.get("native_registration_interactions", False):
+    if native_registration_enabled():
         while time.time() < deadline:
             raise_if_cancelled(cancel_callback)
             candidates = _native_visible_elements(
@@ -3001,7 +3239,7 @@ def fill_profile_and_submit(session, timeout=120, log_callback=None, cancel_call
     page = session.page
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
-    if config.get("native_registration_interactions", False):
+    if native_registration_enabled():
         given_input = family_input = password_input = None
         while time.time() < deadline:
             raise_if_cancelled(cancel_callback)
@@ -3313,6 +3551,7 @@ return String(cfInput.value || '').trim().length;
 
 def wait_for_sso_cookie(session, timeout=120, log_callback=None, cancel_callback=None):
     page = session.page
+    server_mode = server_client_mode_enabled()
     deadline = time.time() + timeout
     last_seen_names = set()
     last_submit_retry = 0.0
@@ -3346,16 +3585,17 @@ def wait_for_sso_cookie(session, timeout=120, log_callback=None, cancel_callback
                 sleep_with_cancel(1, cancel_callback)
                 continue
 
-            token = read_sso_cookie()
-            if token:
-                if log_callback:
-                    log_callback("[Debug] 已获取到 sso cookie")
-                return token
+            if server_mode:
+                token = read_sso_cookie()
+                if token:
+                    if log_callback:
+                        log_callback("[Debug] 已获取到 sso cookie")
+                    return token
 
             # 仍停留在“完成注册”页时，若 Cloudflare 已通过，周期性重试点击提交
             now = time.time()
             if now - last_submit_retry >= 2.5:
-                if config.get("native_registration_interactions", False):
+                if native_registration_enabled():
                     native_state = page.run_js(
                         r"""
 const text = (document.body && document.body.innerText || '').replace(/\s+/g, '').toLowerCase();
@@ -3495,7 +3735,7 @@ return String(cfInput.value || '').trim().length;
                 if name:
                     last_seen_names.add(name)
 
-                if name in ("sso", "sso-rw") and value:
+                if value and (name == "sso" or (server_mode and name == "sso-rw")):
                     if log_callback:
                         log_callback("[Debug] 已获取到 sso cookie")
                     return value
@@ -3653,11 +3893,13 @@ def register_one(session, shared, worker_id, slot_no):
         raise Exception("验证码阶段失败，已达到最大重试次数")
     profile = fill_profile_and_submit(session, log_callback=log, cancel_callback=cancel)
     sso = wait_for_sso_cookie(session, log_callback=log, cancel_callback=cancel)
-    sso_bot_flag = get_jwt_claim(sso, "bot_flag_source")
-    log(
-        "[Debug] 注册完成后的 SSO bot_flag_source="
-        + ("absent" if sso_bot_flag is None else str(sso_bot_flag))
-    )
+    server_mode = server_client_mode_enabled()
+    if server_mode:
+        sso_bot_flag = get_jwt_claim(sso, "bot_flag_source")
+        log(
+            "[Debug] 注册完成后的 SSO bot_flag_source="
+            + ("absent" if sso_bot_flag is None else str(sso_bot_flag))
+        )
     # TOS、生日和网页对话均为硬门禁；OAuth 后的客户端 preprobe 是最终可用性门禁。
     api_ok, api_msg = accept_tos_for_token(sso, log_callback=log, max_attempts=4, retry_delay=2.0)
     browser_ok, browser_msg = browser_activate_chat_permission(
@@ -3682,38 +3924,49 @@ def register_one(session, shared, worker_id, slot_no):
     )
     if not birth_ok:
         raise RuntimeError(f"出生日期设置未通过，账号不可用: {birth_msg}")
-    chat_ok = False
-    chat_msg = "网页对话验证未执行"
-    for chat_attempt in range(1, 4):
+    if not server_mode:
         chat_ok, chat_msg = browser_chat_canary(
             session,
             log_callback=log,
             cancel_callback=cancel,
             timeout=60,
         )
-        if chat_ok:
-            break
-        if chat_attempt >= 3 or not any(
-            marker in str(chat_msg) for marker in ("tos-gate", "门禁阻断")
-        ):
-            break
-        log(f"[!] 网页对话前门禁回退，重新激活后重试 {chat_attempt}/2: {chat_msg}")
-        browser_ok, browser_msg = browser_activate_chat_permission(
-            session, sso, log_callback=log, cancel_callback=cancel, timeout=60
-        )
-        if not browser_ok:
-            chat_msg = f"重新激活 TOS 门禁失败: {browser_msg}"
-            break
-        birth_ok, birth_msg = browser_set_birth_date(
-            session,
-            log_callback=log,
-            cancel_callback=cancel,
-            attempts=2,
-            retry_delay=1.0,
-        )
-        if not birth_ok:
-            chat_msg = f"重新激活后出生日期设置失败: {birth_msg}"
-            break
+    else:
+        chat_ok = False
+        chat_msg = "网页对话验证未执行"
+        for chat_attempt in range(1, 4):
+            chat_ok, chat_msg = browser_chat_canary(
+                session,
+                log_callback=log,
+                cancel_callback=cancel,
+                timeout=60,
+            )
+            if chat_ok:
+                break
+            if chat_attempt >= 3 or not any(
+                marker in str(chat_msg) for marker in ("tos-gate", "门禁阻断")
+            ):
+                break
+            log(
+                f"[!] 网页对话前门禁回退，重新激活后重试 {chat_attempt}/2: "
+                f"{chat_msg}"
+            )
+            browser_ok, browser_msg = browser_activate_chat_permission(
+                session, sso, log_callback=log, cancel_callback=cancel, timeout=60
+            )
+            if not browser_ok:
+                chat_msg = f"重新激活 TOS 门禁失败: {browser_msg}"
+                break
+            birth_ok, birth_msg = browser_set_birth_date(
+                session,
+                log_callback=log,
+                cancel_callback=cancel,
+                attempts=2,
+                retry_delay=1.0,
+            )
+            if not birth_ok:
+                chat_msg = f"重新激活后出生日期设置失败: {birth_msg}"
+                break
     if not chat_ok:
         raise RuntimeError(f"网页对话验证未通过，账号不可用: {chat_msg}")
     if api_ok and browser_ok:

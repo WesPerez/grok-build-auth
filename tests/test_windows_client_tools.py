@@ -190,7 +190,7 @@ def test_windows_main_has_no_global_process_kill():
     assert "editor_deadline" in chat_canary
     assert "native-cdp" in chat_canary
     assert "What is {left} + {right}?" in chat_canary
-    assert "WEB_CANARY_" not in chat_canary
+    assert "WEB_CANARY_" in source
     assert "numbers.length === 1" in chat_canary
     assert "native_registration_interactions" in source
     assert "_native_type" in source
@@ -201,6 +201,8 @@ def test_windows_main_has_no_global_process_kill():
     assert "网页对话首次提交返回 PERMISSION_DENIED/403" in chat_canary
     assert "for chat_attempt in range(1, 4)" in source
     assert "网页对话前门禁回退" in source
+    assert "server_client_mode_enabled()" in source
+    assert "if server_mode:" in browser_gate
 
 
 def test_windows_example_defaults_to_single_hidden_worker():
@@ -210,6 +212,36 @@ def test_windows_example_defaults_to_single_hidden_worker():
     assert config["target_successes"] == 0
     assert config["hide_window"] is True
     assert config["cpa_require_created"] is False
+    assert config["server_client_mode"] is False
+
+
+def test_server_client_mode_is_linux_only(tmp_path, monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        drission = types.ModuleType("DrissionPage")
+        drission.Chromium = object
+        drission.ChromiumOptions = object
+        drission_errors = types.ModuleType("DrissionPage.errors")
+        drission_errors.PageDisconnectedError = RuntimeError
+        curl_cffi = types.ModuleType("curl_cffi")
+        curl_cffi.requests = object()
+        monkeypatch.setitem(sys.modules, "DrissionPage", drission)
+        monkeypatch.setitem(sys.modules, "DrissionPage.errors", drission_errors)
+        monkeypatch.setitem(sys.modules, "curl_cffi", curl_cffi)
+        client = load_module("grok_register_mode_test", CLIENT / "grok_register_ttk.py")
+        client.config.update({
+            "server_client_mode": True,
+            "native_registration_interactions": True,
+        })
+        monkeypatch.setattr(client.sys, "platform", "win32")
+        assert client.server_client_mode_enabled() is False
+        assert client.native_registration_enabled() is False
+        monkeypatch.setattr(client.sys, "platform", "linux")
+        assert client.server_client_mode_enabled() is True
+        assert client.native_registration_enabled() is True
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
 
 
 def test_windows_client_target_success_stops_new_slots(tmp_path, monkeypatch):
@@ -271,6 +303,7 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     )
     assert config["target_successes"] == 3
     assert config["stealth_patch"] is True
+    assert config["server_client_mode"] is True
     assert config["native_registration_interactions"] is True
     runner_source = (SCRIPTS / "run_linux_client_full.py").read_text(encoding="utf-8")
     assert 'parser.add_argument("--proxy-url"' in runner_source

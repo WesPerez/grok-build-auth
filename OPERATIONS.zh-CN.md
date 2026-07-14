@@ -30,9 +30,10 @@ grok_register_ttk.py -> bridge 邮箱 API -> x.ai 注册 -> OAuth
 |---|---|
 | 明确选择纯协议、服务器邮箱和服务器代理池 | 服务器协议路径 |
 | 日常批量，或需要 Windows 浏览器/外部网络出口 | 外部客户端路径 |
+| 用户明确授权在部署服务器模拟客户端，且 Edge/Xvfb/代理已通过 canary | Linux/Xvfb 服务器模拟客户端 |
 | 只研究协议或生成本地 auth | `run.py` 单账号路径 |
 
-两条路径均受支持，但不在同一台服务器混跑：服务器只运行协议编排器；Windows 客户端在外部机器运行并通过 bridge 推送。只有旧的“先 quarantine 入库、再探针筛选”流程废弃。
+默认不在同一台服务器混跑协议编排器和浏览器客户端。用户明确授权服务器模拟客户端时，可在 Linux/Xvfb 上复用正式客户端，但不得同时运行 `register_and_import.py`；必须先单账号 canary，再使用隔离 route 和代理扩到两路。只有旧的“先 quarantine 入库、再探针筛选”流程废弃。
 
 ## 2. 组件和信任边界
 
@@ -432,6 +433,19 @@ Linux/Xvfb 示例：
 cd /root/grok-build-auth/clients/windows
 DISPLAY=:99 bash -c 'echo 1 | .venv/bin/python3 grok_register_ttk.py'
 ```
+
+部署服务器模拟客户端使用正式编排入口，不恢复历史 `/tmp` runner：
+
+```bash
+cd /root/grok-build-auth
+DISPLAY=:99 clients/windows/.venv/bin/python3 scripts/run_linux_client_full.py \
+  --target 1 \
+  --routes 1 \
+  --attempts-per-route 20 \
+  --proxy-ref <healthy-ref>
+```
+
+canary 必须同时出现本地 auth、bridge `action=created`、`probe=passed` 和精确账号 ID。两路后台批量使用两个独立代理 ref、两个 route 目录、每路单浏览器；不能用数据库全池增长代替本批归因。
 
 脚本没有稳定的非交互参数接口，不要把位置参数当 CLI 选项使用。
 
