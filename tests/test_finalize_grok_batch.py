@@ -216,9 +216,32 @@ def test_probe_evidence_is_structured_and_does_not_retain_error_text():
     structured = MODULE.classify_probe_evidence({
         "account_id": 8, "status": 200, "completed": False,
         "availability": "usable_exhausted", "code": "RATE_LIMITED",
+        "quota_evidence": {"status": 429, "reason": "FREE_USAGE_EXHAUSTED"},
     })
     assert structured["classification"] == "usable_exhausted"
-    assert structured["status"] == 200
+    assert structured["status"] == 429
+    assert structured["quota_reason"] == "FREE_USAGE_EXHAUSTED"
+
+
+def test_probe_evidence_does_not_trust_structured_availability_without_quota_evidence():
+    with pytest.raises(MODULE.FinalizeError, match="no decisive usable probe"):
+        MODULE.classify_probe_evidence({
+            "account_id": 8, "status": 429, "completed": False,
+            "availability": "usable_exhausted", "code": "RATE_LIMITED",
+        })
+
+
+@pytest.mark.parametrize("quota_evidence", [
+    {"status": 429, "reason": "TEMPORARY_CAPACITY"},
+    {"status": 503, "reason": "FREE_USAGE_EXHAUSTED"},
+])
+def test_probe_evidence_rejects_invalid_structured_quota_evidence(quota_evidence):
+    with pytest.raises(MODULE.FinalizeError, match="no decisive usable probe"):
+        MODULE.classify_probe_evidence({
+            "account_id": 8, "status": 200, "completed": False,
+            "availability": "usable_exhausted", "code": "RATE_LIMITED",
+            "quota_evidence": quota_evidence,
+        })
 
 
 def test_prepared_artifact_rejects_tamper_and_expiry(tmp_path):
@@ -274,6 +297,79 @@ def test_cleanup_resumes_from_quarantined_entry(tmp_path):
     MODULE._purge_quarantine(batch, journal_path, journal)
     assert journal["status"] == "completed"
     assert not quarantine.exists()
+
+
+def cleanup_prepared(batch: Path) -> dict:
+    auth = write_json(batch / "auth" / "x" / "auth.json", {"token": "secret"})
+    log = batch / "logs" / "x.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("success", encoding="utf-8")
+    helper = write_json(batch / "import" / "helper.log", {"imported_ids": [7]})
+    return {
+        "account_ids": [7],
+        "artifact_sha256": "prepared-hash",
+        "mappings": [{
+            "auth_path": auth, "auth_file_sha256": MODULE.sha256_file(auth),
+            "log_path": log, "log_sha256": MODULE.sha256_file(log),
+        }],
+        "bundles": [],
+        "helper_log": {"path": helper, "sha256": MODULE.sha256_file(helper)},
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("kind", "database_backup"),
+    ("source", "backup/pre.dump"),
+    ("quarantine", "cleanup/quarantine/0000-pre.dump"),
+    ("sha256", "0" * 64),
+    ("status", "approved"),
+])
+def test_existing_cleanup_journal_must_match_prepared_entries(tmp_path, field, value):
+    batch = tmp_path / "20260714T120000Z-abcdef"
+    prepared = cleanup_prepared(batch)
+    journal_path, journal = MODULE._cleanup_journal(batch, prepared)
+    journal["entries"][0][field] = value
+    write_json(journal_path, journal)
+
+    with pytest.raises(MODULE.FinalizeError, match="cleanup journal entr"):
+        MODULE._cleanup_journal(batch, prepared)
+
+
+def test_existing_cleanup_journal_rejects_added_backup_entry(tmp_path):
+    batch = tmp_path / "20260714T120000Z-abcdef"
+    prepared = cleanup_prepared(batch)
+    backup = batch / "backup" / "pre.dump"
+    backup.parent.mkdir(parents=True)
+    backup.write_bytes(b"database backup")
+    journal_path, journal = MODULE._cleanup_journal(batch, prepared)
+    journal["entries"].append({
+        "kind": "database_backup", "source": "backup/pre.dump",
+        "quarantine": "cleanup/quarantine/9999-pre.dump",
+        "sha256": MODULE.sha256_file(backup), "status": "pending",
+    })
+    write_json(journal_path, journal)
+
+    with pytest.raises(MODULE.FinalizeError, match="differ from prepared evidence"):
+        MODULE._cleanup_journal(batch, prepared)
+
+
+def test_existing_cleanup_journal_accepts_valid_progress_statuses(tmp_path):
+    batch = tmp_path / "20260714T120000Z-abcdef"
+    prepared = cleanup_prepared(batch)
+    journal_path, journal = MODULE._cleanup_journal(batch, prepared)
+    journal["entries"][0].update({
+        "status": "quarantined", "quarantined_at": MODULE.utc_now(),
+    })
+    journal["entries"][1].update({
+        "status": "deleted", "quarantined_at": MODULE.utc_now(),
+        "deleted_at": MODULE.utc_now(),
+    })
+    write_json(journal_path, journal)
+
+    _, resumed = MODULE._cleanup_journal(batch, prepared)
+    assert [entry["status"] for entry in resumed["entries"][:2]] == [
+        "quarantined", "deleted",
+    ]
 
 
 def test_backup_records_preserve_import_and_reconcile_roles(tmp_path):

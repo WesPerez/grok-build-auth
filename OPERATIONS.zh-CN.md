@@ -364,7 +364,7 @@ python3 scripts/finalize_grok_batch.py \
   --confirm-cleanup
 ```
 
-cleanup 只消费未过期的 prepared artifact，不会重复执行生产探针。提交会先原子写入脱敏 handoff、带 source hash 到账号 ID 映射的 checkpoint 和持久 cleanup journal，再把精确文件原子移动到批次内 quarantine；状态文件落盘后才逐项删除，因此崩溃后可用同一命令续跑。密码恢复结果、失败尝试材料和带角色/来源/验证时间的数据库恢复点默认保留；最终 `manifest.json`、`handoff.json` 和 `import/*.json` 不包含邮箱、token 或密码。
+首次 cleanup 只消费未过期的 prepared artifact，不会重复执行生产探针。提交会先原子写入脱敏 handoff、带 source hash 到账号 ID 映射的 checkpoint 和持久 cleanup journal，再把精确文件原子移动到批次内 quarantine；已有 journal 时会重新按 prepared evidence 推导并核对完整清单，崩溃续跑允许 artifact 已过期，但不允许更换或增加清理路径。SHA256 只用于检测文件或证据的意外变化，属于完整性校验，不提供签名式真实性或防篡改保证。密码恢复结果、失败尝试材料和带角色/来源/验证时间的数据库恢复点默认保留；最终 `manifest.json`、`handoff.json` 和 `import/*.json` 不包含邮箱、token 或密码。
 
 ## 5. 外部客户端路径
 

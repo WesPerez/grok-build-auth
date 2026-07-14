@@ -31,6 +31,15 @@ GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 ALLOWED_RUNTIME_STATUSES = {"imported-preprobed", "postimport-account-probe-failed"}
 PREPARED_ARTIFACT = "closeout-prepared.json"
 PREPARED_TTL_SECONDS = 30 * 60
+EXPLICIT_QUOTA_REASONS = {
+    "FREE_USAGE_EXHAUSTED",
+    "SPENDING_LIMIT_EXCEEDED",
+    "INSUFFICIENT_QUOTA",
+    "QUOTA_EXHAUSTED",
+    "CREDIT_EXHAUSTED",
+}
+CLEANUP_JOURNAL_STATUSES = {"quarantining", "quarantined", "completed"}
+CLEANUP_ENTRY_STATUSES = {"pending", "quarantined", "deleted"}
 
 
 class FinalizeError(RuntimeError):
@@ -435,25 +444,39 @@ def map_sources_to_accounts(
 def classify_probe_evidence(item: dict[str, Any]) -> dict[str, Any]:
     observed_at = utc_now()
     availability = str(item.get("availability") or "")
-    if availability == "usable" or (item.get("status") == 200 and item.get("completed") is True):
+    if item.get("status") == 200 and item.get("completed") is True:
         return {
             "classification": "usable", "code": str(item.get("code") or "COMPLETED"),
             "status": int(item.get("status") or 200), "observed_at": observed_at,
         }
-    if availability == "usable_exhausted" and item.get("code") == "RATE_LIMITED":
-        return {
-            "classification": "usable_exhausted", "code": "RATE_LIMITED",
-            "status": int(item.get("status") or 0), "observed_at": observed_at,
-        }
+    quota_evidence = item.get("quota_evidence")
+    if isinstance(quota_evidence, dict):
+        quota_status = quota_evidence.get("status")
+        quota_reason = quota_evidence.get("reason")
+        if (
+            quota_status in {402, 429}
+            and quota_reason in EXPLICIT_QUOTA_REASONS
+            and availability in {"", "usable_exhausted"}
+            and item.get("code") in {None, "", "RATE_LIMITED"}
+            and item.get("status") in {200, quota_status}
+        ):
+            return {
+                "classification": "usable_exhausted", "code": "RATE_LIMITED",
+                "status": quota_status, "quota_reason": quota_reason,
+                "observed_at": observed_at,
+            }
     error = str(item.get("error") or "").lower()
     explicit_quota = (
         "subscription:free-usage-exhausted" in error
         or "spending-limit-exceeded" in error
         or "insufficient_quota" in error
+        or "quota exhausted" in error
+        or "run out of credit" in error
         or ("used all the included free usage" in error and "rolling 24-hour window" in error)
     )
-    if ("429" in error or "402" in error) and explicit_quota:
-        status = 429 if "429" in error else 402
+    match = re.search(r"(?<!\d)(402|429)(?!\d)", error)
+    if match and explicit_quota:
+        status = int(match.group(1))
         return {
             "classification": "usable_exhausted", "code": "RATE_LIMITED",
             "status": status, "observed_at": observed_at,
@@ -884,6 +907,33 @@ def _cleanup_entries(batch_dir: Path, prepared: dict[str, Any]) -> list[dict[str
     return entries
 
 
+def _validate_cleanup_journal_entries(
+    batch_dir: Path, prepared: dict[str, Any], journal: dict[str, Any],
+) -> None:
+    entries = journal.get("entries")
+    expected = _cleanup_entries(batch_dir, prepared)
+    if not isinstance(entries, list) or len(entries) != len(expected):
+        raise FinalizeError("cleanup journal entries differ from prepared evidence")
+    immutable_fields = ("kind", "source", "quarantine", "sha256")
+    allowed_fields = {*immutable_fields, "status", "quarantined_at", "deleted_at"}
+    for index, (actual, expected_entry) in enumerate(zip(entries, expected, strict=True)):
+        if not isinstance(actual, dict):
+            raise FinalizeError(f"cleanup journal entry {index} is invalid")
+        if set(actual) - allowed_fields:
+            raise FinalizeError(f"cleanup journal entry {index} has unexpected fields")
+        if any(actual.get(field) != expected_entry[field] for field in immutable_fields):
+            raise FinalizeError("cleanup journal entries differ from prepared evidence")
+        status_value = actual.get("status")
+        if status_value not in CLEANUP_ENTRY_STATUSES:
+            raise FinalizeError(f"cleanup journal entry {index} has invalid status")
+        for timestamp_field in ("quarantined_at", "deleted_at"):
+            timestamp = actual.get(timestamp_field)
+            if timestamp is not None and not isinstance(timestamp, str):
+                raise FinalizeError(
+                    f"cleanup journal entry {index} has invalid {timestamp_field}"
+                )
+
+
 def _cleanup_journal(batch_dir: Path, prepared: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
     path = batch_dir / "import" / "cleanup-journal.json"
     if path.exists():
@@ -892,11 +942,16 @@ def _cleanup_journal(batch_dir: Path, prepared: dict[str, Any]) -> tuple[Path, d
             raise FinalizeError("cleanup journal belongs to a different batch")
         if journal.get("account_ids") != prepared["account_ids"]:
             raise FinalizeError("cleanup journal account IDs differ from prepared evidence")
+        if journal.get("schema_version") != 1:
+            raise FinalizeError("cleanup journal has unsupported schema")
+        if journal.get("status") not in CLEANUP_JOURNAL_STATUSES:
+            raise FinalizeError("cleanup journal has invalid status")
         if (
             prepared.get("artifact_sha256")
             and journal.get("prepared_artifact_sha256") != prepared["artifact_sha256"]
         ):
             raise FinalizeError("cleanup journal belongs to different prepared evidence")
+        _validate_cleanup_journal_entries(batch_dir, prepared, journal)
         return path, journal
     journal = {
         "schema_version": 1, "batch_id": batch_dir.name,

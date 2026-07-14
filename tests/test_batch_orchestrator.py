@@ -411,6 +411,9 @@ def test_postimport_account_probes_accept_sse_quota_as_usable_exhausted(monkeypa
     assert result["failed_count"] == 0
     assert result["results"][0]["availability"] == "usable_exhausted"
     assert result["results"][0]["code"] == "RATE_LIMITED"
+    assert result["results"][0]["quota_evidence"] == {
+        "status": 429, "reason": "FREE_USAGE_EXHAUSTED",
+    }
 
 
 @pytest.mark.parametrize("status", [402, 429])
@@ -429,6 +432,29 @@ def test_postimport_account_probes_accept_outer_quota_status(monkeypatch, status
     assert result["usable_exhausted_count"] == 1
     assert result["results"][0]["status"] == status
     assert result["results"][0]["code"] == "RATE_LIMITED"
+    assert result["results"][0]["quota_evidence"] == {
+        "status": status, "reason": "QUOTA_EXHAUSTED",
+    }
+
+
+@pytest.mark.parametrize("body", [
+    "service temporarily at capacity; retry shortly",
+    "resource has been exhausted",
+    "rate limit exceeded",
+])
+def test_postimport_account_probe_rejects_ordinary_429(body):
+    assert MODULE.classify_postimport_account_probe(429, body, False) == (
+        "unknown_error", "HTTP_429",
+    )
+    assert MODULE.explicit_quota_evidence(429, body) is None
+
+
+def test_postimport_account_probe_requires_402_or_429_quota_status():
+    body = "subscription:free-usage-exhausted rolling 24-hour window"
+    assert MODULE.classify_postimport_account_probe(200, body, False) == (
+        "unknown_error", "HTTP_200",
+    )
+    assert MODULE.explicit_quota_evidence(200, body) is None
 
 
 def test_record_manifest_backup_preserves_history_and_deduplicates(tmp_path):

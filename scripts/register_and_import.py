@@ -40,6 +40,13 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 EMAIL_RE = re.compile(r"^(xai[a-f0-9]{6})@([A-Za-z0-9.-]+)$")
 BATCH_LOCK_PATH = PROJECT_DIR / "private" / "batch-orchestrator.lock"
 GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+EXPLICIT_QUOTA_MARKERS = (
+    ("subscription:free-usage-exhausted", "FREE_USAGE_EXHAUSTED"),
+    ("spending-limit-exceeded", "SPENDING_LIMIT_EXCEEDED"),
+    ("insufficient_quota", "INSUFFICIENT_QUOTA"),
+    ("quota exhausted", "QUOTA_EXHAUSTED"),
+    ("run out of credit", "CREDIT_EXHAUSTED"),
+)
 
 
 class BatchError(RuntimeError):
@@ -897,15 +904,19 @@ def run_postimport_account_probes(
                 completed = True
             if event.get("type") in {"error", "test_error"}:
                 error = str(event.get("error") or event.get("message") or "")[:300]
+        quota_evidence = explicit_quota_evidence(status, raw)
         availability, code = classify_postimport_account_probe(status, raw, completed)
-        results.append({
+        result = {
             "account_id": account_id,
             "status": status,
             "completed": completed,
             "error": error,
             "availability": availability,
             "code": code,
-        })
+        }
+        if quota_evidence:
+            result["quota_evidence"] = quota_evidence
+        results.append(result)
     usable_count = sum(item["availability"] == "usable" for item in results)
     usable_exhausted_count = sum(item["availability"] == "usable_exhausted" for item in results)
     failed_count = len(results) - usable_count - usable_exhausted_count
@@ -919,14 +930,31 @@ def run_postimport_account_probes(
     }
 
 
+def explicit_quota_evidence(status: int, body: str) -> dict[str, Any] | None:
+    low = (body or "").lower()
+    quota_status = status if status in {402, 429} else None
+    if quota_status is None:
+        match = re.search(r"(?<!\d)(402|429)(?!\d)", low)
+        if match:
+            quota_status = int(match.group(1))
+    if quota_status is None:
+        return None
+    reason = next((code for marker, code in EXPLICIT_QUOTA_MARKERS if marker in low), None)
+    if reason is None and (
+        "used all the included free usage" in low
+        and "rolling 24-hour window" in low
+    ):
+        reason = "FREE_USAGE_EXHAUSTED"
+    if reason is None:
+        return None
+    return {"status": quota_status, "reason": reason}
+
+
 def classify_postimport_account_probe(status: int, body: str, completed: bool) -> tuple[str, str]:
     if completed:
         return "usable", "TEST_COMPLETED"
     low = (body or "").lower()
-    if status in {402, 429} or any(value in low for value in (
-        "free-usage", "rolling 24", "resource_exhausted", "spending-limit",
-        "run out of credit", "quota exhausted", "resource has been exhausted",
-    )):
+    if explicit_quota_evidence(status, body):
         return "usable_exhausted", "RATE_LIMITED"
     if any(value in low for value in (
         "invalid_grant", "refresh token has been revoked", "grok_oauth_token_refresh_failed",
