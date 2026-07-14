@@ -1210,6 +1210,11 @@ def cloudflare_get_oai_code(
 
 
 def generate_random_birthdate():
+    return generate_random_birthdate_parts()[0]
+
+
+def generate_random_birthdate_parts():
+    """Return (iso_payload, year, month, day) for page UI + REST fallback."""
     import datetime as dt
 
     today = dt.date.today()
@@ -1217,7 +1222,8 @@ def generate_random_birthdate():
     birth_year = today.year - age
     birth_month = random.randint(1, 12)
     birth_day = random.randint(1, 28)
-    return f"{birth_year}-{birth_month:02d}-{birth_day:02d}T16:00:00.000Z"
+    iso = f"{birth_year}-{birth_month:02d}-{birth_day:02d}T16:00:00.000Z"
+    return iso, birth_year, birth_month, birth_day
 
 
 def response_preview(res, limit=200):
@@ -1422,17 +1428,10 @@ def browser_activate_chat_permission(browser_session, sso_token, log_callback=No
             return ""
 
     def inject_sso_cookies():
-        cookies = [
-            {"name": "sso", "value": token, "domain": ".x.ai", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso", "value": token, "domain": ".grok.com", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso", "value": token, "domain": "accounts.x.ai", "path": "/", "secure": True, "httpOnly": True},
-            {"name": "sso", "value": token, "domain": "grok.com", "path": "/", "secure": True, "httpOnly": True},
-        ]
-        if server_mode:
-            cookies.extend(
-                {"name": "sso-rw", "value": token, "domain": domain, "path": "/", "secure": True, "httpOnly": True}
-                for domain in (".x.ai", ".grok.com", "accounts.x.ai", "grok.com")
-            )
+        cookies = []
+        for domain in (".x.ai", ".grok.com", "accounts.x.ai", "grok.com"):
+            cookies.append({"name": "sso", "value": token, "domain": domain, "path": "/", "secure": True, "httpOnly": True})
+            cookies.append({"name": "sso-rw", "value": token, "domain": domain, "path": "/", "secure": True, "httpOnly": True})
         try:
             page.set.cookies(cookies)
         except Exception:
@@ -1757,21 +1756,40 @@ def browser_set_birth_date(
     attempts=3,
     retry_delay=2.0,
 ):
-    """Set the birth date through the authenticated grok.com browser session."""
+    """Two-branch birth gate.
+
+    Branch A: REST /rest/auth/set-birth-date returns 200 -> no age modal expected.
+    Branch B: REST fails -> type in chat to open age modal -> click 继续.
+
+    Final account usability is still decided later by browser chat canary.
+    """
     log = log_callback or (lambda *_: None)
+
+    def safe_log(msg):
+        text_msg = str(msg)
+        try:
+            log(text_msg)
+        except Exception:
+            try:
+                log(text_msg.encode("gbk", errors="replace").decode("gbk", errors="replace"))
+            except Exception:
+                pass
+
     if browser_session is None or getattr(browser_session, "page", None) is None:
-        return False, "browser session 不可用"
+        return False, "browser session unavailable"
 
     page = browser_session.page
-    last_message = "browser birth 未执行"
-    for attempt in range(1, max(1, int(attempts)) + 1):
-        raise_if_cancelled(cancel_callback)
-        try:
-            if "grok.com" not in str(getattr(page, "url", "") or "").lower():
-                page.get("https://grok.com/")
-                sleep_with_cancel(1.0, cancel_callback)
-            result = page.run_js(
-                r"""
+    last_message = "browser birth not executed"
+
+    def ensure_grok_home():
+        url = str(getattr(page, "url", "") or "")
+        if "grok.com" not in url.lower() or "tos-gate" in url.lower():
+            page.get("https://grok.com/")
+            sleep_with_cancel(1.0, cancel_callback)
+
+    def rest_set_birth(iso_value):
+        return page.run_js(
+            r"""
 return fetch('/rest/auth/set-birth-date', {
   method: 'POST',
   credentials: 'include',
@@ -1787,17 +1805,273 @@ return fetch('/rest/auth/set-birth-date', {
   error: String(error).slice(0, 160),
 }));
 """,
-                generate_random_birthdate(),
+            iso_value,
+        )
+
+    def trigger_age_modal():
+        editor = None
+        for candidate in page.eles('css:textarea,[contenteditable="true"]', timeout=1.0) or []:
+            try:
+                if candidate.states.is_displayed and candidate.states.is_enabled:
+                    editor = candidate
+                    break
+            except Exception:
+                continue
+        if editor is not None:
+            try:
+                editor.click(by_js=False, timeout=2.0)
+            except Exception:
+                pass
+            try:
+                _native_type(page, editor, "1")
+            except Exception:
+                try:
+                    editor.input("1", clear=False, by_js=False)
+                except Exception:
+                    pass
+            sleep_with_cancel(0.8, cancel_callback)
+            return {"state": "typed-native"}
+        return page.run_js(
+            r"""
+function visible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+if (!editor) return {state: 'no-editor', url: location.href};
+editor.focus();
+try { editor.click(); } catch (e) {}
+if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+  const proto = editor.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  if (setter) setter.call(editor, '1');
+  else editor.value = '1';
+} else {
+  editor.textContent = '1';
+}
+editor.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, data:'1', inputType:'insertText'}));
+editor.dispatchEvent(new InputEvent('input', {bubbles:true, data:'1', inputType:'insertText'}));
+editor.dispatchEvent(new Event('change', {bubbles:true}));
+return {state: 'typed-js', url: location.href};
+"""
+        )
+
+    def inspect_age_modal():
+        return page.run_js(
+            r"""
+function visible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+  return [node && node.innerText, node && node.textContent, node && node.getAttribute && node.getAttribute('aria-label'), node && node.getAttribute && node.getAttribute('placeholder')]
+    .filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+}
+const body = (document.body && document.body.innerText || '').replace(/\s+/g, ' ').trim();
+const hit = /请确认你的年龄|选择你的出生年份|confirm your age|birth year|date of birth|出生年份|出生日期/i.test(body);
+const inputs = Array.from(document.querySelectorAll('input,textarea,[contenteditable="true"],[role="combobox"]')).filter(visible).map((node) => ({
+  tag: node.tagName.toLowerCase(),
+  type: String(node.getAttribute('type') || ''),
+  placeholder: String(node.getAttribute('placeholder') || ''),
+  value: String(node.value || node.textContent || '').slice(0, 40),
+  label: textOf(node).slice(0, 80),
+}));
+const buttons = Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"]')).filter(visible).map((node) => textOf(node)).filter(Boolean).slice(0, 12);
+return {url: location.href, hit, bodyPreview: body.slice(0, 160), inputs, buttons};
+"""
+        )
+
+    def fill_age_year(year):
+        year = str(year)
+        for candidate in page.eles('css:input,textarea', timeout=1.0) or []:
+            try:
+                if not (candidate.states.is_displayed and candidate.states.is_enabled):
+                    continue
+            except Exception:
+                continue
+            try:
+                rect_h = float(candidate.rect.get('height', 0) or 0) if hasattr(candidate, 'rect') else 0
+            except Exception:
+                rect_h = 0
+            if rect_h > 80:
+                continue
+            try:
+                candidate.click(by_js=False, timeout=1.5)
+                _native_type(page, candidate, year)
+                return {"state": "filled-year-native", "value": year}
+            except Exception:
+                try:
+                    candidate.input(year, clear=True, by_js=False)
+                    return {"state": "filled-year-input", "value": year}
+                except Exception:
+                    continue
+        return page.run_js(
+            r"""
+const year = String(arguments[0] || '');
+function visible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function setValue(input, value) {
+  input.focus();
+  try { input.click(); } catch (e) {}
+  const proto = input.tagName === 'TEXTAREA' ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  const tracker = input._valueTracker;
+  if (tracker) tracker.setValue('');
+  if (setter) setter.call(input, value); else input.value = value;
+  input.dispatchEvent(new InputEvent('input', {bubbles:true, data:value, inputType:'insertText'}));
+  input.dispatchEvent(new Event('change', {bubbles:true}));
+  return String(input.value || '').trim() === value;
+}
+const body = document.body && document.body.innerText || '';
+const inAgeModal = /请确认你的年龄|选择你的出生年份|confirm your age|birth year|出生年份/i.test(body);
+const inputs = Array.from(document.querySelectorAll('input,textarea')).filter(visible);
+let target = null;
+for (const input of inputs) {
+  const rect = input.getBoundingClientRect();
+  if (rect.height > 80) continue;
+  const meta = [input.getAttribute('placeholder'), input.getAttribute('aria-label'), input.name, input.value].join(' ');
+  if (/year|出生|年龄|birth/i.test(meta) || /^\d{4}$/.test(String(input.value || '')) || inAgeModal) {
+    target = input;
+    if (/year|出生|年龄|birth/i.test(meta) || /^\d{4}$/.test(String(input.value || ''))) break;
+  }
+}
+if (!target) return {state: 'no-year-input', inAgeModal};
+return {state: setValue(target, year) ? 'filled-year' : 'fill-failed', value: String(target.value || '')};
+""",
+            year,
+        )
+
+    def click_continue():
+        for phrase_score in (("继续", 100), ("continue", 95), ("确认", 90), ("confirm", 90)):
+            clicked = _native_click_matching(
+                page,
+                'button, [role="button"], input[type="submit"]',
+                (phrase_score,),
             )
-            status = int(result.get("status") or 0) if isinstance(result, dict) else 0
-            if isinstance(result, dict) and result.get("ok") and 200 <= status < 300:
-                log(f"[+] 浏览器出生日期已设置（第 {attempt} 次，HTTP {status}）")
-                return True, "ok"
-            last_message = f"browser set_birth_date HTTP {status}"
-            log(f"[!] 浏览器出生日期设置失败（第 {attempt} 次）: {last_message}")
+            if clicked:
+                return {"state": "clicked-native", "text": clicked}
+        return page.run_js(
+            r"""
+function visible(node) {
+  if (!node) return false;
+  const style = window.getComputedStyle(node);
+  if (!style || style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+}
+function textOf(node) {
+  return [node && node.innerText, node && node.textContent, node && node.getAttribute && node.getAttribute('aria-label')].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+}
+function score(text) {
+  const s = String(text || '').toLowerCase().replace(/\s+/g, '');
+  let n = 0;
+  if (s.includes('继续') || s.includes('continue')) n += 100;
+  if (s.includes('确认') || s.includes('confirm')) n += 80;
+  if (s.includes('cancel') || s.includes('取消')) n -= 120;
+  return n;
+}
+const nodes = Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"]'))
+  .filter((node) => visible(node) && !node.disabled)
+  .map((node) => ({node, text: textOf(node), score: score(textOf(node))}))
+  .filter((item) => item.score > 0)
+  .sort((a,b) => b.score - a.score);
+if (!nodes.length) return {state: 'no-button'};
+const best = nodes[0];
+try { best.node.click(); } catch (e) {
+  try { best.node.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true, view:window})); } catch (e2) {}
+}
+return {state: 'clicked-js', text: (best.text || '').slice(0, 40)};
+"""
+        )
+
+    for attempt in range(1, max(1, int(attempts)) + 1):
+        raise_if_cancelled(cancel_callback)
+        iso_value, year, month, day = generate_random_birthdate_parts()
+        try:
+            ensure_grok_home()
+
+            # Branch A: REST success means no age modal is expected.
+            rest = rest_set_birth(iso_value)
+            rest_status = int(rest.get("status") or 0) if isinstance(rest, dict) else 0
+            if isinstance(rest, dict) and rest.get("ok") and 200 <= rest_status < 300:
+                safe_log(
+                    f"[+] 生日支线A REST 成功（第 {attempt} 次；HTTP {rest_status}）；不弹窗是正常的"
+                )
+                return True, "ok-rest-branch-a"
+
+            safe_log(
+                f"[!] 生日支线A REST 未通过（第 {attempt} 次；HTTP {rest_status}），转入支线B弹窗"
+            )
+
+            # Branch B: REST wrong/failed -> chat typing triggers age modal -> click 继续.
+            trigger = trigger_age_modal()
+            safe_log(f"[*] 支线B触发年龄弹窗 第 {attempt} 次: {trigger}")
+            modal = None
+            for _ in range(10):
+                raise_if_cancelled(cancel_callback)
+                modal = inspect_age_modal()
+                if isinstance(modal, dict) and modal.get("hit"):
+                    break
+                trigger_age_modal()
+                sleep_with_cancel(0.5, cancel_callback)
+
+            if not (isinstance(modal, dict) and modal.get("hit")):
+                last_message = f"branch-b age modal missing after REST fail: rest={rest}, modal={modal}"
+                safe_log(f"[!] 支线B未出现年龄弹窗（第 {attempt} 次）")
+            else:
+                safe_log(f"[*] 支线B已出现年龄弹窗 第 {attempt} 次 buttons={modal.get('buttons')}")
+                year_already = False
+                try:
+                    for item in (modal.get("inputs") or []):
+                        val = str((item or {}).get("value") or "").strip()
+                        if val.isdigit() and 1950 <= int(val) <= 2015:
+                            year_already = True
+                            year = int(val)
+                            break
+                except Exception:
+                    year_already = False
+                if year_already:
+                    filled = {"state": "year-prefilled", "value": year}
+                    safe_log(f"[*] 弹窗已有年份，直接点继续: {year}")
+                else:
+                    filled = fill_age_year(year)
+                    safe_log(f"[*] 弹窗填写年份: year={year} result={filled}")
+                clicked = click_continue()
+                safe_log(f"[*] 支线B点击继续: {clicked}")
+                sleep_with_cancel(0.5, cancel_callback)
+                clicked2 = click_continue()
+                if clicked2:
+                    safe_log(f"[*] 支线B二次点击继续: {clicked2}")
+                sleep_with_cancel(1.0, cancel_callback)
+                after = inspect_age_modal()
+                modal_gone = isinstance(after, dict) and not after.get("hit")
+                if modal_gone or (
+                    isinstance(clicked, dict)
+                    and "clicked" in str(clicked.get("state") or "")
+                ):
+                    safe_log(
+                        f"[+] 生日支线B弹窗继续完成（第 {attempt} 次；modal_gone={modal_gone}）"
+                    )
+                    return True, "ok-modal-branch-b"
+                last_message = (
+                    f"branch-b continue failed: filled={filled}, clicked={clicked}, "
+                    f"after={after}"
+                )
+                safe_log(f"[!] 支线B继续未确认（第 {attempt} 次）: {str(last_message)[:220]}")
         except Exception as exc:
-            last_message = f"browser_set_birth_date 异常: {exc}"
-            log(f"[!] 浏览器出生日期设置异常（第 {attempt} 次）: {exc}")
+            last_message = f"browser_set_birth_date exception: {exc}"
+            safe_log(f"[!] 出生日期设置异常（第 {attempt} 次）: {exc}")
         if attempt < max(1, int(attempts)):
             try:
                 page.get("https://grok.com/")
@@ -1810,25 +2084,289 @@ return fetch('/rest/auth/set-birth-date', {
     return False, last_message
 
 
+
 def _browser_chat_canary_legacy(
     browser_session,
     log_callback=None,
     cancel_callback=None,
     timeout=60,
 ):
-    """Run the established Windows browser canary without server-only changes."""
+    """Windows browser canary: must really submit chat and receive assistant reply."""
     log = log_callback or (lambda *_: None)
+
+    def safe_log(msg):
+        text_msg = str(msg)
+        try:
+            log(text_msg)
+        except Exception:
+            try:
+                log(text_msg.encode("gbk", errors="replace").decode("gbk", errors="replace"))
+            except Exception:
+                pass
+
     if browser_session is None or getattr(browser_session, "page", None) is None:
-        return False, "browser session 不可用"
+        return False, "browser session unavailable"
 
     page = browser_session.page
     marker = "WEB_CANARY_" + secrets.token_hex(12)
+    prompt = f"Reply exactly: {marker}"
+
+    def current_url():
+        try:
+            return str(getattr(page, "url", "") or "")
+        except Exception:
+            return ""
+
+    def dismiss_age_modal_if_any():
+        try:
+            state = page.run_js(
+                r"""
+const body = (document.body && document.body.innerText || '').replace(/\s+/g, ' ');
+const hit = /请确认你的年龄|选择你的出生年份|confirm your age|birth year|出生年份/i.test(body);
+if (!hit) return {hit:false};
+function visible(node) {
+  if (!node) return false;
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+function textOf(node) {
+  return [node.innerText, node.textContent, node.getAttribute && node.getAttribute('aria-label')].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+}
+const btn = Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"]'))
+  .filter(visible)
+  .find((node) => /继续|continue|确认|confirm/i.test(textOf(node)));
+if (!btn) return {hit:true, clicked:false};
+btn.click();
+return {hit:true, clicked:true, text: textOf(btn).slice(0,40)};
+"""
+            )
+            if isinstance(state, dict) and state.get("clicked"):
+                safe_log(f"[*] canary 前关闭年龄弹窗: {state}")
+                sleep_with_cancel(0.8, cancel_callback)
+            return state
+        except Exception as exc:
+            return {"error": type(exc).__name__}
+
+    def find_editor():
+        for candidate in page.eles('css:textarea,[contenteditable="true"]', timeout=0.8) or []:
+            try:
+                if candidate.states.is_displayed and candidate.states.is_enabled:
+                    return candidate
+            except Exception:
+                continue
+        return None
+
+    def fill_prompt():
+        editor = find_editor()
+        if editor is None:
+            return {"filled": False, "reason": "no-editor"}
+        # Prefer real keystrokes so React controlled inputs enable send.
+        try:
+            editor.click(by_js=False, timeout=2.0)
+        except Exception:
+            pass
+        try:
+            editor.clear(by_js=False)
+        except Exception:
+            pass
+        typed_ok = False
+        try:
+            page.actions.type(prompt, interval=random.uniform(0.02, 0.05))
+            typed_ok = True
+        except Exception:
+            try:
+                editor.input(prompt, clear=True, by_js=False)
+                typed_ok = True
+            except Exception:
+                typed_ok = False
+        if not typed_ok:
+            js_fill = page.run_js(
+                r"""
+const value = arguments[0];
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+if (!editor) return {filled:false, reason:'no-editor'};
+editor.focus();
+try { editor.click(); } catch (e) {}
+if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
+  const proto = editor.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+  const tracker = editor._valueTracker;
+  if (tracker) tracker.setValue('');
+  if (setter) setter.call(editor, value); else editor.value = value;
+} else {
+  try { document.execCommand('selectAll', false, null); } catch (e) {}
+  try { document.execCommand('insertText', false, value); } catch (e) {
+    editor.textContent = value;
+  }
+}
+editor.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, data:value, inputType:'insertText'}));
+editor.dispatchEvent(new InputEvent('input', {bubbles:true, data:value, inputType:'insertText'}));
+editor.dispatchEvent(new Event('change', {bubbles:true}));
+const now = (editor.value || editor.innerText || editor.textContent || '');
+return {filled: now.includes(value.slice(0, 20)), via:'js', len: now.length};
+""",
+                prompt,
+            )
+            return js_fill if isinstance(js_fill, dict) else {"filled": False, "reason": "js-fill-failed"}
+
+        verify = page.run_js(
+            r"""
+const needle = arguments[0];
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+if (!editor) return {filled:false, reason:'no-editor'};
+const now = (editor.value || editor.innerText || editor.textContent || '');
+const send = document.querySelector('button[data-testid="chat-submit"]');
+return {
+  filled: now.includes(needle.slice(0, 24)),
+  editorLen: now.length,
+  hasSend: Boolean(send),
+  sendDisabled: Boolean(send && send.disabled),
+  via: 'native'
+};
+""",
+            marker,
+        )
+        if isinstance(verify, dict):
+            return verify
+        return {"filled": True, "via": "native-unverified"}
+
+    def click_send():
+        # 1) native chat-submit
+        send = page.ele('css:button[data-testid="chat-submit"]', timeout=0.8)
+        if send:
+            try:
+                if send.states.is_displayed and send.states.is_enabled:
+                    send.click(by_js=False, timeout=2.0)
+                    return {"sent": True, "via": "native-chat-submit"}
+            except Exception as exc:
+                last = type(exc).__name__
+            else:
+                last = "send-disabled-or-hidden"
+        else:
+            last = "no-chat-submit"
+
+        # 2) JS click submit-like buttons
+        js_send = page.run_js(
+            r"""
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+function textOf(node) {
+  return [node.innerText, node.textContent, node.getAttribute('aria-label')].filter(Boolean).join(' ').toLowerCase();
+}
+let send = document.querySelector('button[data-testid="chat-submit"]');
+if (!send || !visible(send) || send.disabled) {
+  send = Array.from(document.querySelectorAll('button,[role="button"]')).find((node) => {
+    if (!visible(node) || node.disabled) return false;
+    const t = textOf(node);
+    return t.includes('send') || t.includes('提交') || t.includes('发送') || node.getAttribute('data-testid') === 'chat-submit';
+  });
+}
+if (!send) return {sent:false, reason:'chat-submit-unavailable'};
+if (send.disabled) return {sent:false, reason:'chat-submit-disabled'};
+send.click();
+return {sent:true, via:'js-click'};
+"""
+        )
+        if isinstance(js_send, dict) and js_send.get("sent"):
+            return js_send
+
+        # 3) Enter / Ctrl+Enter fallbacks
+        try:
+            page.actions.key("Enter")
+            return {"sent": True, "via": "enter-key"}
+        except Exception:
+            pass
+        try:
+            page.run_js(
+                r"""
+const editor = document.querySelector('textarea,[contenteditable="true"]');
+if (editor) editor.focus();
+const ev = new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true});
+(editor || document).dispatchEvent(ev);
+return true;
+"""
+            )
+            return {"sent": True, "via": "js-enter"}
+        except Exception as exc:
+            return {"sent": False, "reason": f"{last}/{type(exc).__name__}"}
+
+    def inspect_submit_state():
+        return page.run_js(
+            r"""
+const marker = arguments[0];
+const promptPrefix = arguments[1];
+function visible(node) {
+  if (!node) return false;
+  const rect = node.getBoundingClientRect();
+  const style = getComputedStyle(node);
+  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+}
+const userSelectors = [
+  '[data-message-author-role="user"]',
+  '[data-role="user"]',
+  '[data-testid*="user-message"]',
+  '[data-testid*="user"]',
+];
+const userMatch = userSelectors.some((selector) =>
+  Array.from(document.querySelectorAll(selector)).some((node) => {
+    const text = (node.innerText || node.textContent || '');
+    return text.includes(marker) || text.includes(promptPrefix);
+  })
+);
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
+const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
+const body = document.body && document.body.innerText || '';
+const bodyHasMarker = body.includes(marker);
+const editorHasMarker = editorText.includes(marker);
+// submitted if user bubble exists, or marker left the editor and appears in page,
+// or editor cleared after send while body still shows the prompt text.
+const submitted = Boolean(
+  userMatch
+  || (bodyHasMarker && !editorHasMarker)
+  || (bodyHasMarker && editorText.trim().length === 0)
+);
+const send = document.querySelector('button[data-testid="chat-submit"]');
+return {
+  submitted,
+  userMatch,
+  bodyHasMarker,
+  editorHasMarker,
+  editorLen: editorText.length,
+  sendDisabled: Boolean(send && send.disabled),
+  permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
+  ageModal: /请确认你的年龄|选择你的出生年份|confirm your age|birth year/i.test(body),
+  url: location.href,
+  bodyPreview: body.replace(/\s+/g, ' ').trim().slice(0, 160),
+};
+""",
+            marker,
+            "Reply exactly:",
+        )
+
     try:
         page.get("https://grok.com/")
         surface_deadline = time.time() + min(30, max(10, int(timeout or 60) // 2))
         surface_state = {}
         while time.time() < surface_deadline:
             raise_if_cancelled(cancel_callback)
+            dismiss_age_modal_if_any()
             try:
                 surface_state = page.run_js(
                     r"""
@@ -1851,120 +2389,93 @@ return {
 """
                 )
             except Exception as exc:
-                surface_state = {
-                    "error": type(exc).__name__,
-                    "url": str(getattr(page, "url", "")),
-                }
+                surface_state = {"error": type(exc).__name__, "url": current_url()}
             if isinstance(surface_state, dict) and surface_state.get("ready"):
                 break
-            current_url = str(
-                (surface_state or {}).get("url") or getattr(page, "url", "")
-            )
-            if "tos-gate" in current_url or "/login" in current_url:
-                return False, f"网页对话界面被门禁阻断: {current_url[:160]}"
+            current = str((surface_state or {}).get("url") or current_url())
+            if "tos-gate" in current or "/login" in current:
+                return False, f"网页对话表面被门禁拦截: {current[:160]}"
             sleep_with_cancel(0.5, cancel_callback)
         else:
             detail = surface_state if isinstance(surface_state, dict) else {}
             return False, (
-                "网页对话界面等待超时: "
-                f"url={str(detail.get('url') or getattr(page, 'url', ''))[:140]}, "
+                "网页对话表面等待超时: "
+                f"url={str(detail.get('url') or current_url())[:140]}, "
                 f"readyState={detail.get('readyState')}, editor={detail.get('hasEditor')}, "
                 f"send={detail.get('hasSend')}, disabled={detail.get('sendDisabled')}"
             )
 
-        editor_result = page.run_js(
-            r"""
-const marker = arguments[0];
-function visible(node) {
-  if (!node) return false;
-  const rect = node.getBoundingClientRect();
-  const style = getComputedStyle(node);
-  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-}
-const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find(visible);
-if (!editor) return {sent: false, reason: 'no-editor', url: location.href};
-const value = 'Reply exactly: ' + marker;
-editor.focus();
-if (editor.tagName === 'TEXTAREA' || editor.tagName === 'INPUT') {
-  const descriptor = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(editor), 'value');
-  if (descriptor && descriptor.set) descriptor.set.call(editor, value);
-  else editor.value = value;
-} else {
-  editor.textContent = value;
-}
-editor.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
-editor.dispatchEvent(new Event('change', {bubbles: true}));
-return {filled: true, url: location.href};
-""",
-            marker,
-        )
-        if not isinstance(editor_result, dict) or not editor_result.get("filled"):
-            return False, (
-                f"网页对话填写失败: {(editor_result or {}).get('reason', 'unknown')}"
-            )
-        send_deadline = time.time() + 10
-        send_result = {}
-        while time.time() < send_deadline:
+        submitted_state = None
+        max_submit_attempts = 3
+        for attempt in range(1, max_submit_attempts + 1):
             raise_if_cancelled(cancel_callback)
-            send_result = page.run_js(
-                r"""
-function visible(node) {
-  if (!node) return false;
-  const rect = node.getBoundingClientRect();
-  const style = getComputedStyle(node);
-  return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-}
+            dismiss_age_modal_if_any()
+            url_now = current_url()
+            if "tos-gate" in url_now or "/login" in url_now:
+                return False, f"网页对话填写时被门禁拦截: {url_now[:160]}"
+
+            fill_result = fill_prompt()
+            safe_log(f"[*] canary 填表 第 {attempt}/{max_submit_attempts} 次: {fill_result}")
+            if not isinstance(fill_result, dict) or not fill_result.get("filled"):
+                sleep_with_cancel(0.6, cancel_callback)
+                continue
+
+            # Wait briefly for send button enablement after React state updates.
+            enable_deadline = time.time() + 5
+            while time.time() < enable_deadline:
+                raise_if_cancelled(cancel_callback)
+                st = page.run_js(
+                    r"""
 const send = document.querySelector('button[data-testid="chat-submit"]');
-if (!send || !visible(send) || send.disabled) return {sent: false, reason: 'chat-submit-unavailable'};
-send.click();
-return {sent: true, via: 'chat-submit', url: location.href};
+return {hasSend: Boolean(send), disabled: Boolean(send && send.disabled)};
 """
-            )
-            if isinstance(send_result, dict) and send_result.get("sent"):
-                break
-            sleep_with_cancel(0.5, cancel_callback)
+                )
+                if isinstance(st, dict) and st.get("hasSend") and not st.get("disabled"):
+                    break
+                sleep_with_cancel(0.25, cancel_callback)
+
+            send_result = click_send()
+            safe_log(f"[*] canary 发送 第 {attempt}/{max_submit_attempts} 次: {send_result}")
+            if not isinstance(send_result, dict) or not send_result.get("sent"):
+                # one more enter fallback already included; retry fill
+                sleep_with_cancel(0.5, cancel_callback)
+                continue
+
+            submit_deadline = time.time() + 15
+            while time.time() < submit_deadline:
+                raise_if_cancelled(cancel_callback)
+                dismiss_age_modal_if_any()
+                submitted_state = inspect_submit_state()
+                if isinstance(submitted_state, dict) and submitted_state.get("permissionDenied"):
+                    return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
+                if isinstance(submitted_state, dict) and submitted_state.get("ageModal"):
+                    safe_log("[*] canary 提交后仍见年龄弹窗，点击继续后重试确认")
+                    dismiss_age_modal_if_any()
+                if isinstance(submitted_state, dict) and submitted_state.get("submitted"):
+                    safe_log(f"[+] canary 已确认真实提交: {submitted_state}")
+                    break
+                sleep_with_cancel(0.5, cancel_callback)
+            else:
+                safe_log(
+                    f"[!] canary 第 {attempt} 次未确认提交: {submitted_state}"
+                )
+                # If editor still holds text, force Enter once more before next attempt.
+                try:
+                    page.actions.key("Enter")
+                except Exception:
+                    pass
+                continue
+            break
         else:
+            detail = submitted_state if isinstance(submitted_state, dict) else {}
             return False, (
-                f"网页对话发送失败: {(send_result or {}).get('reason', 'unknown')}"
+                "网页对话未确认真实提交: "
+                f"userMatch={detail.get('userMatch')}, bodyHasMarker={detail.get('bodyHasMarker')}, "
+                f"editorHasMarker={detail.get('editorHasMarker')}, editorLen={detail.get('editorLen')}, "
+                f"url={str(detail.get('url') or current_url())[:120]}"
             )
 
-        submit_deadline = time.time() + 5
-        while time.time() < submit_deadline:
-            raise_if_cancelled(cancel_callback)
-            submitted = page.run_js(
-                r"""
-const marker = arguments[0];
-const userSelectors = [
-  '[data-message-author-role="user"]',
-  '[data-role="user"]',
-  '[data-testid*="user-message"]',
-];
-const userMatch = userSelectors.some((selector) =>
-  Array.from(document.querySelectorAll(selector)).some((node) => (node.innerText || '').includes(marker))
-);
-const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find((node) => {
-  const rect = node.getBoundingClientRect();
-  return rect.width > 0 && rect.height > 0;
-});
-const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
-const body = document.body && document.body.innerText || '';
-return {
-  submitted: userMatch || (!editorText.includes(marker) && body.includes(marker)),
-  permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
-  url: location.href,
-};
-""",
-                marker,
-            )
-            if isinstance(submitted, dict) and submitted.get("permissionDenied"):
-                return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
-            if isinstance(submitted, dict) and submitted.get("submitted"):
-                break
-            sleep_with_cancel(0.5, cancel_callback)
-        else:
-            return False, "网页对话未确认真实提交"
-
-        deadline = time.time() + max(20, int(timeout or 60))
+        deadline = time.time() + max(25, int(timeout or 60))
         while time.time() < deadline:
             raise_if_cancelled(cancel_callback)
             result = page.run_js(
@@ -1981,6 +2492,7 @@ const assistantMatch = assistantSelectors.some((selector) =>
 const body = document.body && document.body.innerText || '';
 return {
   assistantMatch,
+  bodyHasMarker: body.includes(marker),
   permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
   url: location.href,
 };
@@ -1990,12 +2502,36 @@ return {
             if isinstance(result, dict) and result.get("permissionDenied"):
                 return False, "网页对话首次提交返回 PERMISSION_DENIED/403"
             if isinstance(result, dict) and result.get("assistantMatch"):
-                log("[+] 网页对话 canary 已收到 assistant 精确回复")
+                safe_log("[+] 网页对话 canary 已收到 assistant 精确回复")
                 return True, "ok"
-            sleep_with_cancel(1.5, cancel_callback)
+            if isinstance(result, dict) and result.get("bodyHasMarker"):
+                body_only = page.run_js(
+                    r"""
+const marker = arguments[0];
+const body = document.body && document.body.innerText || '';
+const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="true"]')).find((node) => {
+  const rect = node.getBoundingClientRect();
+  return rect.width > 0 && rect.height > 0;
+});
+const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
+const occurrences = body.split(marker).length - 1;
+return {occurrences, editorHas: editorText.includes(marker)};
+""",
+                    marker,
+                )
+                # user + assistant both showing marker => occurrences >= 2
+                if (
+                    isinstance(body_only, dict)
+                    and int(body_only.get("occurrences") or 0) >= 2
+                    and not body_only.get("editorHas")
+                ):
+                    safe_log("[+] 网页对话 canary 已在页面中确认 canary 回复")
+                    return True, "ok"
+            sleep_with_cancel(1.0, cancel_callback)
         return False, "网页对话 canary 等待 assistant 回复超时"
     except Exception as exc:
         return False, f"browser_chat_canary 异常: {exc}"
+
 
 
 def browser_chat_canary(
@@ -2111,7 +2647,7 @@ return {
         else:
             return False, f"网页对话发送失败: {(send_result or {}).get('reason', 'unknown')}"
 
-        submit_deadline = time.time() + 5
+        submit_deadline = time.time() + 15
         while time.time() < submit_deadline:
             raise_if_cancelled(cancel_callback)
             submitted = page.run_js(
@@ -2132,9 +2668,11 @@ const editor = Array.from(document.querySelectorAll('textarea,[contenteditable="
 const editorText = editor && (editor.value || editor.innerText || editor.textContent) || '';
 const body = document.body && document.body.innerText || '';
 return {
-  submitted: userMatch || (!editorText.includes(prompt) && body.includes(prompt)),
+  submitted: userMatch || (body.includes(prompt) && !editorText.includes(prompt)) || (body.includes(prompt) && editorText.trim().length === 0),
   permissionDenied: /permission-denied|access to the chat endpoint is denied/i.test(body),
   url: location.href,
+  userMatch,
+  editorLen: editorText.length,
 };
 """,
                 prompt,
@@ -3923,6 +4461,9 @@ def register_one(session, shared, worker_id, slot_no):
         retry_delay=2.0,
     )
     if not birth_ok:
+        if not config.get("hide_window", False):
+            log("[*] hide_window=false：出生日期未通过，浏览器保留 180 秒供人工查看页面")
+            sleep_with_cancel(180, cancel)
         raise RuntimeError(f"出生日期设置未通过，账号不可用: {birth_msg}")
     if not server_mode:
         chat_ok, chat_msg = browser_chat_canary(

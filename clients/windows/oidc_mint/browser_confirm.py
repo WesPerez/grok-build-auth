@@ -468,20 +468,177 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
-def _find_button_exact(page: Any, label: str) -> Any | None:
-    try:
-        for el in page.eles("tag:button") or []:
+def _iter_clickables(page: Any):
+    selectors = [
+        "tag:button",
+        "css:button",
+        "css:[role='button']",
+        "css:input[type='submit']",
+        "css:input[type='button']",
+        "css:a[role='button']",
+    ]
+    seen = set()
+    for sel in selectors:
+        try:
+            els = page.eles(sel, timeout=0.3) or []
+        except TypeError:
             try:
-                if _norm(el.text or "") == label:
-                    return el
+                els = page.eles(sel) or []
+            except Exception:
+                els = []
+        except Exception:
+            els = []
+        for el in els:
+            try:
+                key = id(el)
+                if key in seen:
+                    continue
+                seen.add(key)
+                yield el
             except Exception:
                 continue
+
+
+def _element_label(el: Any) -> str:
+    parts = []
+    try:
+        parts.append(str(getattr(el, "text", "") or ""))
     except Exception:
         pass
+    for name in ("aria-label", "value", "title", "data-testid"):
+        try:
+            parts.append(str(el.attr(name) or ""))
+        except Exception:
+            pass
     try:
-        return page.ele(f"xpath://button[normalize-space(.)='{label}']", timeout=0.3)
+        parts.append(str(getattr(el, "raw_text", "") or ""))
     except Exception:
+        pass
+    return _norm(" ".join(parts))
+
+
+def _find_button_exact(page: Any, label: str) -> Any | None:
+    target = _norm(label)
+    if not target:
         return None
+    for el in _iter_clickables(page):
+        try:
+            if _element_label(el) == target:
+                return el
+        except Exception:
+            continue
+    target_l = target.lower()
+    for el in _iter_clickables(page):
+        try:
+            lab = _element_label(el)
+            if not lab:
+                continue
+            low = lab.lower()
+            if low == target_l or target_l in low or low in target_l:
+                return el
+        except Exception:
+            continue
+    for xp in (
+        f"xpath://button[normalize-space(.)='{label}']",
+        f"xpath://*[@role='button' and normalize-space(.)='{label}']",
+        f"xpath://button[contains(normalize-space(.), '{label}')]",
+        f"xpath://*[@role='button' and contains(normalize-space(.), '{label}')]",
+    ):
+        try:
+            el = page.ele(xp, timeout=0.3)
+            if el:
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def _list_visible_buttons(page: Any, limit: int = 12) -> list[str]:
+    out: list[str] = []
+    for el in _iter_clickables(page):
+        try:
+            lab = _element_label(el)
+            if lab:
+                out.append(lab[:60])
+        except Exception:
+            continue
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _click_continue_like(
+    page: Any,
+    log: LogFn,
+    *,
+    real: bool = True,
+    labels: list[str] | None = None,
+) -> str | None:
+    labels = labels or [
+        "继续",
+        "Continue",
+        "允许",
+        "Allow",
+        "Authorize",
+        "Approve",
+        "确认",
+        "Confirm",
+        "Next",
+        "下一步",
+    ]
+    hit = _click_exact(page, labels, log, real=real)
+    if hit:
+        return hit
+    try:
+        result = page.run_js(
+            r"""
+function visible(node){
+  if(!node) return false;
+  const st=getComputedStyle(node); const r=node.getBoundingClientRect();
+  return r.width>0 && r.height>0 && st.display!=='none' && st.visibility!=='hidden' && !node.disabled;
+}
+function textOf(node){
+  return [node.innerText,node.textContent,node.getAttribute('aria-label'),node.getAttribute('value'),node.getAttribute('title')]
+    .filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+}
+function score(t){
+  const s=String(t||'').toLowerCase().replace(/\s+/g,'');
+  let n=0;
+  if(s==='继续'||s==='continue'||s==='允许'||s==='allow') n+=120;
+  if(s.includes('继续')||s.includes('continue')) n+=100;
+  if(s.includes('允许')||s.includes('allow')||s.includes('authorize')||s.includes('approve')) n+=95;
+  if(s.includes('确认')||s.includes('confirm')||s.includes('next')||s.includes('下一步')) n+=70;
+  if(s.includes('cancel')||s.includes('取消')||s.includes('deny')||s.includes('拒绝')) n-=200;
+  return n;
+}
+const nodes=[...document.querySelectorAll('button,[role="button"],input[type="submit"],input[type="button"]')]
+  .filter(visible)
+  .map(node=>({node,text:textOf(node),score:score(textOf(node))}))
+  .filter(x=>x.score>0)
+  .sort((a,b)=>b.score-a.score);
+if(!nodes.length){
+  return {ok:false, buttons:[...document.querySelectorAll('button,[role="button"]')].filter(visible).map(textOf).slice(0,10)};
+}
+const best=nodes[0];
+try{best.node.scrollIntoView({block:'center'});}catch(e){}
+try{best.node.click();}catch(e){
+  try{best.node.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));}catch(e2){}
+}
+return {ok:true, text:(best.text||'').slice(0,60), score:best.score};
+"""
+        )
+        if isinstance(result, dict) and result.get("ok"):
+            log("clicked JS scored continue-like: " + str(result.get("text")))
+            return str(result.get("text") or "js-continue")
+        if isinstance(result, dict):
+            log("continue-like not found buttons=" + str(result.get("buttons")))
+    except Exception as e:
+        log(f"continue-like js failed: {e}")
+    buttons = _list_visible_buttons(page)
+    if buttons:
+        log(f"visible buttons: {buttons}")
+    return None
+
 
 
 def _click_exact(
@@ -678,24 +835,43 @@ def approve_device_code(
             phase = "device"
             continue
 
-        # Consent page — REAL click exact 允许
-        if "/consent" in url or "授权 Grok Build" in text or "Authorize Grok Build" in text:
+        # Consent / Authorize Grok Build page - must click Continue/Allow
+        low_text = (text or "").lower()
+        is_consent = (
+            "/consent" in url
+            or "/oauth2/device/consent" in url
+            or "授权 Grok Build" in text
+            or "Authorize Grok Build" in text
+            or "authorize — grok" in low_text
+            or "authorize - grok" in low_text
+            or ("authorize" in low_text and "grok" in low_text)
+            or ("授权" in text and "Grok" in text)
+        )
+        if is_consent:
             phase = "consent"
-            # Prefer real click; React needs it to set form action=allow
-            if _click_exact(page, ["允许", "Allow", "Authorize", "Approve"], log, real=True):
+            log("consent/authorize page detected; buttons=" + str(_list_visible_buttons(page)))
+            if _click_continue_like(
+                page,
+                log,
+                real=True,
+                labels=["继续", "Continue", "允许", "Allow", "Authorize", "Approve", "确认", "Confirm"],
+            ):
                 _sleep(2.5)
                 continue
-            # last resort: set action and submit
             try:
                 page.run_js(
-                    """
+                    r"""
                     const f=document.querySelector('form');
-                    if(!f) return;
+                    if(!f) return false;
                     let a=f.querySelector('input[name=action]');
                     if(!a){a=document.createElement('input');a.type='hidden';a.name='action';f.appendChild(a);}
                     a.value='allow';
-                    const btn=[...f.querySelectorAll('button')].find(b=>((b.innerText||'').trim())==='允许'||(b.innerText||'').trim()==='Allow');
+                    const btn=[...f.querySelectorAll('button,[role="button"]')].find(b=>{
+                      const t=((b.innerText||b.textContent||'')+'').replace(/\s+/g,' ').trim().toLowerCase();
+                      return t==='继续'||t==='continue'||t==='允许'||t==='allow'||t.includes('authorize')||t.includes('继续')||t.includes('允许');
+                    });
                     if(btn) btn.click(); else f.submit();
+                    return true;
                     """
                 )
                 log("consent form submit via JS fallback")
@@ -717,7 +893,7 @@ def approve_device_code(
                         log("filled user_code")
                 except Exception:
                     pass
-            if _click_exact(page, ["继续", "Continue"], log, real=False):
+            if _click_continue_like(page, log, real=True, labels=["继续", "Continue", "Next", "下一步"]):
                 _sleep(2.0)
                 continue
             try:
@@ -732,7 +908,7 @@ def approve_device_code(
 
         # Account redirect
         if "正在重定向" in text or ("/account" in url and "sign-in" not in url):
-            if _click_exact(page, ["继续", "Continue"], log, real=False):
+            if _click_continue_like(page, log, real=True, labels=["继续", "Continue", "Next", "下一步"]):
                 _sleep(2.0)
                 continue
 
@@ -791,6 +967,12 @@ def approve_device_code(
                 if "sign-in" not in _page_url(page):
                     break
             continue
+
+        # Generic continue for device/login/build intermediate pages.
+        if phase in ("device", "email", "account", "consent") or "device" in url or "oauth2" in url or "authorize" in url.lower():
+            if _click_continue_like(page, log, real=True):
+                _sleep(1.8)
+                continue
 
         _sleep(1.0)
 
