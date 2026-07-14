@@ -344,6 +344,26 @@ python3 scripts/register_and_import.py \
 
 `preimport-probe-failed` 不能靠无脑 resume 解决。先判断是资格传播、token、代理、403 entitlement 还是 429 额度，再决定等待、补 OAuth 或隔离账号。
 
+### 4.10 批次安全收口
+
+账号完成导入、逐账号测试和分组测试后，先对精确批次执行只读 dry-run：
+
+```bash
+python3 scripts/finalize_grok_batch.py --batch <batch-id>
+```
+
+dry-run 会重新核对本地 auth、bundle、生产账号的 email/subject、access/refresh 凭据、唯一 Grok 分组、调度状态、官方 CLI base URL、实时指定账号测试、分组测试和所有数据库恢复点。正常账号与明确 free-usage/spending-limit 的 402/429 账号均可收口；容量、网络、permission、revoked 和未知错误必须停止。
+
+全部通过后再提交精确清理：
+
+```bash
+python3 scripts/finalize_grok_batch.py \
+  --batch <batch-id> \
+  --confirm-cleanup
+```
+
+提交会先原子写入脱敏 handoff 和带 source hash 到账号 ID 映射的 checkpoint，再删除已成功交接账号的精确 auth、token bundle 和成功注册日志。密码恢复结果、失败尝试材料和本批数据库恢复点默认保留；最终 `manifest.json`、`handoff.json` 和 `import/*.json` 不包含邮箱、token 或密码。
+
 ## 5. 外部客户端路径
 
 ### 5.1 部署边界和要求
