@@ -202,7 +202,9 @@ def test_windows_main_has_no_global_process_kill():
     assert "for chat_attempt in range(1, 4)" in source
     assert "网页对话前门禁回退" in source
     assert "server_client_mode_enabled()" in source
-    assert "if server_mode:" in browser_gate
+    assert "server_mode = server_client_mode_enabled()" in browser_gate
+    assert "if not server_mode:" in browser_gate
+    assert "chat_ready_stable if server_mode else chat_ready" in browser_gate
 
 
 def test_windows_example_defaults_to_single_hidden_worker():

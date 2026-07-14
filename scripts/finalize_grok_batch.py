@@ -29,6 +29,8 @@ ORCHESTRATOR_PATH = PROJECT_DIR / "scripts" / "register_and_import.py"
 BATCH_ID_RE = re.compile(r"^\d{8}T\d{6}Z-[a-f0-9]{6}$")
 GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 ALLOWED_RUNTIME_STATUSES = {"imported-preprobed", "postimport-account-probe-failed"}
+PREPARED_ARTIFACT = "closeout-prepared.json"
+PREPARED_TTL_SECONDS = 30 * 60
 
 
 class FinalizeError(RuntimeError):
@@ -66,11 +68,28 @@ def atomic_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        data = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode()
+        with temp.open("wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
         temp.chmod(0o600)
         os.replace(temp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         temp.unlink(missing_ok=True)
+
+
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 def sha256_file(path: Path) -> str:
@@ -187,7 +206,7 @@ def registered_sources(batch_dir: Path, manifest: dict[str, Any]) -> list[dict[s
             "identity_sha256": hashlib.sha256(email.encode()).hexdigest(),
             "subject_sha256": hashlib.sha256(subject.encode()).hexdigest(),
             "result_path": result_path,
-            "log_path": log_path,
+            "log_path": log_path, "log_sha256": sha256_file(log_path),
         })
     if not sources:
         raise FinalizeError("batch has no registered auth sources")
@@ -309,6 +328,21 @@ select a.id, a.platform, a.type, a.status, a.schedulable,
          select 1 from account_groups ag join groups g on g.id=ag.group_id
          where ag.account_id=a.id and g.deleted_at is null
            and g.name='grok' and g.platform='grok'
+       ),
+       (
+         select count(*)
+         from accounts other
+         where other.deleted_at is null and other.platform='grok'
+           and (
+             (
+               coalesce(a.credentials->>'email','') <> ''
+               and lower(coalesce(other.credentials->>'email','')) = lower(a.credentials->>'email')
+             )
+             or (
+               coalesce(a.credentials->>'sub','') <> ''
+               and coalesce(other.credentials->>'sub','') = a.credentials->>'sub'
+             )
+           )
        )
 from accounts a
 where a.deleted_at is null and a.id in ({ids})
@@ -324,7 +358,7 @@ order by a.id;
     rows: dict[int, dict[str, Any]] = {}
     for line in proc.stdout.splitlines():
         parts = line.split("\t")
-        if len(parts) != 13 or not parts[0].isdigit():
+        if len(parts) != 14 or not parts[0].isdigit():
             raise FinalizeError("unexpected exact account query output")
         token = parts[6]
         refresh_token = parts[7]
@@ -338,6 +372,7 @@ order by a.id;
             "subject_sha256": hashlib.sha256(parts[9].strip().encode()).hexdigest() if parts[9] else "",
             "proxy_id": int(parts[10]), "group_count": int(parts[11]),
             "bound_grok": parts[12] == "t",
+            "global_identity_count": int(parts[13]),
         }
         rows[row["id"]] = row
     if set(rows) != set(account_ids):
@@ -384,6 +419,7 @@ def map_sources_to_accounts(
             or row["status"] != "active" or not row["schedulable"]
             or row["base_url"] != GROK_CLI_BASE_URL
             or row["proxy_id"] != 0 or row["group_count"] != 1 or not row["bound_grok"]
+            or row.get("global_identity_count") != 1
         ):
             raise FinalizeError(f"account {row['id']} failed static Grok state verification")
         mappings.append({
@@ -396,9 +432,19 @@ def map_sources_to_accounts(
     return sorted(mappings, key=lambda item: item["account_id"])
 
 
-def classify_probe(item: dict[str, Any]) -> str:
-    if item.get("status") == 200 and item.get("completed") is True:
-        return "usable"
+def classify_probe_evidence(item: dict[str, Any]) -> dict[str, Any]:
+    observed_at = utc_now()
+    availability = str(item.get("availability") or "")
+    if availability == "usable" or (item.get("status") == 200 and item.get("completed") is True):
+        return {
+            "classification": "usable", "code": str(item.get("code") or "COMPLETED"),
+            "status": int(item.get("status") or 200), "observed_at": observed_at,
+        }
+    if availability == "usable_exhausted" and item.get("code") == "RATE_LIMITED":
+        return {
+            "classification": "usable_exhausted", "code": "RATE_LIMITED",
+            "status": int(item.get("status") or 0), "observed_at": observed_at,
+        }
     error = str(item.get("error") or "").lower()
     explicit_quota = (
         "subscription:free-usage-exhausted" in error
@@ -407,21 +453,29 @@ def classify_probe(item: dict[str, Any]) -> str:
         or ("used all the included free usage" in error and "rolling 24-hour window" in error)
     )
     if ("429" in error or "402" in error) and explicit_quota:
-        return "usable_exhausted"
+        status = 429 if "429" in error else 402
+        return {
+            "classification": "usable_exhausted", "code": "RATE_LIMITED",
+            "status": status, "observed_at": observed_at,
+        }
     raise FinalizeError(f"account {item.get('account_id')} has no decisive usable probe")
 
 
-def classify_probe_results(results: Any, account_ids: list[int]) -> dict[int, str]:
+def classify_probe(item: dict[str, Any]) -> str:
+    return str(classify_probe_evidence(item)["classification"])
+
+
+def classify_probe_results(results: Any, account_ids: list[int]) -> dict[int, dict[str, Any]]:
     if not isinstance(results, list) or len(results) != len(account_ids):
         raise FinalizeError("batch specified-account probes are incomplete")
-    classifications: dict[int, str] = {}
+    classifications: dict[int, dict[str, Any]] = {}
     for item in results:
         if not isinstance(item, dict) or not isinstance(item.get("account_id"), int):
             raise FinalizeError("invalid specified-account probe result")
         account_id = int(item["account_id"])
         if account_id in classifications:
             raise FinalizeError("duplicate specified-account probe result")
-        classifications[account_id] = classify_probe(item)
+        classifications[account_id] = classify_probe_evidence(item)
     if set(classifications) != set(account_ids):
         raise FinalizeError("specified-account probe IDs differ from imported IDs")
     return classifications
@@ -429,7 +483,7 @@ def classify_probe_results(results: Any, account_ids: list[int]) -> dict[int, st
 
 def historical_probe_classifications(
     manifest: dict[str, Any], account_ids: list[int],
-) -> dict[int, str]:
+) -> dict[int, dict[str, Any]]:
     preprobe = manifest.get("preimport_auth_probes") or {}
     if (
         preprobe.get("tested") != len(account_ids)
@@ -456,6 +510,7 @@ def validate_backup_with_pg_restore(config: dict[str, str], path: Path) -> None:
 
 def backup_records(
     batch_dir: Path, config: dict[str, str], helper_backup: dict[str, Any],
+    runtime_manifest: dict[str, Any],
     *, verifier: Callable[[dict[str, str], Path], None] = validate_backup_with_pg_restore,
 ) -> list[dict[str, Any]]:
     backup_dir = batch_dir / "backup"
@@ -464,18 +519,62 @@ def backup_records(
     paths = sorted(path for path in backup_dir.iterdir() if path.is_file() and not path.is_symlink())
     if not paths or any(path.suffix != ".dump" for path in paths):
         raise FinalizeError("batch backup directory contains no exact dump set")
+    evidence_by_name: dict[str, dict[str, Any]] = {}
+    helper_path = require_exact_child(str(helper_backup.get("path") or ""), backup_dir)
+
+    def add_evidence(raw: Any, *, kind: str, source: str) -> None:
+        if not isinstance(raw, dict) or not raw.get("path"):
+            return
+        evidence_path = require_exact_child(str(raw["path"]), backup_dir)
+        if evidence_path.name == helper_path.name:
+            kind = "pre_sub2api_import"
+        existing = evidence_by_name.get(evidence_path.name)
+        record = {
+            "kind": str(raw.get("kind") or kind), "source": source,
+            "bytes": raw.get("bytes"), "sha256": raw.get("sha256"),
+            "created_at": raw.get("created_at"),
+        }
+        if existing and existing["source"] == "import/helper.log":
+            return
+        if existing and existing["kind"] != record["kind"]:
+            raise FinalizeError(f"backup role conflict: {evidence_path.name}")
+        evidence_by_name[evidence_path.name] = record
+
+    add_evidence(helper_backup, kind="pre_sub2api_import", source="import/helper.log")
+    for item in runtime_manifest.get("backup_history") or []:
+        add_evidence(item, kind="pre_grok_reconcile", source="manifest.json:backup_history")
+    add_evidence(
+        runtime_manifest.get("backup"), kind="pre_grok_reconcile",
+        source="manifest.json:backup",
+    )
+
     records = []
     for path in paths:
         if stat.S_IMODE(path.stat().st_mode) != 0o600:
             raise FinalizeError(f"backup permissions must be 0600: {path.name}")
+        evidence = evidence_by_name.get(path.name)
+        if evidence is None:
+            raise FinalizeError(f"backup has no durable role evidence: {path.name}")
+        actual_bytes = path.stat().st_size
+        actual_sha256 = sha256_file(path)
+        if evidence.get("bytes") not in (None, actual_bytes):
+            raise FinalizeError(f"backup size differs from recorded evidence: {path.name}")
+        if evidence.get("sha256") not in (None, actual_sha256):
+            raise FinalizeError(f"backup hash differs from recorded evidence: {path.name}")
         verifier(config, path)
         records.append({
-            "file": f"backup/{path.name}", "bytes": path.stat().st_size,
-            "sha256": sha256_file(path), "pg_restore_list_verified": True,
-            "retention": "retain-pending-policy",
+            "kind": evidence["kind"], "source": evidence["source"],
+            "file": f"backup/{path.name}", "bytes": actual_bytes,
+            "sha256": actual_sha256,
+            "created_at": evidence.get("created_at") or dt.datetime.fromtimestamp(
+                path.stat().st_mtime, tz=dt.timezone.utc
+            ).isoformat().replace("+00:00", "Z"),
+            "pg_restore_list_verified": True,
+            "pg_restore_list_verified_at": utc_now(),
+            "retention_status": "retain_until_explicit_backup_policy",
+            "deleted_at": None,
         })
-    referenced_path = require_exact_child(str(helper_backup.get("path") or ""), backup_dir)
-    referenced = next((item for item in records if item["file"] == f"backup/{referenced_path.name}"), None)
+    referenced = next((item for item in records if item["file"] == f"backup/{helper_path.name}"), None)
     if referenced is None:
         raise FinalizeError("import recovery point is not present in the batch backup set")
     if (
@@ -525,9 +624,9 @@ def live_probe_classifications(
     config: dict[str, str], account_ids: list[int],
     probe: Callable[[dict[str, str], list[int]], list[dict[str, Any]]],
     *, attempts: int = 3, retry_delay: float = 5.0,
-) -> dict[int, str]:
+) -> dict[int, dict[str, Any]]:
     pending = list(account_ids)
-    classifications: dict[int, str] = {}
+    classifications: dict[int, dict[str, Any]] = {}
     for attempt in range(attempts):
         results = probe(config, pending)
         if (
@@ -539,7 +638,7 @@ def live_probe_classifications(
         for item in results:
             account_id = int(item["account_id"])
             try:
-                classifications[account_id] = classify_probe(item)
+                classifications[account_id] = classify_probe_evidence(item)
             except FinalizeError:
                 retry_ids.append(account_id)
         if not retry_ids:
@@ -571,13 +670,17 @@ def prepare_closeout(
     historical_probe_classifications(manifest, account_ids)
     classifications = live_probe_classifications(config, account_ids, live_account_probe)
     live_group_probe(config)
-    backups = backup_records(batch_dir, config, evidence["backup"], verifier=backup_verifier)
+    backups = backup_records(
+        batch_dir, config, evidence["backup"], manifest, verifier=backup_verifier,
+    )
     bundles = bundle_records(batch_dir, sources)
     helper_path = require_exact_child(batch_dir / "import" / "helper.log", batch_dir / "import")
     helper_record = {"path": helper_path, "sha256": sha256_file(helper_path)}
     failures = failure_summary(manifest)
-    usable = sum(value == "usable" for value in classifications.values())
-    exhausted = sum(value == "usable_exhausted" for value in classifications.values())
+    usable = sum(value["classification"] == "usable" for value in classifications.values())
+    exhausted = sum(
+        value["classification"] == "usable_exhausted" for value in classifications.values()
+    )
     completed_at = utc_now()
 
     accounts = []
@@ -593,8 +696,8 @@ def prepare_closeout(
             "production_refresh_present": True,
             "production_refresh_match": item["production_refresh_match"],
             "action": evidence["action"],
-            "usability": classifications[item["account_id"]],
-            "specified_account_probe": "passed" if classifications[item["account_id"]] == "usable" else "quota",
+            "usability": classifications[item["account_id"]]["classification"],
+            "specified_account_probe": classifications[item["account_id"]],
             "platform": "grok", "type": "oauth", "status": "active",
             "schedulable": True, "group": "grok", "group_count": 1,
             "official_base_url": True, "proxy_id": 0,
@@ -643,6 +746,78 @@ def prepare_closeout(
     }
 
 
+def _canonical_sha256(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def prepared_artifact_payload(batch_dir: Path, prepared: dict[str, Any]) -> dict[str, Any]:
+    prepared_at = utc_now()
+    expires_at = (
+        dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=PREPARED_TTL_SECONDS)
+    ).isoformat().replace("+00:00", "Z")
+    payload = {
+        "schema_version": 1, "batch_id": batch_dir.name,
+        "status": "live-verification-prepared", "prepared_at": prepared_at,
+        "expires_at": expires_at, "account_ids": prepared["account_ids"],
+        "manifest": prepared["manifest"],
+        "evidence": {
+            "action": prepared["evidence"]["action"],
+            "created": prepared["evidence"]["created"],
+            "failed": prepared["evidence"]["failed"],
+        },
+        "mappings": [{
+            **{key: value for key, value in item.items() if key not in {"auth_path", "result_path", "log_path"}},
+            "auth_path": str(Path(item["auth_path"]).relative_to(batch_dir)),
+            "result_path": str(Path(item["result_path"]).relative_to(batch_dir)),
+            "log_path": str(Path(item["log_path"]).relative_to(batch_dir)),
+        } for item in prepared["mappings"]],
+        "bundles": [{
+            **{key: value for key, value in item.items() if key != "path"},
+            "path": str(Path(item["path"]).relative_to(batch_dir)),
+        } for item in prepared["bundles"]],
+        "helper_log": {
+            "path": str(Path(prepared["helper_log"]["path"]).relative_to(batch_dir)),
+            "sha256": prepared["helper_log"]["sha256"],
+        },
+    }
+    payload["artifact_sha256"] = _canonical_sha256(payload)
+    return payload
+
+
+def write_prepared_artifact(batch_dir: Path, prepared: dict[str, Any]) -> Path:
+    path = batch_dir / "import" / PREPARED_ARTIFACT
+    atomic_json(path, prepared_artifact_payload(batch_dir, prepared))
+    return path
+
+
+def load_prepared_artifact(batch_dir: Path, *, allow_expired: bool = False) -> dict[str, Any]:
+    path = batch_dir / "import" / PREPARED_ARTIFACT
+    payload = load_json(require_exact_child(path, batch_dir / "import"))
+    expected_hash = str(payload.pop("artifact_sha256", ""))
+    if not expected_hash or _canonical_sha256(payload) != expected_hash:
+        raise FinalizeError("prepared closeout artifact hash mismatch")
+    if payload.get("batch_id") != batch_dir.name or payload.get("status") != "live-verification-prepared":
+        raise FinalizeError("prepared closeout artifact has invalid identity or status")
+    try:
+        expires_at = dt.datetime.fromisoformat(str(payload["expires_at"]).replace("Z", "+00:00"))
+    except (KeyError, ValueError) as exc:
+        raise FinalizeError("prepared closeout artifact has invalid expiry") from exc
+    if expires_at <= dt.datetime.now(dt.timezone.utc) and not allow_expired:
+        raise FinalizeError("prepared closeout artifact expired; run live verification again")
+    payload["artifact_sha256"] = expected_hash
+    for item in payload.get("mappings") or []:
+        item["auth_path"] = require_exact_child(batch_dir / item["auth_path"], batch_dir, must_exist=False)
+        item["result_path"] = require_exact_child(batch_dir / item["result_path"], batch_dir, must_exist=False)
+        item["log_path"] = require_exact_child(batch_dir / item["log_path"], batch_dir, must_exist=False)
+    for item in payload.get("bundles") or []:
+        item["path"] = require_exact_child(batch_dir / item["path"], batch_dir, must_exist=False)
+    payload["helper_log"]["path"] = require_exact_child(
+        batch_dir / payload["helper_log"]["path"], batch_dir, must_exist=False,
+    )
+    return payload
+
+
 def _remove_empty_parent(path: Path, boundary: Path) -> int:
     removed = 0
     current = path
@@ -675,107 +850,182 @@ def enforce_private_permissions(batch_dir: Path) -> None:
             path.chmod(0o600)
 
 
-def commit_closeout(batch_dir: Path, prepared: dict[str, Any]) -> dict[str, Any]:
-    mappings = prepared["mappings"]
-    validated_sources: list[tuple[Path, Path]] = []
-    for item in mappings:
-        auth_path = require_exact_child(item["auth_path"], batch_dir / "auth")
-        if sha256_file(auth_path) != item["auth_file_sha256"]:
-            raise FinalizeError("auth source changed after closeout preparation")
-        log_path = require_exact_child(item["log_path"], batch_dir / "logs")
-        validated_sources.append((auth_path, log_path))
-
-    validated_bundles: list[Path] = []
+def _cleanup_entries(batch_dir: Path, prepared: dict[str, Any]) -> list[dict[str, Any]]:
+    raw: list[tuple[str, Path, str]] = []
+    for item in prepared["mappings"]:
+        auth_path = require_exact_child(item["auth_path"], batch_dir / "auth", must_exist=False)
+        log_path = require_exact_child(item["log_path"], batch_dir / "logs", must_exist=False)
+        raw.append(("oauth_source", auth_path, str(item["auth_file_sha256"])))
+        raw.append(("successful_log", log_path, str(item.get("log_sha256") or "")))
     for item in prepared["bundles"]:
-        path = require_exact_child(item["path"], batch_dir / "bundle")
-        if sha256_file(path) != item["sha256"]:
-            raise FinalizeError("token bundle changed after closeout preparation")
-        validated_bundles.append(path)
-    helper_item = prepared["helper_log"]
-    validated_helper_log = require_exact_child(helper_item["path"], batch_dir / "import")
-    if sha256_file(validated_helper_log) != helper_item["sha256"]:
-        raise FinalizeError("import helper evidence changed after closeout preparation")
+        raw.append((
+            "token_bundle",
+            require_exact_child(item["path"], batch_dir / "bundle", must_exist=False),
+            str(item["sha256"]),
+        ))
+    helper = prepared["helper_log"]
+    raw.append((
+        "import_helper",
+        require_exact_child(helper["path"], batch_dir / "import", must_exist=False),
+        str(helper["sha256"]),
+    ))
+    entries = []
+    for index, (kind, source, expected_hash) in enumerate(raw):
+        if not expected_hash:
+            if not source.is_file():
+                raise FinalizeError(f"cleanup source hash is unavailable: {source}")
+            expected_hash = sha256_file(source)
+        quarantine = batch_dir / "cleanup" / "quarantine" / f"{index:04d}-{source.name}"
+        entries.append({
+            "kind": kind, "source": str(source.relative_to(batch_dir)),
+            "quarantine": str(quarantine.relative_to(batch_dir)),
+            "sha256": expected_hash, "status": "pending",
+        })
+    return entries
 
+
+def _cleanup_journal(batch_dir: Path, prepared: dict[str, Any]) -> tuple[Path, dict[str, Any]]:
+    path = batch_dir / "import" / "cleanup-journal.json"
+    if path.exists():
+        journal = load_json(path)
+        if journal.get("batch_id") != batch_dir.name:
+            raise FinalizeError("cleanup journal belongs to a different batch")
+        if journal.get("account_ids") != prepared["account_ids"]:
+            raise FinalizeError("cleanup journal account IDs differ from prepared evidence")
+        if (
+            prepared.get("artifact_sha256")
+            and journal.get("prepared_artifact_sha256") != prepared["artifact_sha256"]
+        ):
+            raise FinalizeError("cleanup journal belongs to different prepared evidence")
+        return path, journal
+    journal = {
+        "schema_version": 1, "batch_id": batch_dir.name,
+        "status": "quarantining", "created_at": utc_now(),
+        "account_ids": prepared["account_ids"],
+        "prepared_artifact_sha256": prepared.get("artifact_sha256"),
+        "entries": _cleanup_entries(batch_dir, prepared),
+    }
+    atomic_json(path, journal)
+    return path, journal
+
+
+def _quarantine_entries(batch_dir: Path, journal_path: Path, journal: dict[str, Any]) -> None:
+    quarantine_root = batch_dir / "cleanup" / "quarantine"
+    quarantine_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    for entry in journal["entries"]:
+        if entry["status"] in {"quarantined", "deleted"}:
+            continue
+        source = require_exact_child(batch_dir / entry["source"], batch_dir, must_exist=False)
+        quarantine = require_exact_child(
+            batch_dir / entry["quarantine"], batch_dir / "cleanup", must_exist=False,
+        )
+        if source.is_file():
+            if source.is_symlink() or sha256_file(source) != entry["sha256"]:
+                raise FinalizeError(f"cleanup source changed after live verification: {entry['source']}")
+            quarantine.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            os.replace(source, quarantine)
+            fsync_directory(source.parent)
+            fsync_directory(quarantine.parent)
+        elif not quarantine.is_file() or sha256_file(quarantine) != entry["sha256"]:
+            raise FinalizeError(f"cleanup source and quarantine are both unavailable: {entry['source']}")
+        entry["status"] = "quarantined"
+        entry["quarantined_at"] = utc_now()
+        atomic_json(journal_path, journal)
+    journal["status"] = "quarantined"
+    atomic_json(journal_path, journal)
+
+
+def _purge_quarantine(batch_dir: Path, journal_path: Path, journal: dict[str, Any]) -> None:
+    for entry in journal["entries"]:
+        if entry["status"] == "deleted":
+            continue
+        quarantine = require_exact_child(
+            batch_dir / entry["quarantine"], batch_dir / "cleanup", must_exist=False,
+        )
+        if quarantine.exists():
+            if not quarantine.is_file() or quarantine.is_symlink() or sha256_file(quarantine) != entry["sha256"]:
+                raise FinalizeError(f"quarantined cleanup artifact changed: {entry['quarantine']}")
+            quarantine.unlink()
+            fsync_directory(quarantine.parent)
+        entry["status"] = "deleted"
+        entry["deleted_at"] = utc_now()
+        atomic_json(journal_path, journal)
+    journal["status"] = "completed"
+    journal["completed_at"] = utc_now()
+    atomic_json(journal_path, journal)
+
+
+def commit_closeout(batch_dir: Path, prepared: dict[str, Any]) -> dict[str, Any]:
     checkpoint_path = batch_dir / "import" / "checkpoint.json"
-    atomic_json(checkpoint_path, {
-        "schema_version": 1, "batch_id": batch_dir.name, "status": "closeout-prepared",
-        "account_ids": prepared["account_ids"], "prepared_at": utc_now(),
-        "oauth_source_files": len(mappings),
-        "sources": [{
+    handoff_path = batch_dir / "handoff.json"
+    journal_path, journal = _cleanup_journal(batch_dir, prepared)
+    checkpoint = {
+        "schema_version": 2, "batch_id": batch_dir.name,
+        "status": "closeout-prepared", "account_ids": prepared["account_ids"],
+        "prepared_at": utc_now(), "sources": [{
             "account_id": item["account_id"],
             "auth_file": str(Path(item["auth_path"]).relative_to(batch_dir)),
             "auth_file_sha256": item["auth_file_sha256"],
             "auth_sha256": item["token_sha256"],
             "refresh_sha256": item["refresh_sha256"],
+            "identity_sha256": item["identity_sha256"],
+            "subject_sha256": item["subject_sha256"],
             "log_file": str(Path(item["log_path"]).relative_to(batch_dir)),
-        } for item in mappings],
+        } for item in prepared["mappings"]],
         "bundles": [{"file": item["file"], "sha256": item["sha256"]} for item in prepared["bundles"]],
-    })
-    handoff_path = batch_dir / "handoff.json"
+        "cleanup_journal": str(journal_path.relative_to(batch_dir)),
+    }
+    atomic_json(checkpoint_path, checkpoint)
     prepared_handoff = json.loads(json.dumps(prepared["manifest"]))
     prepared_handoff["status"] = "closeout-prepared"
     atomic_json(handoff_path, prepared_handoff)
 
-    removed_auth = 0
-    removed_logs = 0
-    removed_dirs = 0
-    for auth_path, log_path in validated_sources:
-        auth_path.unlink()
-        removed_auth += 1
-        removed_dirs += _remove_empty_parent(auth_path.parent, batch_dir / "auth")
-        log_path.unlink()
-        removed_logs += 1
-
-    for directory in (batch_dir / "auth", batch_dir / "logs"):
-        if directory.is_dir():
-            removed_dirs += _remove_empty_parent(directory, batch_dir)
-
-    removed_bundles = 0
-    for path in validated_bundles:
-        path.unlink()
-        removed_bundles += 1
-    bundle_dir = batch_dir / "bundle"
-    if bundle_dir.is_dir():
-        removed_dirs += _remove_empty_parent(bundle_dir, batch_dir)
-
-    validated_helper_log.unlink()
-
+    _quarantine_entries(batch_dir, journal_path, journal)
+    counts = {
+        "oauth_source_files": sum(item["kind"] == "oauth_source" for item in journal["entries"]),
+        "token_bundles": sum(item["kind"] == "token_bundle" for item in journal["entries"]),
+        "successful_logs": sum(item["kind"] == "successful_log" for item in journal["entries"]),
+    }
     manifest = prepared["manifest"]
-    manifest["cleanup"].update({
-        "status": "completed", "completed_at": utc_now(),
-        "oauth_source_files": removed_auth, "token_bundles": removed_bundles,
-        "successful_logs": removed_logs, "empty_directories_removed": removed_dirs,
-    })
+    manifest["cleanup"].update({"status": "quarantined", **counts})
     minimal_result = {
         "schema_version": 2, "batch_id": batch_dir.name,
-        "action": prepared["evidence"]["action"],
-        "account_ids": prepared["account_ids"],
+        "action": prepared["evidence"]["action"], "account_ids": prepared["account_ids"],
         "created": prepared["evidence"]["created"], "failed": prepared["evidence"]["failed"],
         "usable": manifest["summary"]["usable"],
         "usable_exhausted": manifest["summary"]["usable_exhausted"],
         "verification": manifest["verification"], "backups": manifest["backups"],
     }
+    checkpoint.update({"status": "quarantined", "cleanup": counts})
     atomic_json(batch_dir / "import" / "result.json", minimal_result)
     atomic_json(batch_dir / "manifest.json", manifest)
     atomic_json(handoff_path, manifest)
-    atomic_json(checkpoint_path, {
-        "schema_version": 1, "batch_id": batch_dir.name, "status": "completed",
-        "account_ids": prepared["account_ids"], "completed_at": utc_now(),
-        "cleanup": {
-            "oauth_source_files": removed_auth, "token_bundles": removed_bundles,
-            "successful_logs": removed_logs,
-        },
+    atomic_json(checkpoint_path, checkpoint)
+    _purge_quarantine(batch_dir, journal_path, journal)
+
+    removed_dirs = 0
+    for directory in (
+        batch_dir / "auth", batch_dir / "logs", batch_dir / "bundle",
+        batch_dir / "cleanup" / "quarantine", batch_dir / "cleanup",
+    ):
+        if directory.is_dir():
+            removed_dirs += _remove_empty_parent(directory, batch_dir)
+    completed_at = utc_now()
+    manifest["cleanup"].update({
+        "status": "completed", "completed_at": completed_at,
+        "empty_directories_removed": removed_dirs,
     })
+    checkpoint.update({"status": "completed", "completed_at": completed_at})
+    atomic_json(batch_dir / "manifest.json", manifest)
+    atomic_json(handoff_path, manifest)
+    atomic_json(checkpoint_path, checkpoint)
     enforce_private_permissions(batch_dir)
     return {
         "batch_id": batch_dir.name, "status": "completed",
         "accounts": len(prepared["account_ids"]),
         "usable": manifest["summary"]["usable"],
         "usable_exhausted": manifest["summary"]["usable_exhausted"],
-        "cleanup": {
-            "oauth_source_files": removed_auth, "token_bundles": removed_bundles,
-            "successful_logs": removed_logs,
-        },
+        "cleanup": counts,
     }
 
 
@@ -783,7 +1033,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Verify and safely close a Grok protocol batch")
     parser.add_argument("--batch", required=True, help="exact batch ID")
     parser.add_argument("--private-dir", default=str(PROJECT_DIR / "private"))
-    parser.add_argument("--confirm-cleanup", action="store_true", help="commit the verified closeout")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument(
+        "--prepare-live-verification", action="store_true",
+        help="run production account/group probes and write a short-lived prepared artifact",
+    )
+    mode.add_argument(
+        "--confirm-cleanup", action="store_true",
+        help="consume a valid prepared artifact without rerunning production probes",
+    )
     return parser.parse_args()
 
 
@@ -791,32 +1049,36 @@ def main() -> int:
     args = parse_args()
     private_dir = Path(args.private_dir).expanduser().resolve()
     batch_dir = resolve_batch_dir(private_dir, args.batch)
-    config = load_env(private_dir / "runtime.env")
-    sub2api_url = urlparse(config.get("SUB2API_URL", ""))
-    if (
-        config.get("SUB2API_GROUP") != "grok"
-        or config.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/") != GROK_CLI_BASE_URL
-        or sub2api_url.scheme != "http"
-        or sub2api_url.hostname not in {"127.0.0.1", "localhost", "::1"}
-        or sub2api_url.username is not None
-        or sub2api_url.password is not None
-    ):
-        raise FinalizeError("runtime config is not the exact Grok production target")
     lock = acquire_non_destructive_batch_lock(private_dir)
     try:
-        prepared = prepare_closeout(batch_dir, config)
-        if args.confirm_cleanup:
-            result = commit_closeout(batch_dir, prepared)
-        else:
+        if args.prepare_live_verification:
+            config = load_env(private_dir / "runtime.env")
+            sub2api_url = urlparse(config.get("SUB2API_URL", ""))
+            if (
+                config.get("SUB2API_GROUP") != "grok"
+                or config.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/") != GROK_CLI_BASE_URL
+                or sub2api_url.scheme != "http"
+                or sub2api_url.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or sub2api_url.username is not None
+                or sub2api_url.password is not None
+            ):
+                raise FinalizeError("runtime config is not the exact Grok production target")
+            prepared = prepare_closeout(batch_dir, config)
+            artifact_path = write_prepared_artifact(batch_dir, prepared)
             manifest = prepared["manifest"]
             result = {
-                "batch_id": batch_dir.name, "status": "dry-run-passed",
+                "batch_id": batch_dir.name, "status": "live-verification-prepared",
                 "accounts": len(prepared["account_ids"]),
                 "usable": manifest["summary"]["usable"],
                 "usable_exhausted": manifest["summary"]["usable_exhausted"],
                 "backups_verified": len(manifest["backups"]),
-                "cleanup_required": True,
+                "prepared_artifact": str(artifact_path.relative_to(batch_dir)),
+                "expires_in_seconds": PREPARED_TTL_SECONDS,
             }
+        else:
+            journal_exists = (batch_dir / "import" / "cleanup-journal.json").is_file()
+            prepared = load_prepared_artifact(batch_dir, allow_expired=journal_exists)
+            result = commit_closeout(batch_dir, prepared)
     finally:
         lock.close()
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
