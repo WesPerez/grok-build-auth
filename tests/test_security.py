@@ -68,9 +68,18 @@ class SecurityTests(unittest.TestCase):
     def test_redaction(self):
         secret = "header.payload.signature-long"
         text = redact_text(
-            f"access_token=abc123 password=hunter2 url=https://user:pass@example.test/path?code=abc sso={secret}"
+            f'access_token=abc123 password=hunter2 url=https://user:pass@example.test/path?code=abc '
+            f'sso={secret} response={{"code":"oauth-code-value","refresh_token":"refresh-value"}}'
         )
-        for value in ("abc123", "hunter2", "user:pass", "?code=abc", secret):
+        for value in (
+            "abc123",
+            "hunter2",
+            "user:pass",
+            "?code=abc",
+            secret,
+            "oauth-code-value",
+            "refresh-value",
+        ):
             self.assertNotIn(value, text)
         self.assertEqual(mask_email("alice@example.com"), "a***@example.com")
 

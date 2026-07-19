@@ -114,6 +114,7 @@ backup/*.dump
 | 变量 | 说明 |
 |---|---|
 | `SUB2API_ENV` | Sub2API 部署的私有环境文件 |
+| `SUB2API_ENVIRONMENT` | 已核验的目标环境：`production`、`preproduction`、`test`、`development` 或 `local` |
 | `SUB2API_URL` | 本机管理/API 地址，推荐 loopback |
 | `SUB2API_POSTGRES_CONTAINER` | PostgreSQL 容器 |
 | `SUB2API_PG_USER`、`SUB2API_PG_DB` | 数据库用户和库名 |

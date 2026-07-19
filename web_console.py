@@ -27,6 +27,11 @@ TASK_STATE_PATH = PRIVATE_DIR / "web" / "current-task.json"
 ACTIVE_BATCH_STATUSES = {"running", "importing", "resuming-import"}
 DOCTOR_CACHE_TTL = 30.0
 GROK_CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
+SUB2API_ENVIRONMENTS = frozenset({"local", "development", "test", "preproduction", "production"})
+
+
+def valid_sub2api_environment(value: str) -> bool:
+    return (value or "").strip().lower() in SUB2API_ENVIRONMENTS
 
 
 def read_json(path: Path) -> dict:
@@ -167,6 +172,7 @@ def doctor() -> list[dict]:
             "YESCAPTCHA_API_KEY", "IMAP_SERVER", "IMAP_PASSWORD", "MAILU_DOMAIN",
             "MAILU_DB", "MAILU_ADMIN_CONTAINER", "MAILU_FLASK_BIN",
             "MAILU_IMAP_CONTAINER", "MAILU_MAIL_ROOT", "SUB2API_ENV",
+            "SUB2API_ENVIRONMENT",
             "SUB2API_URL", "SUB2API_GROUP", "SUB2API_POSTGRES_CONTAINER",
             "SUB2API_PG_USER", "SUB2API_PG_DB", "SUB2API_IMPORT_TOOL",
             "GROK_ACCOUNT_BASE_URL",
@@ -210,6 +216,14 @@ def doctor() -> list[dict]:
         add("Sub2API 地址", parsed.hostname in {"127.0.0.1", "localhost", "::1"}, "本机回环地址，不使用外部代理" if parsed.hostname in {"127.0.0.1", "localhost", "::1"} else "必须使用本机回环地址")
         helper = Path(values.get("SUB2API_IMPORT_TOOL", ""))
         add("导入工具", helper.is_file(), str(helper) if helper.is_file() else "导入工具路径无效")
+        sub2api_environment = values.get("SUB2API_ENVIRONMENT", "")
+        add(
+            "Sub2API 环境",
+            valid_sub2api_environment(sub2api_environment),
+            f"目标环境: {sub2api_environment}"
+            if valid_sub2api_environment(sub2api_environment)
+            else "SUB2API_ENVIRONMENT 必须是 production、preproduction、test、development 或 local",
+        )
         grok_target_ok = (
             values.get("SUB2API_GROUP") == "grok"
             and values.get("GROK_ACCOUNT_BASE_URL", "").rstrip("/") == GROK_CLI_BASE_URL

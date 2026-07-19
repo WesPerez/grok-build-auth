@@ -68,11 +68,16 @@ _SECRET_FIELD = re.compile(
     r"(?i)(access_token|refresh_token|id_token|authorization|cookie|password|sso|code(?:_verifier)?)"
     r"\s*[:=]\s*([^\s,;&]+)"
 )
+_JSON_SECRET_FIELD = re.compile(
+    r'(?i)(["\'](?:access_token|refresh_token|id_token|authorization|cookie|password|sso|'
+    r'code(?:_verifier)?)["\']\s*:\s*["\'])([^"\']+)(["\'])'
+)
 
 
 def redact_text(value: Any) -> str:
     text = str(value)
     text = re.sub(r"https?://[^\s]+", lambda m: sanitize_url(m.group(0)), text)
+    text = _JSON_SECRET_FIELD.sub(lambda m: f"{m.group(1)}<redacted>{m.group(3)}", text)
     text = _SECRET_FIELD.sub(lambda m: f"{m.group(1)}=<redacted>", text)
     text = re.sub(r"\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}(?:\.[A-Za-z0-9_-]{10,})?\b", "<redacted-jwt>", text)
     return text[:500]

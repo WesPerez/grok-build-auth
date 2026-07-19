@@ -32,6 +32,7 @@ def main() -> int:
     parser.add_argument("--batch", required=True)
     parser.add_argument("--private-dir", default=str(PROJECT_DIR / "private"))
     parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument("--debug", action="store_true", help="Enable redacted OAuth diagnostics")
     args = parser.parse_args()
 
     batch_module = load_batch_module()
@@ -87,6 +88,7 @@ def main() -> int:
                     protocol=True,
                     playwright_fallback=True,
                     headless=True,
+                    debug=args.debug,
                 )
                 auth_path = Path(str(oauth.cliproxyapi_path or ""))
                 auth_path = auth_path.resolve()

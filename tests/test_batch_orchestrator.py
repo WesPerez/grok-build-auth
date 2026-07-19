@@ -156,6 +156,44 @@ def test_grok_target_config_requires_dedicated_group_and_official_cli_url():
         })
 
 
+def test_import_command_carries_ops_environment_and_write_confirmations(tmp_path):
+    command = MODULE.build_sub2api_import_command({
+        "SUB2API_IMPORT_TOOL": "/skills/k12-sub2api-ops/scripts/sub2api_live_tool.py",
+        "SUB2API_POSTGRES_CONTAINER": "sub2api-prod-postgres",
+        "SUB2API_PG_USER": "sub2api",
+        "SUB2API_PG_DB": "sub2api",
+        "SUB2API_ENVIRONMENT": "production",
+        "SUB2API_ENV": "/srv/sub2api/.env",
+        "SUB2API_URL": "http://127.0.0.1:13080",
+        "SUB2API_GROUP": "grok",
+    }, bundle_path=tmp_path / "bundle.json", backup_dir=tmp_path / "backup",
+       confirm_production_write=True)
+
+    assert command[command.index("--environment") + 1] == "production"
+    assert "--confirm-write" in command
+    assert "--confirm-production-write" in command
+
+
+def test_production_import_command_rejects_missing_confirmation(tmp_path):
+    config = {
+        "SUB2API_IMPORT_TOOL": "/skills/k12-sub2api-ops/scripts/sub2api_live_tool.py",
+        "SUB2API_POSTGRES_CONTAINER": "sub2api-prod-postgres",
+        "SUB2API_PG_USER": "sub2api",
+        "SUB2API_PG_DB": "sub2api",
+        "SUB2API_ENVIRONMENT": "production",
+        "SUB2API_ENV": "/srv/sub2api/.env",
+        "SUB2API_URL": "http://127.0.0.1:13080",
+        "SUB2API_GROUP": "grok",
+    }
+    with pytest.raises(MODULE.BatchError, match="confirm-production-write"):
+        MODULE.build_sub2api_import_command(
+            config,
+            bundle_path=tmp_path / "bundle.json",
+            backup_dir=tmp_path / "backup",
+            confirm_production_write=False,
+        )
+
+
 def test_reconcile_updates_exact_ids_through_admin_api(monkeypatch):
     updated = []
     monkeypatch.setattr(MODULE, "grok_group_id", lambda config: 5)
@@ -229,6 +267,13 @@ def test_doctor_cache_avoids_repeated_probes(monkeypatch):
     assert len(calls) == 1
     WEB_MODULE.cached_doctor(force=True)
     assert len(calls) == 2
+
+
+def test_web_console_validates_sub2api_environment():
+    assert WEB_MODULE.valid_sub2api_environment("production")
+    assert WEB_MODULE.valid_sub2api_environment("test")
+    assert not WEB_MODULE.valid_sub2api_environment("")
+    assert not WEB_MODULE.valid_sub2api_environment("prod")
 
 
 def test_state_marks_active_batch_interrupted_without_process(monkeypatch):

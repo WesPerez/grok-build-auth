@@ -286,6 +286,45 @@ def validate_grok_target_config(config: dict[str, str]) -> str:
     return value
 
 
+def validate_sub2api_environment(config: dict[str, str]) -> str:
+    value = config.get("SUB2API_ENVIRONMENT", "").strip().lower()
+    allowed = {"local", "development", "test", "preproduction", "production"}
+    if value not in allowed:
+        raise BatchError(
+            "SUB2API_ENVIRONMENT must be one of local, development, test, "
+            "preproduction, production"
+        )
+    return value
+
+
+def build_sub2api_import_command(
+    config: dict[str, str],
+    *,
+    bundle_path: Path,
+    backup_dir: Path,
+    confirm_production_write: bool,
+) -> list[str]:
+    environment = validate_sub2api_environment(config)
+    if environment in {"production", "preproduction"} and not confirm_production_write:
+        raise BatchError("production import requires --confirm-production-write")
+    command = [
+        sys.executable, config["SUB2API_IMPORT_TOOL"], "import",
+        "--bundle", str(bundle_path),
+        "--postgres-container", config["SUB2API_POSTGRES_CONTAINER"],
+        "--pg-user", config["SUB2API_PG_USER"],
+        "--pg-db", config["SUB2API_PG_DB"],
+        "--environment", environment,
+        "--env-file", config["SUB2API_ENV"],
+        "--base-url", config["SUB2API_URL"],
+        "--backup-dir", str(backup_dir),
+        "--group", config["SUB2API_GROUP"],
+        "--confirm-write",
+    ]
+    if confirm_production_write:
+        command.append("--confirm-production-write")
+    return command
+
+
 def mailbox_exists(db_path: Path, email: str) -> bool:
     with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
         row = conn.execute("select count(*) from user where email = ?", (email,)).fetchone()
@@ -1026,10 +1065,11 @@ def main() -> int:
     validate_grok_target_config(config)
     if not args.no_import:
         require_config(config, [
-            "SUB2API_ENV", "SUB2API_URL", "SUB2API_GROUP",
+            "SUB2API_ENV", "SUB2API_ENVIRONMENT", "SUB2API_URL", "SUB2API_GROUP",
             "SUB2API_POSTGRES_CONTAINER", "SUB2API_PG_USER", "SUB2API_PG_DB",
             "SUB2API_IMPORT_TOOL", "GROK_ACCOUNT_BASE_URL",
         ])
+        validate_sub2api_environment(config)
         if bind_proxy_after_import:
             validate_sub2api_proxy_ids(config, proxy_pool)
     proxy_health = None
@@ -1343,17 +1383,12 @@ def main() -> int:
     if missing_auth_paths:
         pending_bundle_path = batch_dir / "bundle" / "pending-sub2api-bundle.json"
         atomic_json(pending_bundle_path, build_bundle(missing_auth_paths, config["GROK_ACCOUNT_BASE_URL"].rstrip("/")))
-        command = [
-            sys.executable, config["SUB2API_IMPORT_TOOL"], "import",
-            "--bundle", str(pending_bundle_path),
-            "--postgres-container", config["SUB2API_POSTGRES_CONTAINER"],
-            "--pg-user", config["SUB2API_PG_USER"],
-            "--pg-db", config["SUB2API_PG_DB"],
-            "--env-file", config["SUB2API_ENV"],
-            "--base-url", config["SUB2API_URL"],
-            "--backup-dir", str(batch_dir / "backup"),
-            "--group", config["SUB2API_GROUP"],
-        ]
+        command = build_sub2api_import_command(
+            config,
+            bundle_path=pending_bundle_path,
+            backup_dir=batch_dir / "backup",
+            confirm_production_write=args.confirm_production_write,
+        )
         set_manifest_stage(manifest, manifest_path, "sub2api-import")
         print(f"Importing {len(missing_auth_paths)} missing accounts; {len(existing)} already exist", flush=True)
         proc = run(

@@ -47,6 +47,8 @@ TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 CREATE_SESSION_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateSession"
 CREATE_COOKIE_SETTER_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
+SESSION_COOKIE_NAMES = frozenset({"sso", "sso-rw", "sso_jwt", "cf_clearance", "__cf_bm"})
+SESSION_COOKIE_DOMAINS = (".x.ai", "accounts.x.ai", "auth.x.ai")
 # Observed Next.js server action for the consent Allow button (may change on deploy).
 SUBMIT_OAUTH2_CONSENT_ACTION = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
 
@@ -204,17 +206,17 @@ class ProtocolOAuthClient:
             cookie_dict = {str(k): str(v) for k, v in cookies.items() if v is not None}
         else:
             return
+        loaded_names: set[str] = set()
         for name, value in cookie_dict.items():
-            if name != "sso":
+            if name not in SESSION_COOKIE_NAMES:
                 continue
-            try:
-                self._s.cookies.set(name, value, domain="accounts.x.ai")
-            except Exception:
+            for domain in SESSION_COOKIE_DOMAINS:
                 try:
-                    self._s.cookies.set(name, value)
+                    self._s.cookies.set(name, value, domain=domain)
                 except Exception:
                     pass
-        self._log("loaded allowlisted cookies into OAuth session")
+            loaded_names.add(name)
+        self._log(f"loaded allowlisted session cookies: {sorted(loaded_names)}")
 
     def _log(self, msg: str) -> None:
         if self.debug:
@@ -230,16 +232,65 @@ class ProtocolOAuthClient:
         return self._s.get(url, headers=h, allow_redirects=allow_redirects, timeout=45)
 
     def _set_sso_cookie(self, jwt_token: str) -> None:
-        """Attach accounts.x.ai session JWT as the ``sso`` cookie used by AuthManagement."""
+        """Attach the session JWT to the xAI auth hosts used during OAuth."""
         if not jwt_token:
             return
-        try:
-            self._s.cookies.set("sso", jwt_token, domain="accounts.x.ai")
-        except Exception:
+        for name in ("sso", "sso-rw"):
+            for domain in SESSION_COOKIE_DOMAINS:
+                try:
+                    self._s.cookies.set(name, jwt_token, domain=domain)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _find_consent_action_id(source: str) -> Optional[str]:
+        """Find the server action bound to submitOAuth2Consent in HTML or JS."""
+        if not source or "submitOAuth2Consent" not in source:
+            return None
+        patterns = (
+            r'createServerReference\)\("([a-f0-9]{40,44})"[^)]{0,500}submitOAuth2Consent',
+            r'"([a-f0-9]{40,44})".{0,500}submitOAuth2Consent',
+            r'submitOAuth2Consent.{0,500}"([a-f0-9]{40,44})"',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, source, re.I | re.S)
+            if match:
+                return match.group(1)
+        return None
+
+    def _resolve_consent_action_id(self, page_url: str, page_html: str) -> str:
+        """Resolve the deployment-specific consent action from live Next.js assets."""
+        inline = self._find_consent_action_id(page_html)
+        if inline:
+            self._log(f"consent action resolved from HTML: {inline[:16]}...")
+            return inline
+
+        script_urls: list[str] = []
+        seen: set[str] = set()
+        for raw in re.findall(r'<script[^>]+src=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', page_html, re.I):
+            url = urljoin(page_url, raw.replace("&amp;", "&"))
+            if url in seen:
+                continue
+            seen.add(url)
+            script_urls.append(url)
+        self._log(f"searching {len(script_urls)} consent JS chunks")
+
+        for url in script_urls:
             try:
-                self._s.cookies.set("sso", jwt_token)
+                response = self._get(url, headers={"accept": "*/*"})
             except Exception:
-                pass
+                continue
+            if response.status_code != 200:
+                continue
+            action_id = self._find_consent_action_id(response.text or "")
+            if action_id:
+                self._log(
+                    f"consent action resolved from {sanitize_url(url)}: {action_id[:16]}..."
+                )
+                return action_id
+
+        self._log("live consent action was not found; using compatibility fallback")
+        return SUBMIT_OAUTH2_CONSENT_ACTION
 
     def create_cookie_setter_link(
         self,
@@ -568,13 +619,7 @@ class ProtocolOAuthClient:
             """POST Next.js submitOAuth2Consent server action; return authorization code."""
             import json as _json
 
-            action_id = SUBMIT_OAUTH2_CONSENT_ACTION
-            # Prefer live action id from page chunks if present.
-            m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent', page_html)
-            if not m:
-                m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"', page_html)
-            if m:
-                action_id = m.group(1)
+            action_id = self._resolve_consent_action_id(page_url, page_html)
 
             # Router state tree for consent page (URL-encoded JSON).
             from urllib.parse import quote as _quote
@@ -615,7 +660,12 @@ class ProtocolOAuthClient:
             if resp.status_code >= 400 or (resp.text and "error" in resp.text[:200].lower() and "code" not in resp.text):
                 resp = self._s.post(page_url, headers=headers, data=body, timeout=45)
             text = resp.text or ""
-            self._log(f"consent action HTTP {resp.status_code} body={text[:180]!r}")
+            has_code = bool(re.search(r'"code"\s*:\s*"[^"]+"|code=[A-Za-z0-9._~\-]+', text))
+            has_success = bool(re.search(r'"success"\s*:\s*true', text, re.I))
+            self._log(
+                f"consent action HTTP {resp.status_code} "
+                f"success={has_success} code_present={has_code}"
+            )
             # Response may be RSC flight text containing JSON with code.
             m = re.search(r'"code"\s*:\s*"([^"]+)"', text)
             if m:
