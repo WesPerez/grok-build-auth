@@ -1,4 +1,4 @@
 interface:
   display_name: "Grok Sub2API Operations"
-  short_description: "注册、导入、恢复并逐账号验证 Grok OAuth"
-  default_prompt: "使用 $grok-sub2api-ops 处理明确的 Grok OAuth 账号注册、auth 导入或恢复，并完成逐账号验证。"
+  short_description: "注册、导入、恢复并治理 Grok OAuth 账号出口"
+  default_prompt: "使用 $grok-sub2api-ops 处理明确的 Grok OAuth 注册、auth 导入、账号恢复、出口型 402 或真实 429 无探针代理绑定，并完成对应验收。"

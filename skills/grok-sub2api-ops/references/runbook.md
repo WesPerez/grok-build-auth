@@ -58,6 +58,8 @@ GROK_OAUTH_TOKEN_REFRESH_FAILED
 
 ## 账号状态
 
+出口型 402 与已有被动证据的真实 429 预绑定，直接读取 [grok-egress-402-warp-429.zh-CN.md](grok-egress-402-warp-429.zh-CN.md)。两类账号不得放进同一探针批次。
+
 | 结果 | 含义 | 动作 |
 |---|---|---|
 | 指定账号 test completed | 当前真实可用 | 保持入组和调度 |
@@ -67,7 +69,7 @@ GROK_OAUTH_TOKEN_REFRESH_FAILED
 | 网络、TLS、5xx | 结果不确定 | 修复链路后复测 |
 | 未绑定分组 | 历史或中断状态 | 查导入证据，不能直接删除 |
 
-数据库 active、schedulable 或 refresh token 字段存在都不是可用证据。审计必须调用指定账号 test；分组请求只作为整体补充。
+数据库 active、schedulable 或 refresh token 字段存在都不是可用证据。一般恢复审计必须调用指定账号 test；唯一例外是已锁定真实 429 的无探针出口预绑定，此时只证明 proxy 绑定，不证明额度恢复。分组请求只作为整体补充。
 
 ## Bridge 验收
 
