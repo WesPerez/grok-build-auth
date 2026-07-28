@@ -177,6 +177,21 @@ def test_cpa_export_requires_bridge_probe(tmp_path, monkeypatch):
         sys.path.remove(str(CLIENT))
 
 
+def test_cpa_export_and_runner_wire_playwright_oauth_fallback():
+    export_source = (CLIENT / "cpa_export.py").read_text(encoding="utf-8")
+    assert 'cfg.get("mint_playwright_fallback", False)' in export_source
+    assert 'cfg.get("mint_playwright_headless", True)' in export_source
+    run_source = (ROOT / "run.py").read_text(encoding="utf-8")
+    assert "--oauth-playwright-fallback" in run_source
+    assert "playwright_fallback=oauth_playwright_fallback" in run_source
+    batch_source = (SCRIPTS / "register_and_import.py").read_text(encoding="utf-8")
+    assert "--oauth-playwright-fallback" in batch_source
+    assert "GROK_OAUTH_PLAYWRIGHT_FALLBACK" in batch_source
+    recover_source = (SCRIPTS / "recover_batch_oauth.py").read_text(encoding="utf-8")
+    assert 'headless=not headed' in recover_source
+    assert "playwright_fallback=True" in recover_source
+
+
 def test_windows_main_has_no_global_process_kill():
     source = (CLIENT / "grok_register_ttk.py").read_text(encoding="utf-8-sig")
     cleanup = source.split("def cleanup_stray_chrome", 1)[1].split("def create_browser_options", 1)[0]
@@ -194,12 +209,16 @@ def test_windows_main_has_no_global_process_kill():
     assert "numbers.length === 1" in chat_canary
     assert "native_registration_interactions" in source
     assert "_native_type" in source
+    assert "form.requestSubmit(button || undefined)" in source
+    assert "验证码页面未转场，提交兜底" in source
+    assert "_wait_for_otp_transition" in source
     assert "has_chat_editor" in browser_gate
     assert "chat_ready_stable" in browser_gate
     assert 'result.get("assistantMatch")' in chat_canary
     assert 'result.get("occurrences")' not in chat_canary
     assert "网页对话首次提交返回 PERMISSION_DENIED/403" in chat_canary
-    assert "for chat_attempt in range(1, 4)" in source
+    assert "for chat_attempt in range(1, chat_retries + 1)" in source
+    assert "assistant 回复超时" in source
     assert "网页对话前门禁回退" in source
     assert "server_client_mode_enabled()" in source
     assert "server_mode = server_client_mode_enabled()" in browser_gate
@@ -241,6 +260,33 @@ def test_server_client_mode_is_linux_only(tmp_path, monkeypatch):
         monkeypatch.setattr(client.sys, "platform", "linux")
         assert client.server_client_mode_enabled() is True
         assert client.native_registration_enabled() is True
+    finally:
+        if str(CLIENT) in sys.path:
+            sys.path.remove(str(CLIENT))
+
+
+def test_verification_code_prefers_subject_and_ignores_html_css(monkeypatch):
+    sys.path.insert(0, str(CLIENT))
+    try:
+        drission = types.ModuleType("DrissionPage")
+        drission.Chromium = object
+        drission.ChromiumOptions = object
+        drission_errors = types.ModuleType("DrissionPage.errors")
+        drission_errors.PageDisconnectedError = RuntimeError
+        curl_cffi = types.ModuleType("curl_cffi")
+        curl_cffi.requests = object()
+        monkeypatch.setitem(sys.modules, "DrissionPage", drission)
+        monkeypatch.setitem(sys.modules, "DrissionPage.errors", drission_errors)
+        monkeypatch.setitem(sys.modules, "curl_cffi", curl_cffi)
+        client = load_module("grok_code_parser_test", CLIENT / "grok_register_ttk.py")
+        body = "<style>.mj-column-per-100{width:100%}</style><p>Use the code below</p>"
+        assert client.extract_verification_code(
+            body,
+            "SpaceXAI confirmation code: 57X-SPF",
+        ) == "57X-SPF"
+        assert client.extract_verification_code(
+            "<style>.mj-column-per-100{width:100%}</style>confirmation code: 57X-SPF",
+        ) == "57X-SPF"
     finally:
         if str(CLIENT) in sys.path:
             sys.path.remove(str(CLIENT))
@@ -314,10 +360,14 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     assert '"duckmail_domain": duckmail_domain' in runner_source
     assert '"duckmail_api_base": mail_api_base' in runner_source
     assert 'parser.add_argument("--mail-domain"' in runner_source
+    assert 'read_env(project / "private" / "runtime.env")' in runner_source
+    assert 'env.setdefault(key, value)' in runner_source
     assert config["client_root"] == str(CLIENT)
     assert config["max_concurrency"] == 1
     assert config["hide_window"] is False
     assert config["cpa_require_created"] is True
+    assert config["mint_playwright_fallback"] is True
+    assert config["mint_playwright_headless"] is False
     assert config["cpa_auth_dir"] == str(tmp_path / "cpa_auths")
     assert config["success_records_file"] == str(tmp_path / "successes.jsonl")
 

@@ -56,6 +56,7 @@ def test_bridge_uses_secret_files_and_signed_mailbox_tokens(monkeypatch, tmp_pat
 
 def test_bridge_probe_parses_json(monkeypatch, tmp_path):
     bridge = load_bridge(monkeypatch, tmp_path)
+    captured = {}
 
     class Response:
         def __enter__(self):
@@ -67,8 +68,13 @@ def test_bridge_probe_parses_json(monkeypatch, tmp_path):
         def read(self, limit):
             return json.dumps({"data": {"success": True}}).encode()
 
-    monkeypatch.setattr(bridge.urllib.request, "urlopen", lambda *args, **kwargs: Response())
+    def urlopen(request, **kwargs):
+        captured["body"] = json.loads(request.data)
+        return Response()
+
+    monkeypatch.setattr(bridge.urllib.request, "urlopen", urlopen)
     assert bridge.test_sub2api_account(1) is True
+    assert "prompt" not in captured["body"]
 
 
 def test_bridge_probe_parses_sse(monkeypatch, tmp_path):
@@ -134,7 +140,15 @@ def test_classify_probe_payload_categories(monkeypatch, tmp_path):
 
 def test_direct_probe_requires_assistant_marker_and_full_headers(monkeypatch, tmp_path):
     bridge = load_bridge(monkeypatch, tmp_path)
-    monkeypatch.setattr(bridge.secrets, "token_urlsafe", lambda size: "fixed-nonce")
+    prompt = "Summarize a structured operations payload as JSON."
+    expected = {
+        "ticket": "case-7",
+        "service": "GROK",
+        "min_latency_ms": 13,
+        "max_latency_ms": 71,
+        "total_latency_ms": 115,
+    }
+    monkeypatch.setattr(bridge, "_direct_probe_task", lambda: (prompt, expected))
     captured = {}
 
     class Response:
@@ -154,7 +168,6 @@ def test_direct_probe_requires_assistant_marker_and_full_headers(monkeypatch, tm
 
     response = Response({
         "status": "completed",
-        "input": "Reply exactly: bridge-fixed-nonce",
         "output": [],
     })
 
@@ -171,17 +184,43 @@ def test_direct_probe_requires_assistant_marker_and_full_headers(monkeypatch, tm
     assert headers["x-grok-client-identifier"] == "grok-shell"
     assert headers["user-agent"] == "grok-cli/0.2.93"
     request_body = json.loads(captured["request"].data)
-    assert request_body["max_output_tokens"] >= 64
+    assert request_body["input"] == prompt
+    assert request_body["max_output_tokens"] >= 128
 
     response.payload = {
         "status": "completed",
         "output": [{
             "type": "message",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": "bridge-fixed-nonce"}],
+            "content": [{"type": "output_text", "text": json.dumps(expected)}],
         }],
     }
     assert bridge._probe_auth_once(auth, timeout=1)["ok"] is True
+
+
+def test_find_account_snapshot_matches_identity_and_rejects_duplicates(monkeypatch, tmp_path):
+    bridge = load_bridge(monkeypatch, tmp_path)
+    queries = []
+
+    def one(query):
+        queries.append(query)
+        return [{"id": 101084, "name": "zzzz-grok-existing"}]
+
+    monkeypatch.setattr(bridge, "_psql_json", one)
+    snapshot = bridge.find_account_snapshot(
+        "grok_test_example.com", "test@example.com", "subject-1"
+    )
+    assert snapshot["id"] == 101084
+    assert "credentials->>'email'" in queries[0]
+    assert "credentials->>'sub'" in queries[0]
+
+    monkeypatch.setattr(bridge, "_psql_json", lambda query: [{"id": 1}, {"id": 2}])
+    try:
+        bridge.find_account_snapshot("grok_test_example.com", "test@example.com", "subject-1")
+    except RuntimeError as exc:
+        assert "ambiguous" in str(exc)
+    else:
+        raise AssertionError("duplicate identity must be rejected")
 
 
 def test_restore_account_verifies_token_groups_and_schedulable(monkeypatch, tmp_path):
@@ -265,7 +304,7 @@ def test_stale_auth_endpoint_performs_no_sub2api_write(monkeypatch, tmp_path):
     }
     writes = []
     monkeypatch.setattr(bridge, "probe_auth_direct", lambda auth: {"ok": True, "category": "ok"})
-    monkeypatch.setattr(bridge, "find_account_snapshot", lambda name: snapshot)
+    monkeypatch.setattr(bridge, "find_account_snapshot", lambda name, email="", subject="": snapshot)
     monkeypatch.setattr(bridge, "sub2api_api", lambda *args, **kwargs: writes.append((args, kwargs)))
     raw = json.dumps(candidate).encode()
     environ = {
@@ -303,6 +342,14 @@ def test_promotion_preserves_rotated_credentials(monkeypatch, tmp_path):
     assert bridge.promote_sub2api_account(10) is True
     assert calls[0][2] == {"group_ids": [5], "confirm_mixed_channel_risk": True}
     assert "credentials" not in calls[0][2]
+
+
+def test_bridge_source_clears_stale_error_while_candidate_is_isolated():
+    source = BRIDGE.read_text(encoding="utf-8")
+    isolate = source.index('f"/api/v1/admin/accounts/{account_id}/schedulable"')
+    clear_error = source.index('f"/api/v1/admin/accounts/{account_id}/clear-error"')
+    postprobe = source.index("account_probe = test_sub2api_account_result(account_id)")
+    assert isolate < clear_error < postprobe
 
 
 def test_created_candidate_with_rotated_token_is_quarantined_not_deleted(monkeypatch, tmp_path):

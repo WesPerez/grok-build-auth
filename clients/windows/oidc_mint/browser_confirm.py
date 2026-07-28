@@ -918,8 +918,8 @@ def approve_device_code(
             _sleep(0.5)
 
         # Sign-in chooser
-        if "使用邮箱登录" in text or "Continue with email" in text:
-            if _click_exact(page, ["使用邮箱登录", "Continue with email", "Sign in with email"], log, real=False):
+        if "使用邮箱登录" in text or "Continue with email" in text or "Login with email" in text:
+            if _click_exact(page, ["使用邮箱登录", "Continue with email", "Sign in with email", "Login with email"], log, real=False):
                 _sleep(1.5)
                 phase = "email"
                 continue
