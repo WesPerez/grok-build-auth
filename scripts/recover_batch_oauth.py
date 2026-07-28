@@ -33,12 +33,6 @@ def main() -> int:
     parser.add_argument("--private-dir", default=str(PROJECT_DIR / "private"))
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--debug", action="store_true", help="Enable redacted OAuth diagnostics")
-    parser.add_argument("--timeout", type=float, default=300.0, help="Playwright OAuth timeout seconds")
-    parser.add_argument(
-        "--headed",
-        action="store_true",
-        help="Run Playwright headed (use under Xvfb so turnstilePatch can load)",
-    )
     args = parser.parse_args()
 
     batch_module = load_batch_module()
@@ -84,12 +78,6 @@ def main() -> int:
         last_error: Exception | None = None
         for number in range(1, max(1, args.attempts) + 1):
             try:
-                headed = bool(args.headed) or config.get("GROK_OAUTH_HEADED", "").lower() in {
-                    "1", "true", "yes", "on",
-                }
-                # Prefer headed when a display is available so Edge can load turnstilePatch.
-                if not headed and os.environ.get("DISPLAY"):
-                    headed = True
                 oauth = complete_build_oauth(
                     email,
                     password,
@@ -99,8 +87,7 @@ def main() -> int:
                     yescaptcha_key=config.get("YESCAPTCHA_API_KEY", ""),
                     protocol=True,
                     playwright_fallback=True,
-                    headless=not headed,
-                    timeout=float(args.timeout),
+                    headless=True,
                     debug=args.debug,
                 )
                 auth_path = Path(str(oauth.cliproxyapi_path or ""))

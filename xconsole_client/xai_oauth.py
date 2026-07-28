@@ -566,23 +566,6 @@ def _playwright_click_first(page: Any, selectors: list[str]) -> bool:
     return False
 
 
-def _playwright_permission_denied_message(page: Any) -> str:
-    """Return a stable error when xAI blocks OAuth with permission_denied/403."""
-    try:
-        text = str(page.inner_text("body", timeout=1000) or "")
-    except Exception:
-        try:
-            text = str(page.content() or "")
-        except Exception:
-            text = ""
-    lowered = text.lower()
-    if "permission_denied" in lowered or "[permission_denied]" in text:
-        return "OAuth permission_denied (HTTP 403) on accounts.x.ai sign-in/consent"
-    if "access denied" in lowered and ("signing into" in lowered or "oauth" in lowered):
-        return "OAuth Access denied on accounts.x.ai sign-in/consent"
-    return ""
-
-
 def _playwright_fill_first(page: Any, selectors: list[str], value: str) -> bool:
     for sel in selectors:
         try:
@@ -597,17 +580,6 @@ def _playwright_fill_first(page: Any, selectors: list[str], value: str) -> bool:
 
 def _playwright_drive_login(page: Any, email: str, password: str, sink: _CallbackState, deadline: float) -> None:
     """Drive auth.x.ai login/consent UI until local OAuth callback fires."""
-    email_choice_selectors = [
-        'button:has-text("Login with email")',
-        'button:has-text("Continue with email")',
-        'button:has-text("Sign in with email")',
-        'button:has-text("使用邮箱登录")',
-    ]
-    cookie_selectors = [
-        'button:has-text("Accept All Cookies")',
-        'button:has-text("Allow All")',
-        'button:has-text("Reject All")',
-    ]
     email_selectors = [
         'input[type="email"]',
         'input[name="email"]',
@@ -644,11 +616,6 @@ def _playwright_drive_login(page: Any, email: str, password: str, sink: _Callbac
     filled_password = False
     while time.time() < deadline and not sink.event.is_set():
         try:
-            denied = _playwright_permission_denied_message(page)
-            if denied:
-                raise RuntimeError(denied)
-            _playwright_click_first(page, cookie_selectors)
-            _playwright_click_first(page, email_choice_selectors)
             if not filled_email and _playwright_fill_first(page, email_selectors, email):
                 filled_email = True
             if not filled_password and _playwright_fill_first(page, password_selectors, password):
@@ -709,15 +676,6 @@ def login_with_playwright(
             "headless": headless,
             "executable_path": _edge_executable(),
         }
-        extension_path = Path(
-            os.environ.get("GROK_TURNSTILE_EXTENSION_PATH")
-            or Path(__file__).resolve().parents[1] / "clients" / "windows" / "turnstilePatch"
-        ).resolve()
-        if extension_path.is_dir() and not headless:
-            launch_kwargs["args"] = [
-                f"--disable-extensions-except={extension_path}",
-                f"--load-extension={extension_path}",
-            ]
         if proxy:
             launch_kwargs["proxy"] = _playwright_proxy(proxy)
 
@@ -761,9 +719,6 @@ def login_with_playwright(
                 # Auto-click consent/authorize if present.
                 while time.time() < deadline and not sink.event.is_set():
                     try:
-                        denied = _playwright_permission_denied_message(page)
-                        if denied:
-                            raise RuntimeError(denied)
                         for sel in (
                             'button:has-text("Authorize")',
                             'button:has-text("Allow")',
@@ -848,29 +803,29 @@ def complete_build_oauth(
         except Exception as exc:
             errors.append(f"protocol OAuth failed: {exc}")
             print(f"Protocol OAuth failed ({redact_text(exc)})")
-            if not playwright_fallback and not interactive_fallback:
+            if not playwright_fallback:
                 raise RuntimeError("protocol OAuth failed; Playwright fallback is disabled") from exc
 
-    if playwright_fallback:
-        try:
-            return login_with_playwright(
-                email,
-                password,
-                timeout=timeout,
-                headless=headless,
-                port=port,
-                proxy=proxy,
-                cliproxyapi_auth_dir=cliproxyapi_auth_dir,
-                cliproxyapi_base_url=cliproxyapi_base_url,
-                session_cookies=session_cookies,
-            )
-        except Exception as auto_err:
-            errors.append(f"playwright OAuth failed: {auto_err}")
-            if not interactive_fallback:
-                raise RuntimeError("; ".join(errors) if errors else str(auto_err)) from auto_err
-            print(f"Playwright OAuth failed ({auto_err}); falling back to interactive browser login...")
+    if not playwright_fallback:
+        raise RuntimeError("Playwright fallback is disabled")
 
-    if interactive_fallback:
+    try:
+        return login_with_playwright(
+            email,
+            password,
+            timeout=timeout,
+            headless=headless,
+            port=port,
+            proxy=proxy,
+            cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+            cliproxyapi_base_url=cliproxyapi_base_url,
+            session_cookies=session_cookies,
+        )
+    except Exception as auto_err:
+        errors.append(f"playwright OAuth failed: {auto_err}")
+        if not interactive_fallback:
+            raise RuntimeError("; ".join(errors)) from auto_err
+        print(f"Playwright OAuth failed ({auto_err}); falling back to interactive browser login...")
         return login_with_browser(
             timeout=max(timeout, 300.0),
             port=port,
@@ -878,11 +833,6 @@ def complete_build_oauth(
             cliproxyapi_auth_dir=cliproxyapi_auth_dir,
             cliproxyapi_base_url=cliproxyapi_base_url,
         )
-
-    if errors:
-        raise RuntimeError("; ".join(errors))
-    raise RuntimeError("Playwright fallback is disabled")
-
 
 
 def default_cliproxyapi_auth_dir() -> Path:

@@ -145,7 +145,6 @@ def register_one(
     oauth_timeout: float = 180.0,
     oauth_interactive_fallback: bool = False,
     oauth_protocol: bool = True,
-    oauth_playwright_fallback: bool = False,
     oauth_debug: bool = False,
     cliproxyapi_auth_dir: Optional[str | Path] = None,
     cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
@@ -227,7 +226,7 @@ def register_one(
                     interactive_fallback=oauth_interactive_fallback,
                     yescaptcha_key=YESCAPTCHA_KEY,
                     protocol=oauth_protocol,
-                    playwright_fallback=oauth_playwright_fallback,
+                    playwright_fallback=False,
                     debug=oauth_debug,
                     session_cookies=session_cookies,
                     auth_client=None,
@@ -327,7 +326,7 @@ def register_one(
                     interactive_fallback=oauth_interactive_fallback,
                     yescaptcha_key=YESCAPTCHA_KEY,
                     protocol=oauth_protocol,
-                    playwright_fallback=oauth_playwright_fallback,
+                    playwright_fallback=False,
                     debug=oauth_debug,
                     session_cookies=session_cookies,
                     auth_client=c,
@@ -455,11 +454,6 @@ def main() -> int:
         action="store_true",
         help="协议/Playwright 失败时回退到系统浏览器手动登录",
     )
-    p.add_argument(
-        "--oauth-playwright-fallback",
-        action="store_true",
-        help="协议 OAuth 失败后启用 Playwright 自动登录回退",
-    )
     args = p.parse_args()
     args.cliproxyapi_base_url = validate_cliproxyapi_base_url(args.cliproxyapi_base_url)
 
@@ -484,7 +478,6 @@ def main() -> int:
         oauth_timeout=args.oauth_timeout,
         oauth_interactive_fallback=args.oauth_interactive_fallback,
         oauth_protocol=not args.no_oauth_protocol,
-        oauth_playwright_fallback=args.oauth_playwright_fallback,
         oauth_debug=False,
         cliproxyapi_auth_dir=args.cliproxyapi_auth_dir,
         cliproxyapi_base_url=args.cliproxyapi_base_url,

@@ -12,7 +12,6 @@ import os
 import sys
 import argparse
 import gc
-import html
 import secrets
 import struct
 import random
@@ -79,9 +78,6 @@ DEFAULT_CONFIG = {
     "stealth_patch": False,      # 内联 turnstilePatch 全局注入
     "server_client_mode": False,
     "native_registration_interactions": False,
-    "server_client_chat_timeout_sec": 90,
-    "server_client_chat_retries": 2,
-    "server_client_chat_retry_delay_sec": 15,
     "duckmail_domain": "",
 }
 
@@ -1025,28 +1021,10 @@ def get_oai_code(
 
 def extract_verification_code(text, subject=""):
     if subject:
-        match = re.search(
-            r"(?:confirmation|verification)\s+code\s*[:：]\s*([A-Z0-9]{3}-[A-Z0-9]{3})",
-            subject,
-            re.IGNORECASE,
-        )
-        if match:
-            return match.group(1)
         match = re.search(r"^([A-Z0-9]{3}-[A-Z0-9]{3})\s+xAI", subject, re.IGNORECASE)
         if match:
             return match.group(1)
-    clean_text = re.sub(r"(?is)<(style|script)\b[^>]*>.*?</\1>", " ", str(text or ""))
-    clean_text = re.sub(r"(?is)<!--.*?-->", " ", clean_text)
-    clean_text = re.sub(r"<[^>]+>", " ", clean_text)
-    clean_text = html.unescape(clean_text)
-    match = re.search(
-        r"(?:confirmation|verification)\s+code\s*[:：]?\s*([A-Z0-9]{3}-[A-Z0-9]{3})",
-        clean_text,
-        re.IGNORECASE,
-    )
-    if match:
-        return match.group(1)
-    match = re.search(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", clean_text, re.IGNORECASE)
+    match = re.search(r"\b([A-Z0-9]{3}-[A-Z0-9]{3})\b", text, re.IGNORECASE)
     if match:
         return match.group(1)
     patterns = [
@@ -3504,112 +3482,12 @@ return false;
         clean_code = str(code).replace("-", "").strip()
     deadline = time.time() + timeout
 
-    def _wait_for_otp_transition(wait_seconds):
-        transition_deadline = min(deadline, time.time() + wait_seconds)
-        last_state = {}
-        while time.time() < transition_deadline:
-            raise_if_cancelled(cancel_callback)
-            try:
-                state = page.run_js(
-                    r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-const otpSelector = 'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],form input[maxlength="1"]';
-const profileSelector = 'input[data-testid="givenName"],input[name="givenName"],input[autocomplete="given-name"],input[data-testid="familyName"],input[name="familyName"],input[autocomplete="family-name"],input[data-testid="password"],input[name="password"],input[type="password"],input[autocomplete="new-password"]';
-return {
-    otpVisible: Array.from(document.querySelectorAll(otpSelector)).some(isVisible),
-    profileVisible: Array.from(document.querySelectorAll(profileSelector)).some(isVisible),
-    url: String(location.href || ''),
-};
-                    """
-                )
-            except Exception:
-                state = {}
-            if isinstance(state, dict):
-                last_state = state
-                if state.get("profileVisible"):
-                    return True, state
-            sleep_with_cancel(0.4, cancel_callback)
-        return False, last_state
-
-    def _request_submit_otp():
-        return page.run_js(
-            r"""
-const code = String(arguments[0] || '').trim();
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function setInputValue(input, value) {
-    const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-    const tracker = input && input._valueTracker;
-    if (tracker) tracker.setValue('');
-    if (nativeSetter) nativeSetter.call(input, value);
-    else input.value = value;
-    input.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new InputEvent('input', { bubbles: true, data: value, inputType: 'insertText' }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-const aggregate = Array.from(document.querySelectorAll(
-  'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],input[inputmode="numeric"],input[inputmode="text"]'
-)).find((node) => isVisible(node) && !node.disabled && !node.readOnly && Number(node.maxLength || 6) > 1);
-const boxes = Array.from(document.querySelectorAll('input')).filter((node) => {
-    if (!isVisible(node) || node.disabled || node.readOnly) return false;
-    const maxLength = Number(node.maxLength || 0);
-    return maxLength === 1 || String(node.autocomplete || '').toLowerCase() === 'one-time-code';
-});
-if (aggregate) {
-    setInputValue(aggregate, code);
-} else if (boxes.length >= code.length) {
-    boxes.slice(0, code.length).forEach((box, index) => setInputValue(box, code[index] || ''));
-}
-
-const buttons = Array.from(document.querySelectorAll('button[type="submit"],button')).filter((node) => {
-    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
-});
-const button = buttons.find((node) => {
-    const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return text.includes('确认邮箱') || text.includes('confirmemail') ||
-        text.includes('continue') || text.includes('继续') || text.includes('next') || text.includes('下一步');
-}) || null;
-const input = aggregate || boxes[boxes.length - 1] || null;
-const form = (button && button.form) || (input && input.form) || document.querySelector('form');
-if (form && typeof form.requestSubmit === 'function') {
-    try {
-        form.requestSubmit(button || undefined);
-        return 'request-submit';
-    } catch (error) {}
-}
-if (button) {
-    button.focus();
-    button.click();
-    return 'button-click';
-}
-if (input) {
-    input.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter' }));
-    input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, cancelable: true, key: 'Enter', code: 'Enter' }));
-    return 'enter-key';
-}
-return 'no-submit-control';
-            """,
-            clean_code,
-        )
-
     if native_registration_enabled():
         while time.time() < deadline:
             raise_if_cancelled(cancel_callback)
             candidates = _native_visible_elements(
                 page,
-                'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],input[inputmode="numeric"],input[inputmode="text"]',
+                'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],input[inputmode="numeric"]',
                 writable=True,
             )
             aggregate = None
@@ -3626,7 +3504,7 @@ return 'no-submit-control';
             else:
                 boxes = []
                 for candidate in _native_visible_elements(
-                    page, 'input[maxlength="1"],input[autocomplete="one-time-code"]', writable=True
+                    page, 'form input[maxlength="1"]', writable=True
                 ):
                     try:
                         max_length = int(candidate.attr("maxlength") or 0)
@@ -3655,16 +3533,22 @@ return 'no-submit-control';
                 log_callback(
                     f"[Debug] 已原生填写验证码并提交: {clicked or 'auto-submit'}"
                 )
-            transitioned, _state = _wait_for_otp_transition(6)
-            if transitioned:
-                return code
-            fallback = _request_submit_otp()
-            if log_callback:
-                log_callback(f"[Debug] 验证码页面未转场，提交兜底: {fallback}")
-            transitioned, _state = _wait_for_otp_transition(10)
-            if transitioned:
-                return code
-            sleep_with_cancel(0.5, cancel_callback)
+            transition_deadline = min(deadline, time.time() + 10)
+            while time.time() < transition_deadline:
+                raise_if_cancelled(cancel_callback)
+                if _native_find_input(
+                    page,
+                    'input[data-testid="password"],input[name="password"],input[type="password"],input[autocomplete="new-password"]',
+                ):
+                    return code
+                otp_remaining = _native_visible_elements(
+                    page,
+                    'input[data-input-otp="true"],input[name="code"],input[autocomplete="one-time-code"],form input[maxlength="1"]',
+                    writable=True,
+                )
+                if not otp_remaining:
+                    return code
+                sleep_with_cancel(0.4, cancel_callback)
         raise Exception("验证码已获取，但原生填写/提交失败")
 
     while time.time() < deadline:
@@ -3739,15 +3623,44 @@ return 'not-ready';
             sleep_with_cancel(0.5, cancel_callback)
             continue
 
-        submit_method = _request_submit_otp()
-        if submit_method != "no-submit-control":
+        clicked = page.run_js(
+            r"""
+function isVisible(node) {
+    if (!node) return false;
+    const style = window.getComputedStyle(node);
+    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+}
+
+const buttons = Array.from(document.querySelectorAll('button[type=\"submit\"], button')).filter((node) => {
+    return isVisible(node) && !node.disabled && node.getAttribute('aria-disabled') !== 'true';
+});
+
+const btn = buttons.find((node) => {
+    const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
+    return (
+        t.includes('确认邮箱') ||
+        t.includes('继续') ||
+        t.includes('下一步') ||
+        t.includes('confirm') ||
+        t.includes('continue') ||
+        t.includes('next')
+    );
+});
+
+if (!btn) return 'no-button';
+btn.focus();
+btn.click();
+return 'clicked';
+            """
+        )
+
+        if clicked == "clicked" or clicked == "no-button":
             if log_callback:
-                log_callback(f"[Debug] 已填写验证码并提交: method={submit_method}")
-            transitioned, _state = _wait_for_otp_transition(10)
-            if transitioned:
-                return code
-            if log_callback:
-                log_callback("[Debug] 验证码提交后页面未转场，继续重试")
+                log_callback(f"[Debug] 已填写验证码并提交: {code}")
+            sleep_with_cancel(1.5, cancel_callback)
+            return code
 
         sleep_with_cancel(0.5, cancel_callback)
 
@@ -3864,50 +3777,6 @@ def fill_profile_and_submit(session, timeout=120, log_callback=None, cancel_call
     page = session.page
     given_name, family_name, password = build_profile()
     deadline = time.time() + timeout
-
-    def _profile_failure(message):
-        try:
-            state = page.run_js(
-                r"""
-function isVisible(node) {
-    if (!node) return false;
-    const style = window.getComputedStyle(node);
-    if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-    const rect = node.getBoundingClientRect();
-    return rect.width > 0 && rect.height > 0;
-}
-function describe(node) {
-    return [
-        node.tagName,
-        node.getAttribute('type'),
-        node.getAttribute('name'),
-        node.getAttribute('data-testid'),
-        node.getAttribute('autocomplete'),
-        node.getAttribute('aria-label'),
-        node.getAttribute('placeholder'),
-    ].filter(Boolean).join('/').slice(0, 120);
-}
-return {
-    url: String(location.href || ''),
-    title: String(document.title || ''),
-    inputs: Array.from(document.querySelectorAll('input,textarea')).filter(isVisible).map(describe).slice(0, 8),
-    buttons: Array.from(document.querySelectorAll('button,[role="button"],input[type="submit"]')).filter(isVisible).map((node) => {
-        return String(node.innerText || node.textContent || node.getAttribute('value') || node.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().slice(0, 80);
-    }).filter(Boolean).slice(0, 8),
-};
-                """
-            )
-        except Exception:
-            state = {"url": str(getattr(page, "url", "") or "")}
-        if not isinstance(state, dict):
-            state = {}
-        inputs = " | ".join(str(item) for item in (state.get("inputs") or []))
-        buttons = " | ".join(str(item) for item in (state.get("buttons") or []))
-        return Exception(
-            f"{message}: url={state.get('url') or ''}; title={state.get('title') or ''}; "
-            f"inputs={inputs or 'none'}; buttons={buttons or 'none'}"
-        )
-
     if native_registration_enabled():
         given_input = family_input = password_input = None
         while time.time() < deadline:
@@ -3928,7 +3797,7 @@ return {
                 break
             sleep_with_cancel(0.5, cancel_callback)
         if not (given_input and family_input and password_input):
-            raise _profile_failure("最终注册页资料输入框未就绪")
+            raise Exception("最终注册页资料输入框未就绪")
         _native_type(page, given_input, given_name)
         _native_type(page, family_input, family_name)
         _native_type(page, password_input, password)
@@ -3985,7 +3854,7 @@ return {present, tokenLength, ready: !present || tokenLength >= 80};
                         log_callback(f"[Debug] 原生资料页 Turnstile 重试失败: {exc}")
                 turnstile_attempted = True
             sleep_with_cancel(0.8, cancel_callback)
-        raise _profile_failure("最终注册页原生资料填写/提交失败")
+        raise Exception("最终注册页原生资料填写/提交失败")
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
@@ -4215,7 +4084,7 @@ return String(cfInput.value || '').trim().length;
 
         sleep_with_cancel(0.5, cancel_callback)
 
-    raise _profile_failure("最终注册页资料填写失败")
+    raise Exception("最终注册页资料填写失败")
 
 
 def wait_for_sso_cookie(session, timeout=120, log_callback=None, cancel_callback=None):
@@ -4551,11 +4420,7 @@ def register_one(session, shared, worker_id, slot_no):
             break
         except Exception as mail_exc:
             msg = str(mail_exc)
-            delivery_failed = (
-                "未收到验证码" in msg
-                or msg.startswith("获取验证码失败")
-            ) and "验证码已获取" not in msg
-            if delivery_failed and mail_try < max_mail_retry:
+            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
                 log(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
                 session.restart()
                 sleep_with_cancel(1, cancel)
@@ -4610,57 +4475,38 @@ def register_one(session, shared, worker_id, slot_no):
     else:
         chat_ok = False
         chat_msg = "网页对话验证未执行"
-        try:
-            chat_timeout = max(30, int(config.get("server_client_chat_timeout_sec", 90) or 90))
-        except (TypeError, ValueError):
-            chat_timeout = 90
-        try:
-            chat_retries = max(1, min(3, int(config.get("server_client_chat_retries", 2) or 2)))
-        except (TypeError, ValueError):
-            chat_retries = 2
-        try:
-            chat_retry_delay = max(1, int(config.get("server_client_chat_retry_delay_sec", 15) or 15))
-        except (TypeError, ValueError):
-            chat_retry_delay = 15
-        for chat_attempt in range(1, chat_retries + 1):
+        for chat_attempt in range(1, 4):
             chat_ok, chat_msg = browser_chat_canary(
                 session,
                 log_callback=log,
                 cancel_callback=cancel,
-                timeout=chat_timeout,
+                timeout=60,
             )
             if chat_ok:
                 break
-            if chat_attempt >= chat_retries:
+            if chat_attempt >= 3 or not any(
+                marker in str(chat_msg) for marker in ("tos-gate", "门禁阻断")
+            ):
                 break
-            if any(marker in str(chat_msg) for marker in ("tos-gate", "门禁阻断")):
-                log(
-                    f"[!] 网页对话前门禁回退，重新激活后重试 {chat_attempt}/{chat_retries - 1}: "
-                    f"{chat_msg}"
-                )
-                browser_ok, browser_msg = browser_activate_chat_permission(
-                    session, sso, log_callback=log, cancel_callback=cancel, timeout=60
-                )
-                if not browser_ok:
-                    chat_msg = f"重新激活 TOS 门禁失败: {browser_msg}"
-                    break
-                birth_ok, birth_msg = browser_set_birth_date(
-                    session,
-                    log_callback=log,
-                    cancel_callback=cancel,
-                    attempts=2,
-                    retry_delay=1.0,
-                )
-                if not birth_ok:
-                    chat_msg = f"重新激活后出生日期设置失败: {birth_msg}"
-                    break
-            elif "assistant 回复超时" in str(chat_msg):
-                log(
-                    f"[*] 网页对话响应超时，等待权限传播后重试 "
-                    f"{chat_attempt}/{chat_retries - 1}（{chat_retry_delay}s）"
-                )
-                sleep_with_cancel(chat_retry_delay, cancel)
-            else:
+            log(
+                f"[!] 网页对话前门禁回退，重新激活后重试 {chat_attempt}/2: "
+                f"{chat_msg}"
+            )
+            browser_ok, browser_msg = browser_activate_chat_permission(
+                session, sso, log_callback=log, cancel_callback=cancel, timeout=60
+            )
+            if not browser_ok:
+                chat_msg = f"重新激活 TOS 门禁失败: {browser_msg}"
+                break
+            birth_ok, birth_msg = browser_set_birth_date(
+                session,
+                log_callback=log,
+                cancel_callback=cancel,
+                attempts=2,
+                retry_delay=1.0,
+            )
+            if not birth_ok:
+                chat_msg = f"重新激活后出生日期设置失败: {birth_msg}"
                 break
     if not chat_ok:
         raise RuntimeError(f"网页对话验证未通过，账号不可用: {chat_msg}")

@@ -207,19 +207,18 @@ def export_cpa_for_account(
                 email=email,
                 password=password,
                 protocol=True,
-                playwright_fallback=bool(cfg.get("mint_playwright_fallback", False)),
-                headless=bool(cfg.get("mint_playwright_headless", True)),
+                playwright_fallback=False,
                 proxy=resolved or "",
                 session_cookies=session_cookies,
                 timeout=timeout,
             )
             tokens = dict(oauth_result.token)
-            log("[Debug] SSO 协议/Playwright OAuth 成功")
+            log("[Debug] SSO 协议 OAuth 成功")
         except Exception as fallback_exc:  # noqa: BLE001
             reason = f"device={exc}; protocol={fallback_exc}"
             _record_failure(out_dir, email, reason)
             if cfg.get("mint_required", False):
-                raise RuntimeError("OAuth mint failed in device/protocol/playwright modes") from fallback_exc
+                raise RuntimeError("OAuth mint failed in both device and protocol modes") from fallback_exc
             return {"ok": False, "error": reason, "email": email}
 
     try:

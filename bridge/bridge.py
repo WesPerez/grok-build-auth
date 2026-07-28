@@ -278,40 +278,21 @@ def _psql_json(query):
     return json.loads(value) if value else None
 
 
-def _sql_literal(value):
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def find_account_snapshot(name, email_addr="", subject=""):
+def find_account_snapshot(name):
     if not re.fullmatch(r"grok_[a-z0-9._+-]+_[a-z0-9.-]+", name):
         raise ValueError("invalid account name")
-    email_addr = str(email_addr or "").strip().lower()
-    if email_addr and not re.fullmatch(r"[a-z0-9][a-z0-9._+-]{0,63}@[a-z0-9.-]+", email_addr):
-        raise ValueError("invalid account email")
-    subject = str(subject or "").strip()
-    predicates = [f"a.name={_sql_literal(name)}"]
-    if email_addr:
-        predicates.append(f"lower(coalesce(a.credentials->>'email',''))={_sql_literal(email_addr)}")
-    if subject:
-        predicates.append(f"coalesce(a.credentials->>'sub','')={_sql_literal(subject)}")
     query = (
-        "select coalesce(json_agg(candidate),'[]'::json) from ("
         "select json_build_object("
         "'id',a.id,'name',a.name,'platform',a.platform,'type',a.type,"
         "'credentials',a.credentials,'extra',a.extra,'proxy_id',a.proxy_id,"
         "'concurrency',a.concurrency,'priority',a.priority,'status',a.status,"
         "'schedulable',a.schedulable,'rate_multiplier',a.rate_multiplier,"
         "'group_ids',coalesce((select json_agg(ag.group_id order by ag.group_id) "
-        "from account_groups ag where ag.account_id=a.id),'[]'::json)) as candidate "
+        "from account_groups ag where ag.account_id=a.id),'[]'::json)) "
         "from accounts a "
-        "where a.deleted_at is null and a.platform='grok' and a.type='oauth' and ("
-        + " or ".join(predicates)
-        + ") order by a.id limit 3) matches"
+        f"where a.name='{name}' and a.deleted_at is null order by a.id desc limit 1"
     )
-    matches = _psql_json(query) or []
-    if len(matches) > 1:
-        raise RuntimeError("ambiguous Grok account identity")
-    return matches[0] if matches else None
+    return _psql_json(query)
 
 
 def find_account_snapshot_by_id(account_id):
@@ -482,55 +463,15 @@ def classify_probe_payload(status_code, body_text):
     return "upstream_error", "UPSTREAM_ERROR", f"上游探测失败 HTTP {status_code}，未入库"
 
 
-def _direct_probe_task():
-    ticket = secrets.token_hex(6)
-    values = [13 + secrets.randbelow(17), 31 + secrets.randbelow(19), 53 + secrets.randbelow(23)]
-    payload = {"ticket": ticket, "service": "grok", "latencies_ms": values}
-    prompt = (
-        "A developer operations check needs a structured latency summary. "
-        f"Read this JSON payload: {json.dumps(payload, separators=(',', ':'))}. "
-        "Return one JSON object with ticket copied unchanged, service uppercased, "
-        "min_latency_ms, max_latency_ms, and total_latency_ms. Do not add prose."
-    )
-    return prompt, {
-        "ticket": ticket,
-        "service": "GROK",
-        "min_latency_ms": min(values),
-        "max_latency_ms": max(values),
-        "total_latency_ms": sum(values),
-    }
-
-
-def _extract_json_object(text):
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(str(text or "")):
-        if char != "{":
-            continue
-        try:
-            value, _ = decoder.raw_decode(str(text)[index:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    return None
-
-
-def _direct_probe_response_matches(text, expected):
-    value = _extract_json_object(text)
-    if not isinstance(value, dict):
-        return False
-    return all(value.get(key) == expected_value for key, expected_value in expected.items())
-
-
 def _probe_auth_once(auth_data, timeout=45):
     """Probe Grok CLI with the raw access_token before any Sub2API write."""
     access_token = str(auth_data.get("access_token") or "").strip()
-    prompt, expected = _direct_probe_task()
+    marker = "bridge-" + secrets.token_urlsafe(18)
     body = json.dumps({
         "model": "grok-4.5",
-        "input": prompt,
+        "input": f"Reply exactly: {marker}",
         "stream": False,
-        "max_output_tokens": 160,
+        "max_output_tokens": 64,
         "store": False,
     }).encode()
     req = urllib.request.Request(
@@ -558,7 +499,7 @@ def _probe_auth_once(auth_data, timeout=45):
                 int(resp.status) == 200
                 and isinstance(payload, dict)
                 and payload.get("status") == "completed"
-                and _direct_probe_response_matches(extract_assistant_text(payload), expected)
+                and extract_assistant_text(payload).strip() == marker
             )
             return {
                 "ok": passed,
@@ -612,6 +553,7 @@ def test_sub2api_account_result(account_id):
     url = f"{SUB2API_BASE}/api/v1/admin/accounts/{account_id}/test"
     body = json.dumps({
         "model_id": "grok-4.5",
+        "prompt": "Reply exactly: bridge-account-ok",
         "mode": "responses",
     }).encode()
     req = urllib.request.Request(
@@ -959,7 +901,7 @@ def handle_request(environ, start_response):
                     imported=False,
                 )
 
-            snapshot = find_account_snapshot(name, email_addr, auth_subject(auth_data))
+            snapshot = find_account_snapshot(name)
             if auth_subject_mismatch(snapshot, auth_data):
                 return error_response(
                     "AUTH principal 与 Sub2API 当前账号不一致，拒绝覆盖",
@@ -983,8 +925,7 @@ def handle_request(environ, start_response):
                     imported=False,
                 )
             account_id = int(snapshot["id"]) if snapshot else None
-            candidate_name = snapshot["name"] if snapshot else name
-            candidate = build_account_payload(candidate_name, auth_data, [], False)
+            candidate = build_account_payload(name, auth_data, [], False)
             action = "created" if account_id is None else "updated"
             try:
                 if account_id is None:
@@ -1000,7 +941,7 @@ def handle_request(environ, start_response):
                         account_id, action, snapshot, name, auth_data, False,
                     )
                 else:
-                    ambiguous = find_account_snapshot(name, email_addr, auth_subject(auth_data))
+                    ambiguous = find_account_snapshot(name)
                     if ambiguous and not auth_subject_mismatch(ambiguous, auth_data):
                         account_id = int(ambiguous["id"])
                         rollback_ok, rollback_state = rollback_import_candidate(
@@ -1026,13 +967,6 @@ def handle_request(environ, start_response):
                     "POST",
                     f"/api/v1/admin/accounts/{account_id}/schedulable",
                     {"schedulable": False},
-                )
-                # Clear the revoked-token error only after the fresh candidate is isolated.
-                # The following semantic probe will repopulate any current quota cooldown.
-                sub2api_api(
-                    "POST",
-                    f"/api/v1/admin/accounts/{account_id}/clear-error",
-                    {},
                 )
             except Exception as exc:
                 rollback_ok, rollback_state = rollback_import_candidate(

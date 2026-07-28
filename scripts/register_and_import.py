@@ -742,16 +742,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cleanup-failed-mailboxes", action="store_true")
     parser.add_argument("--confirm-production-write", action="store_true")
     parser.add_argument("--no-import", action="store_true", help="register and build the bundle without writing Sub2API")
-    parser.add_argument(
-        "--oauth-playwright-fallback",
-        action="store_true",
-        help="enable Playwright OAuth fallback after protocol mint fails",
-    )
-    parser.add_argument(
-        "--oauth-headed",
-        action="store_true",
-        help="run Playwright OAuth headed under Xvfb so turnstilePatch can load",
-    )
     return parser.parse_args()
 
 
@@ -1224,20 +1214,8 @@ def main() -> int:
                     "--proxy-env", "GROK_ATTEMPT_PROXY_URL",
                     "--registration-backend", args.registration_backend,
                 ]
-                oauth_playwright = bool(args.oauth_playwright_fallback) or config.get(
-                    "GROK_OAUTH_PLAYWRIGHT_FALLBACK", ""
-                ).lower() in {"1", "true", "yes", "on"}
-                oauth_headed = bool(args.oauth_headed) or config.get(
-                    "GROK_OAUTH_HEADED", ""
-                ).lower() in {"1", "true", "yes", "on"}
-                if oauth_playwright:
-                    registration_command.append("--oauth-playwright-fallback")
-                if oauth_headed:
-                    registration_command.append("--oauth-headed")
                 if args.registration_backend == "browser-playwright-edge" and config.get("GROK_BROWSER_HEADED", "true").lower() in {"1", "true", "yes", "on"}:
                     registration_command.append("--browser-headed")
-                    registration_command = ["xvfb-run", "-a", *registration_command]
-                elif oauth_playwright and oauth_headed and not os.environ.get("DISPLAY"):
                     registration_command = ["xvfb-run", "-a", *registration_command]
                 proc = run(registration_command, env=env, log=log_path, on_line=on_registration_line,
                     on_heartbeat=on_registration_heartbeat)

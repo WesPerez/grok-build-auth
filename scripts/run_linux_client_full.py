@@ -198,9 +198,6 @@ def build_config(
         "stealth_patch": True,
         "server_client_mode": True,
         "native_registration_interactions": True,
-        "server_client_chat_timeout_sec": 90,
-        "server_client_chat_retries": 2,
-        "server_client_chat_retry_delay_sec": 15,
         "cpa_export_enabled": True,
         "cpa_auth_dir": str(route_dir / "cpa_auths"),
         "cpa_base_url": "https://cli-chat-proxy.grok.com/v1",
@@ -216,11 +213,6 @@ def build_config(
         "mint_proxy": "",
         "mint_timeout_sec": 420,
         "mint_required": True,
-        # Device-code mint often gets invalid_grant/Access denied on fresh
-        # accounts; allow Playwright fallback after protocol OAuth fails.
-        "mint_playwright_fallback": True,
-        # Xvfb provides a real DISPLAY, so headed Edge can load turnstilePatch.
-        "mint_playwright_headless": False,
         "cpa_preprobe_enabled": True,
         "cpa_preprobe_required": True,
         "cpa_preprobe_timeout_sec": 60,
@@ -316,11 +308,6 @@ def main() -> int:
     preflight = project / "scripts" / "windows_client_preflight.py"
     reprobe_script = project / "clients" / "windows" / "cpa_reprobe.py"
     env = os.environ.copy()
-    # The browser client and protocol OAuth fallback need the same private
-    # runtime values (notably YESCAPTCHA_API_KEY and proxy settings). Keep
-    # explicit operator environment values authoritative.
-    for key, value in read_env(project / "private" / "runtime.env").items():
-        env.setdefault(key, value)
     env["DISPLAY"] = env.get("DISPLAY") or ":99"
 
     route_specs: list[dict[str, Any]] = []
