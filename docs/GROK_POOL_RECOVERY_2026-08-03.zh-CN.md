@@ -48,7 +48,7 @@
 生产候选后来切到无凭据的 GitHub Raw：`0xRadikal/Free-v2ray-Configs`。这只是候选来源，不是可用性背书。正式链路为：
 
 1. 拉取 sing-box 候选并固定本次解析地址。
-2. 先复测现有 400 个固定 bridge 槽位，只填补失败、重复出口或过度共享凭据的槽位。
+2. 先复测现有最多 400 个固定 bridge 槽位，只填补失败、重复出口或过度共享凭据的槽位；400 是备用容量上限，不要求一次补满。找到几个替代就只换几个，未补上的坏槽保留原端口并由 Resin 熔断隔离。
 3. 常驻 bridge 重启后再次验证。
 4. 每个候选必须通过代理认证、`grok.com:443`、`auth.x.ai:443`、TLS 证书和 Cloudflare 小响应出口检查。
 5. 至少 320 个通过且满足相对上一批阈值，才备份 Resin SQLite 并原子更新。
@@ -88,6 +88,8 @@ Sub2API account
 - 没有明确 endpoint 的笼统 refresh timeout：证据不足，不自动轮换。
 - 同 shard 三个独立请求出现 `502/504`：可作为另一路 lease 轮换证据。
 - 短窗口候选超过全局阈值：视为池级或上游故障，停止逐号 churn，先修复来源或 Platform。
+- Resin 内建主动探测每小时覆盖全局节点到 `auth.x.ai` 的公开 OIDC 端点；GitHub 主池每 3 小时执行双目标全量复测并只替换坏槽。主链失败才启用论坛 fallback，未过期批次直接复用且论坛发现最多每天一次。
+- 没有实际补洞时不发布新 generation、不重启 bridge。节点离开可路由视图或出口漂移后，旧 sticky lease 会在下一次请求自动迁移，无需改 Sub2API `proxy_id`。
 
 ## 9. 最终验收口径
 
@@ -112,3 +114,15 @@ Sub2API account
 - 官方 `codex-cli 0.146.0` 只执行了一次自然结构任务：Router request `019fc7af-142b-7c72-8778-69ef315de22d` 仅一次 Grok attempt、HTTP 200、无 fallback；Sub2API request `7f12f121-fee9-4930-86a6-66057f615abb` 命中 group 5、provider Grok、账号 `101161` 并返回 200。
 
 这次未对 311 个账号逐号生成。全量结论来自结构、调度、被动 refresh 与代理池证据；真实模型调用覆盖只是一条分组链路。
+
+## 11. 逐槽补洞与定时维护终态
+
+2026-08-03 23:17:55 至 23:20:55（Asia/Shanghai）的正式运行验证了增量策略：400 个固定 bridge 槽中，298 个健康槽保持原端口，87 个坏槽被当期新候选替换，15 个暂时没有替代的坏槽保留原端口并由 Resin 熔断隔离；发布代共有 385 个健康槽和 385 个唯一出口。没有因为缺少 15 个替代而放弃已经找到的 87 个补洞，也没有压缩端口导致后续逻辑账号出口整体位移。
+
+常驻 bridge 重启复验后，Resin 同步输入 400、双目标通过 363、选择 320、唯一出口 362、写入节点 365，任务成功提交新代。同步完成瞬间 Platform 可路由 319；稍后的全局只读快照为 371 个节点、335 个 healthy、332 个唯一健康出口，GrokEU 可路由 331、出口 330。两组数字采样时刻不同，不能混写成同一原子快照。
+
+23:36:16 的 Sub2API 只读短事务显示：311 个 live Grok OAuth 全部 `active + schedulable`，311 个 `proxy_id` 和 311 个 `GrokEU.shard-N` 逻辑身份均唯一，永久 error、overload、非 429 temp 均为 0；当时 38 个账号处于正常 429 冷却，立即可选 273 个。429 数量会随真实流量和 reset 窗口变化，必须连同采样时间判断，不能把本文任何历史数值当作永久库存。
+
+第一次同步在 Admin API 写入前的 SQLite 在线备份阶段报 `PermissionError`。根因是 hardened unit 清空 capability，而 Resin DB/WAL/SHM 由 `resin-grok` 以 `0600` 创建；受限 root 无权读取。修复保留了空 capability，只给 UID 0 精确的目录遍历、文件只读与新 sidecar 默认 ACL。随后 `state.db`、`cache.db` 在线备份和 `integrity_check` 均成功，Resin 仍独占写权限。原 ACL、原 unit、原生产配置、原 runtime config 和完整性通过的 `state.db` 备份保存在 `private/runs/pool-cadence-20260803T144036Z/`；主备份 SHA-256 为 `a16613e040048890b72e2991def6c8f5895f242d1b7a21026f6a15997633f372`。
+
+最终调度分层为：Resin 每小时主动探测节点到 `auth.x.ai` 公共 OIDC 端点；GitHub bridge 每 3 小时复测全池并只补坏槽；主链失败时才启用论坛 fallback，论坛发现最多每 24 小时一次。400 是备用容量目标，320 是发布健康底线，不再把一次找齐几百个新节点作为维护前提。

@@ -71,13 +71,17 @@ Sub2API account
 
 如果业务硬性要求物理出口独占，需要 Resin 明确支持排他租约或另建分片容量策略；不能靠批量删除 lease 假装达成。无此能力时，准确表述应是“账号拥有独立逻辑身份和粘性租约”。
 
-## 6. 代理来源与日更
+## 6. 代理来源与分层保活
 
 - GitHub Raw 的公开配置只是候选来源，不是“节点都可用于 Grok”的证明。
 - 本机必须重新验证代理认证、`grok.com:443`、`auth.x.ai:443`、TLS 证书和小流量出口；所有目标都通过才准入。
-- 非论坛 source 避免七天帖子过期，但仍可能整批变质。日更必须 fail-closed：新批低于绝对阈值或相对上一批骤降时保留旧池。
+- 非论坛 source 避免七天帖子过期，但仍可能整批变质。GitHub 主池按 3 小时复测时仍必须 fail-closed：新批低于绝对阈值或相对上一批骤降时保留旧池。
 - 两阶段 bridge 发布必须保留上一代：刷新、重启、复验、Resin 同步全部成功后才 commit；任一步失败都 rollback。
+- 固定 bridge 槽位没有实际替换时不发布新 generation、不重启常驻 sing-box，避免高频保活本身打断真实连接。目标容量不是整批门槛：找到 1 个替代只换 1 个，找到 10 个只换 10 个；未补上的坏槽保留固定端口并由 Resin 熔断隔离，生产只守健康出口底线。
+- Resin 内建主动探测适合每小时覆盖全局节点的公开 `auth.x.ai` 连接，GitHub 全池双目标复测适合每 3 小时，论坛只应在主链不足时触发并最多每天刷新一次；仍未过期且 hash/行数完整的论坛代直接复用。
+- Resin 路由命中 sticky lease 前会确认 node 仍在 Platform 可路由视图且出口未漂移。节点熔断或出口变化会使旧 lease 失效，并在下一次请求迁移；因此节点替换不要求批量修改 Sub2API `proxy_id`。
 - systemd 的失败回滚命令不能用 `-` 前缀吞掉非零退出；否则 staged 代可能残留而 unit 仍显示成功。维护器只需读取 `/root` 下脚本并把状态写入显式 `/var` 路径时，保持 `ProtectHome=read-only` 和空 capability，不为路径便利放宽整个 home 或 DAC 能力。
+- 空 `CapabilityBoundingSet` 也会让 root 失去绕过文件 DAC 的能力。Resin 数据库及 WAL/SHM 由专用用户以 `0600` 创建时，维护器的在线备份会在任何 Admin API 写入前报 `PermissionError`。正确修复是保存原 `getfacl -Rp`，仅给 UID 0 目录遍历、DB/WAL/SHM 只读 ACL，并设置新 sidecar 的默认 ACL；不要取消写前备份，也不要给整个 unit 增加 `CAP_DAC_READ_SEARCH`。
 - trusted pool 的名称不是健康证明。只有在同一周期接受 `grok.com` 与 `auth.x.ai` 等价验证的订阅才可进入生产 Platform；否则保留对象用于人工回滚，但从生产过滤器移除。同步器若默认兼容保留 trusted 过滤器，生产配置必须使用显式开关关闭该行为并在应用后读回核验，不能只看配置文件。仍应同时报告 managed/trusted 的 lease 分布和共享程度。
 - 同一账号重复出现带明确 `auth.x.ai/oauth2/token` endpoint 的 EOF、TLS handshake timeout 或 SOCKS server failure，可以作为精确轮换该 sticky lease 的被动证据；没有 endpoint 的笼统 refresh timeout 证据不足。轮换只删 lease，不测试账号、不清 429、不改 `proxy_id`，并保留批量故障全局保护。
 
@@ -89,6 +93,8 @@ Sub2API account
 2. **全量即时调度核验，无生成**：分别统计 429、overload、temp-unschedulable，并按 revoked、额度、传输分类。
 3. **代理池验证，不使用账号**：运行 CONNECT/TLS/trace 报告，确认 `grok.com` 与 `auth.x.ai` 都通过且安全阈值满足。
 4. **一个官方客户端烟测**：使用当前官方 Codex CLI、`grok-4.5` 和 `high`，输入自然的小型结构任务；从服务端日志确认 Grok group/provider/account HTTP 200 且没有 Router fallback。
+
+即使用户提出“每个账号最小测试”，也应先判断目标层级。每小时全节点主动探测和每 3 小时双目标池复测已经覆盖代理连通性；对数百账号逐号生成只会新增额度消耗、429 和风控噪声。节点实际替换后以新槽双目标验证、Resin egress/健康反馈和后续真实 refresh 成功收口；只有明确出口型 402 的既有流程才做一次指定账号 canary，真实 429 始终零探针。
 
 最终报告必须准确区分：
 
