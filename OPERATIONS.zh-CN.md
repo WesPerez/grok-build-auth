@@ -2,6 +2,8 @@
 
 本文是服务器注册、外部客户端、bridge、代理池和 Sub2API 的唯一操作手册。示例中的 `<...>` 都必须替换为本机值；密钥只允许保存在权限为 `0600` 的私有配置或 secret manager 中。
 
+账号池、OAuth、调度和 Resin 出口的跨层判断见 `docs/GROK_OAUTH_RESIN_OPERATIONS_LESSONS.zh-CN.md`；本轮完整复盘见 `docs/GROK_POOL_RECOVERY_2026-08-03.zh-CN.md`。两份文档特别区分结构健康、当前可选、真实探针覆盖和物理出口共享，避免把单次请求或 UI 状态误报为全池结论。
+
 ## 1. 最终目标和路径选择
 
 最终成功不是“注册页面显示成功”，而是 Sub2API 中生成一个可用账号：

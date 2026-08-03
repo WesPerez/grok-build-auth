@@ -265,7 +265,7 @@ def test_stale_auth_endpoint_performs_no_sub2api_write(monkeypatch, tmp_path):
     }
     writes = []
     monkeypatch.setattr(bridge, "probe_auth_direct", lambda auth: {"ok": True, "category": "ok"})
-    monkeypatch.setattr(bridge, "find_account_snapshot", lambda name: snapshot)
+    monkeypatch.setattr(bridge, "find_account_snapshot", lambda name, email, subject: snapshot)
     monkeypatch.setattr(bridge, "sub2api_api", lambda *args, **kwargs: writes.append((args, kwargs)))
     raw = json.dumps(candidate).encode()
     environ = {
@@ -283,6 +283,82 @@ def test_stale_auth_endpoint_performs_no_sub2api_write(monkeypatch, tmp_path):
     assert result["error_code"] == "STALE_AUTH"
     assert result["imported"] is False
     assert writes == []
+
+
+def test_identity_lookup_uses_email_and_subject_and_rejects_ambiguity(monkeypatch, tmp_path):
+    bridge = load_bridge(monkeypatch, tmp_path)
+    queries = []
+    snapshot = {"id": 10, "name": "zzzz-grok-test"}
+    monkeypatch.setattr(bridge, "_psql_json", lambda query: queries.append(query) or [snapshot])
+
+    assert bridge.find_account_snapshot(
+        "grok_test_example.com", "test@example.com", "subject'value",
+    ) == snapshot
+    assert "credentials->>'email'" in queries[0]
+    assert "credentials->>'sub'" in queries[0]
+    assert "subject''value" in queries[0]
+
+    monkeypatch.setattr(bridge, "_psql_json", lambda query: [snapshot, {"id": 11}])
+    try:
+        bridge.find_account_snapshot("grok_test_example.com", "test@example.com", "subject")
+    except RuntimeError as exc:
+        assert "ambiguous" in str(exc)
+    else:
+        raise AssertionError("ambiguous identity should fail closed")
+
+
+def test_update_preserves_display_name_and_priority(monkeypatch, tmp_path):
+    bridge = load_bridge(monkeypatch, tmp_path)
+    now = int(time.time())
+    candidate = {
+        "email": "test@example.com",
+        "access_token": jwt_token(now - 30, now + 21000, "same-subject"),
+        "refresh_token": "n" * 32,
+    }
+    snapshot = {
+        "id": 10,
+        "name": "zzzz-grok_test_example.com",
+        "priority": 5,
+        "credentials": {
+            "email": "test@example.com",
+            "access_token": jwt_token(now - 120, now + 20500, "same-subject"),
+            "refresh_token": "o" * 32,
+        },
+    }
+    writes = []
+    lookups = []
+    monkeypatch.setattr(bridge, "probe_auth_direct", lambda auth: {"ok": True, "category": "ok"})
+    monkeypatch.setattr(
+        bridge,
+        "find_account_snapshot",
+        lambda name, email="", subject="": lookups.append((name, email, subject)) or snapshot,
+    )
+    monkeypatch.setattr(
+        bridge,
+        "sub2api_api",
+        lambda method, path, body=None: writes.append((method, path, body)) or {},
+    )
+    monkeypatch.setattr(bridge, "test_sub2api_account_result", lambda account_id: "usable")
+    monkeypatch.setattr(bridge, "promote_sub2api_account", lambda account_id: True)
+    raw = json.dumps(candidate).encode()
+    environ = {
+        "PATH_INFO": "/v0/management/auth-files",
+        "REQUEST_METHOD": "POST",
+        "CONTENT_LENGTH": str(len(raw)),
+        "QUERY_STRING": "name=xai-test.json",
+        "HTTP_X_MANAGEMENT_KEY": bridge.MANAGEMENT_KEY,
+        "wsgi.input": io.BytesIO(raw),
+    }
+    status = {}
+    body = b"".join(bridge.handle_request(environ, lambda value, headers: status.update(value=value)))
+    result = json.loads(body)
+
+    assert status["value"].startswith("200")
+    assert result["action"] == "updated" and result["account_id"] == 10
+    assert lookups[0] == ("grok_test_example.com", "test@example.com", "same-subject")
+    update = next(body for method, path, body in writes if method == "PUT" and path.endswith("/10"))
+    assert update["name"] == "zzzz-grok_test_example.com"
+    assert update["priority"] == 5
 
 
 def test_promotion_preserves_rotated_credentials(monkeypatch, tmp_path):

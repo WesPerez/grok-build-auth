@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -757,6 +758,137 @@ def login_with_playwright(
         server.server_close()
 
 
+def _device_browser_terminal_kind(exc: BaseException) -> str:
+    """Reduce a device-flow exception to a non-secret operational category."""
+    low = str(exc or "").lower()
+    if "access_denied" in low or "access denied" in low:
+        return "access_denied"
+    if "expired_token" in low or "expired token" in low:
+        return "expired_token"
+    if "timed out" in low or "timeout" in low or "waiting for user approval" in low:
+        return "approval_timeout"
+    if "cancelled" in low or "canceled" in low:
+        return "cancelled"
+    if any(value in low for value in ("invalid credential", "invalid password", "sign-in rejected")):
+        return "credentials_rejected"
+    if any(value in low for value in ("proxy", "socks", "tls", "eof", "connection")):
+        return "transport_error"
+    if "browser" in low or "chromium" in low or "edge" in low:
+        return "browser_error"
+    return "runtime_error"
+
+
+def login_with_device_browser(
+    email: str,
+    password: str,
+    *,
+    cliproxyapi_auth_dir: Optional[str | Path] = None,
+    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
+    cliproxyapi_disabled: bool = False,
+    headless: bool = False,
+    timeout: float = 240.0,
+    proxy: str = "",
+    debug: bool = False,
+) -> OAuthLoginResult:
+    """Mint OAuth through xAI's device-code flow and a real Edge session."""
+    windows_dir = Path(__file__).resolve().parent.parent / "clients" / "windows"
+    if not (windows_dir / "oidc_mint" / "oauth_device.py").is_file():
+        raise RuntimeError("device browser OAuth client is unavailable")
+
+    inserted = str(windows_dir) not in sys.path
+    if inserted:
+        sys.path.insert(0, str(windows_dir))
+    try:
+        from oidc_mint import mint_with_browser
+    except Exception as exc:
+        raise RuntimeError("device browser OAuth dependencies are unavailable") from exc
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(str(windows_dir))
+            except ValueError:
+                pass
+
+    logged_stages: set[str] = set()
+
+    def safe_log(message: str) -> None:
+        if not debug:
+            return
+        low = str(message or "").lower()
+        stage = ""
+        if "device done" in low:
+            stage = "device_done"
+        elif "token poll success" in low:
+            stage = "token_received"
+        elif "consent/authorize page detected" in low:
+            stage = "device_consent"
+        elif "login attempt" in low:
+            stage = "device_login"
+        elif "standalone chromium started" in low:
+            stage = "browser_started"
+        elif "request_device_code" in low and "failed" in low:
+            stage = "device_code_request_failed"
+        elif "browser confirm warning" in low:
+            stage = "browser_confirm_warning"
+        if stage and stage not in logged_stages:
+            logged_stages.add(stage)
+            print(f"device-browser stage={stage}")
+
+    try:
+        tokens = mint_with_browser(
+            email=email,
+            password=password,
+            proxy=proxy or None,
+            headless=headless,
+            browser_timeout_sec=timeout,
+            poll_log=safe_log,
+            force_standalone=True,
+            reuse_browser=False,
+        )
+    except Exception as exc:
+        terminal = _device_browser_terminal_kind(exc)
+        if debug:
+            print(f"device-browser terminal={terminal}")
+        raise RuntimeError(f"device browser OAuth terminal={terminal}") from exc
+    token = {
+        key: value
+        for key, value in dict(tokens or {}).items()
+        if key in {"access_token", "refresh_token", "id_token", "token_type", "expires_in", "scope"}
+    }
+    if not token.get("access_token") or not token.get("refresh_token"):
+        raise RuntimeError("device browser OAuth did not return complete tokens")
+    if token.get("expires_in") is not None:
+        try:
+            token["expires_at"] = int(time.time()) + int(token["expires_in"])
+        except (TypeError, ValueError):
+            pass
+
+    userinfo = fetch_userinfo(str(token["access_token"]), timeout=30.0, proxy=proxy)
+    id_payload = parse_jwt_payload(str(token.get("id_token") or "")) or {}
+    identity_email = str(userinfo.get("email") or id_payload.get("email") or "").strip().lower()
+    identity_subject = str(userinfo.get("sub") or id_payload.get("sub") or "").strip()
+    if identity_email != str(email or "").strip().lower() or not identity_subject:
+        raise RuntimeError("device browser OAuth identity does not match the requested account")
+
+    clip_path = None
+    if cliproxyapi_auth_dir:
+        clip_path = save_cliproxyapi_auth_record(
+            token,
+            userinfo=userinfo,
+            auth_dir=cliproxyapi_auth_dir,
+            redirect_uri="",
+            disabled=cliproxyapi_disabled,
+            base_url=cliproxyapi_base_url,
+        )
+    return OAuthLoginResult(
+        token=token,
+        userinfo=userinfo,
+        id_token_payload=id_payload,
+        cliproxyapi_path=clip_path,
+        redirect_uri="",
+    )
+
+
 def complete_build_oauth(
     email: str,
     password: str,
@@ -770,6 +902,7 @@ def complete_build_oauth(
     interactive_fallback: bool = False,
     yescaptcha_key: Optional[str] = None,
     protocol: bool = True,
+    device_browser_fallback: bool = False,
     playwright_fallback: bool = False,
     debug: bool = False,
     session_cookies: Optional[Dict[str, str]] = None,
@@ -779,9 +912,13 @@ def complete_build_oauth(
 
     Preference order:
       1) Pure HTTP protocol (reuse signup cookies, else CreateSession+YesCaptcha)
-      2) Playwright auto-login (if protocol=False or protocol fails)
-      3) Interactive system-browser fallback (if interactive_fallback=True)
+      2) Official device-code flow in a headed Edge session (when selected)
+      3) Playwright authorization-code login (when selected)
+      4) Interactive system-browser fallback (if interactive_fallback=True)
     """
+    if device_browser_fallback and playwright_fallback:
+        raise ValueError("device_browser_fallback and playwright_fallback are mutually exclusive")
+
     key = (yescaptcha_key or os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
     errors: list[str] = []
 
@@ -804,7 +941,25 @@ def complete_build_oauth(
             errors.append(f"protocol OAuth failed: {exc}")
             print(f"Protocol OAuth failed ({redact_text(exc)})")
             if not playwright_fallback:
-                raise RuntimeError("protocol OAuth failed; Playwright fallback is disabled") from exc
+                if not device_browser_fallback:
+                    raise RuntimeError("protocol OAuth failed; browser fallbacks are disabled") from exc
+
+    if device_browser_fallback:
+        try:
+            return login_with_device_browser(
+                email,
+                password,
+                cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+                cliproxyapi_base_url=cliproxyapi_base_url,
+                headless=headless,
+                timeout=timeout,
+                proxy=proxy,
+                debug=debug,
+            )
+        except Exception as exc:
+            errors.append(f"device browser OAuth failed: {exc}")
+            if not playwright_fallback:
+                raise RuntimeError("device browser OAuth failed") from exc
 
     if not playwright_fallback:
         raise RuntimeError("Playwright fallback is disabled")

@@ -278,21 +278,44 @@ def _psql_json(query):
     return json.loads(value) if value else None
 
 
-def find_account_snapshot(name):
+def sql_literal(value):
+    text = str(value)
+    if "\x00" in text:
+        raise ValueError("SQL literal contains a null byte")
+    return "'" + text.replace("'", "''") + "'"
+
+
+def find_account_snapshot(name, email_addr="", subject=""):
     if not re.fullmatch(r"grok_[a-z0-9._+-]+_[a-z0-9.-]+", name):
         raise ValueError("invalid account name")
+    email_addr = str(email_addr or "").strip().lower()
+    subject = str(subject or "").strip()
+    if email_addr and not re.fullmatch(r"[a-z0-9][a-z0-9._+-]{0,63}@[a-z0-9.-]+", email_addr):
+        raise ValueError("invalid account email")
+    filters = [f"a.name={sql_literal(name)}"]
+    if email_addr:
+        filters.append(f"lower(coalesce(a.credentials->>'email',''))={sql_literal(email_addr)}")
+    if subject:
+        filters.append(f"coalesce(a.credentials->>'sub','')={sql_literal(subject)}")
     query = (
-        "select json_build_object("
+        "select coalesce(json_agg(candidate.snapshot order by candidate.id),'[]'::json) from ("
+        "select a.id,json_build_object("
         "'id',a.id,'name',a.name,'platform',a.platform,'type',a.type,"
         "'credentials',a.credentials,'extra',a.extra,'proxy_id',a.proxy_id,"
         "'concurrency',a.concurrency,'priority',a.priority,'status',a.status,"
         "'schedulable',a.schedulable,'rate_multiplier',a.rate_multiplier,"
         "'group_ids',coalesce((select json_agg(ag.group_id order by ag.group_id) "
-        "from account_groups ag where ag.account_id=a.id),'[]'::json)) "
-        "from accounts a "
-        f"where a.name='{name}' and a.deleted_at is null order by a.id desc limit 1"
+        "from account_groups ag where ag.account_id=a.id),'[]'::json)) as snapshot "
+        "from accounts a where a.deleted_at is null and a.platform='grok' and a.type='oauth' and ("
+        + " or ".join(filters)
+        + ") order by a.id limit 2) candidate"
     )
-    return _psql_json(query)
+    matches = _psql_json(query)
+    if not isinstance(matches, list):
+        raise RuntimeError("account identity query returned an invalid result")
+    if len(matches) > 1:
+        raise RuntimeError("account identity is ambiguous")
+    return matches[0] if matches else None
 
 
 def find_account_snapshot_by_id(account_id):
@@ -901,7 +924,8 @@ def handle_request(environ, start_response):
                     imported=False,
                 )
 
-            snapshot = find_account_snapshot(name)
+            candidate_subject = auth_subject(auth_data)
+            snapshot = find_account_snapshot(name, email_addr, candidate_subject)
             if auth_subject_mismatch(snapshot, auth_data):
                 return error_response(
                     "AUTH principal 与 Sub2API 当前账号不一致，拒绝覆盖",
@@ -925,7 +949,10 @@ def handle_request(environ, start_response):
                     imported=False,
                 )
             account_id = int(snapshot["id"]) if snapshot else None
-            candidate = build_account_payload(name, auth_data, [], False)
+            candidate_name = str(snapshot.get("name") or name) if snapshot else name
+            candidate = build_account_payload(candidate_name, auth_data, [], False)
+            if snapshot:
+                candidate["priority"] = int(snapshot.get("priority") or 1)
             action = "created" if account_id is None else "updated"
             try:
                 if account_id is None:
