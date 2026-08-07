@@ -103,7 +103,7 @@ class SecurityTests(unittest.TestCase):
                     "owner@example.com",
                     "password",
                     cliproxyapi_auth_dir=td,
-                    proxy="socks5://127.0.0.1:10902",
+                    proxy="socks5://127.0.0.1:19012",
                     debug=True,
                 )
 
@@ -166,7 +166,7 @@ class SecurityTests(unittest.TestCase):
                 login_with_device_browser(
                     "owner@example.com",
                     "password",
-                    proxy="socks5://127.0.0.1:10902",
+                    proxy="socks5://127.0.0.1:19012",
                     debug=True,
                 )
 

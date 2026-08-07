@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from xconsole_client.proxy_pool import ProxyPoolError, load_proxy_pool
+
 
 def read_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
@@ -53,17 +55,19 @@ def write_private_json(path: Path, payload: dict[str, Any]) -> None:
 
 def load_proxy_urls(project: Path) -> dict[str, str]:
     runtime = read_env(project / "private" / "runtime.env")
-    pool = json.loads((project / "private" / "proxies.json").read_text(encoding="utf-8"))
-    result: dict[str, str] = {}
-    for item in pool.get("proxies", []):
-        if not item.get("enabled", True):
-            continue
-        ref = str(item.get("ref") or "").strip()
-        env_name = str(item.get("url_env") or "").strip()
-        value = runtime.get(env_name, "").strip()
-        if ref and value:
-            result[ref] = value
-    return result
+    pool_path = project / "private" / "proxies.json"
+    runtime["GROK_PROXY_POOL_FILE"] = str(pool_path)
+    try:
+        pool = load_proxy_pool(str(pool_path), runtime)
+    except ProxyPoolError as exc:
+        raise RuntimeError(f"invalid registration proxy pool: {exc}") from exc
+    if (
+        not pool.configured
+        or pool.schema_version != 2
+        or any(spec.source != "resin" for spec in pool.specs)
+    ):
+        raise RuntimeError("registration proxy pool must use version=2 Resin declarations")
+    return {spec.ref: spec.url for spec in pool.specs}
 
 
 def split_targets(total: int, routes: int) -> list[int]:
@@ -232,7 +236,6 @@ def main() -> int:
     parser.add_argument("--routes", type=int, default=2)
     parser.add_argument("--attempts-per-route", type=int, default=200)
     parser.add_argument("--proxy-ref", action="append", dest="proxy_refs")
-    parser.add_argument("--proxy-url", action="append", dest="proxy_urls")
     parser.add_argument(
         "--email-provider", choices=("cloudflare", "duckmail"), default="cloudflare"
     )
@@ -269,25 +272,13 @@ def main() -> int:
         raise RuntimeError(f"mail domain is not enabled by bridge: {domain}")
 
     proxies = load_proxy_urls(project)
-    if args.proxy_urls:
-        if args.proxy_refs:
-            raise RuntimeError("use either --proxy-ref or --proxy-url, not both")
-        if len(args.proxy_urls) != args.routes or len(set(args.proxy_urls)) != args.routes:
-            raise RuntimeError("provide one distinct --proxy-url per route")
-        selected_routes = [
-            (f"explicit-{index}", value.strip())
-            for index, value in enumerate(args.proxy_urls, start=1)
-        ]
-        if any(not value for _, value in selected_routes):
-            raise RuntimeError("--proxy-url cannot be empty")
-    else:
-        selected_refs = args.proxy_refs or list(proxies)[: args.routes]
-        if len(selected_refs) != args.routes or len(set(selected_refs)) != args.routes:
-            raise RuntimeError("provide one distinct --proxy-ref per route")
-        missing = [ref for ref in selected_refs if ref not in proxies]
-        if missing:
-            raise RuntimeError(f"proxy refs are not configured/enabled: {missing}")
-        selected_routes = [(ref, proxies[ref]) for ref in selected_refs]
+    selected_refs = args.proxy_refs or list(proxies)[: args.routes]
+    if len(selected_refs) != args.routes or len(set(selected_refs)) != args.routes:
+        raise RuntimeError("provide one distinct --proxy-ref per route")
+    missing = [ref for ref in selected_refs if ref not in proxies]
+    if missing:
+        raise RuntimeError(f"proxy refs are not configured/enabled: {missing}")
+    selected_routes = [(ref, proxies[ref]) for ref in selected_refs]
 
     run_id = args.run_id or dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + secrets.token_hex(3)
     run_dir = project / "private" / "client-runs" / run_id

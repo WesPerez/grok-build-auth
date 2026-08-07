@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 import threading
 from typing import Mapping
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 try:
     import fcntl
@@ -23,12 +23,42 @@ class ProxyPoolError(RuntimeError):
 PROXY_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
+def _resin_proxy_url(config: Mapping[str, object], ref: str) -> str:
+    scheme = str(config.get("scheme") or "socks5h").strip().lower()
+    host = str(config.get("host") or "").strip()
+    username = str(config.get("username") or "").strip()
+    token_file_value = str(config.get("token_file") or "").strip()
+    try:
+        port = int(config.get("port") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ProxyPoolError(f"proxy {ref} has invalid Resin port") from exc
+    if scheme not in {"socks5", "socks5h"} or not host or port < 1 or port > 65535:
+        raise ProxyPoolError(f"proxy {ref} has invalid Resin endpoint")
+    if not username or any(char.isspace() or char in "@/:?#" for char in username):
+        raise ProxyPoolError(f"proxy {ref} has invalid Resin username")
+    if not token_file_value:
+        raise ProxyPoolError(f"proxy {ref} requires a Resin token_file")
+    token_file = Path(token_file_value).expanduser()
+    if token_file.is_symlink() or not token_file.is_file():
+        raise ProxyPoolError(f"proxy {ref} Resin token_file is missing or symlinked")
+    if token_file.stat().st_mode & 0o077:
+        raise ProxyPoolError(f"proxy {ref} Resin token_file permissions must be 0600 or stricter")
+    token = token_file.read_text(encoding="utf-8").strip()
+    if not token or any(char.isspace() for char in token):
+        raise ProxyPoolError(f"proxy {ref} Resin token_file is empty or malformed")
+    return (
+        f"{scheme}://{quote(username, safe='')}:{quote(token, safe='')}@"
+        f"{host}:{port}"
+    )
+
+
 @dataclass(frozen=True)
 class ProxySpec:
     ref: str
     url: str
     max_active_leases: int = 1
     sub2api_proxy_id: int | None = None
+    source: str = "legacy"
 
 
 @dataclass(frozen=True)
@@ -48,9 +78,11 @@ class ProxyPool:
     def __init__(
         self, specs: list[ProxySpec], *, configured: bool,
         rotation_state_path: Path | None = None,
+        schema_version: int | None = None,
     ) -> None:
         self._specs = specs
         self.configured = configured
+        self.schema_version = schema_version
         self._active = {spec.ref: 0 for spec in specs}
         self._cursor = 0
         self._lock = threading.Lock()
@@ -76,6 +108,7 @@ class ProxyPool:
             specs,
             configured=self.configured,
             rotation_state_path=self._rotation_state_path,
+            schema_version=self.schema_version,
         )
 
     def acquire(self) -> ProxyLease | None:
@@ -182,7 +215,7 @@ class ProxyPool:
 def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
     raw_path = (path_value or "").strip()
     if not raw_path:
-        return ProxyPool([], configured=False)
+        return ProxyPool([], configured=False, schema_version=None)
     path = Path(raw_path).expanduser().resolve()
     if not path.is_file():
         raise ProxyPoolError(f"proxy pool file not found: {path}")
@@ -192,10 +225,13 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ProxyPoolError(f"invalid proxy pool JSON: {path}") from exc
-    if payload.get("version") != 1 or not isinstance(payload.get("proxies"), list):
-        raise ProxyPoolError("proxy pool requires version=1 and a proxies array")
+    version = payload.get("version")
+    if version not in {1, 2} or not isinstance(payload.get("proxies"), list):
+        raise ProxyPoolError("proxy pool requires version=1|2 and a proxies array")
+    resin_only = version == 2
     specs: list[ProxySpec] = []
     seen: set[str] = set()
+    seen_resin_usernames: set[str] = set()
     bind_after_import = str(values.get("GROK_BIND_SUB2API_PROXY_AFTER_IMPORT", "false")).strip().lower() in {
         "1", "true", "yes", "on",
     }
@@ -207,9 +243,27 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
             continue
         ref = str(item.get("ref") or "").strip()
         url_env = str(item.get("url_env") or "").strip()
-        if not PROXY_REF_RE.fullmatch(ref) or ref in seen or not url_env:
-            raise ProxyPoolError("each enabled proxy needs a unique ref and url_env")
-        url = str(values.get(url_env) or os.environ.get(url_env) or "").strip()
+        resin_config = item.get("resin")
+        if not PROXY_REF_RE.fullmatch(ref) or ref in seen:
+            raise ProxyPoolError("each enabled proxy needs a unique ref")
+        if resin_config is not None:
+            if url_env or not isinstance(resin_config, dict):
+                raise ProxyPoolError(f"proxy {ref} has invalid Resin declaration")
+            resin_username = str(resin_config.get("username") or "").strip()
+            if resin_username in seen_resin_usernames:
+                raise ProxyPoolError(
+                    f"proxy {ref} reuses Resin logical identity {resin_username}"
+                )
+            url = _resin_proxy_url(resin_config, ref)
+            seen_resin_usernames.add(resin_username)
+            source = "resin"
+        else:
+            if resin_only:
+                raise ProxyPoolError(f"proxy {ref} requires a Resin declaration in version=2")
+            if not url_env:
+                raise ProxyPoolError(f"proxy {ref} needs url_env or a Resin declaration")
+            url = str(values.get(url_env) or os.environ.get(url_env) or "").strip()
+            source = "legacy"
         try:
             parsed = urlparse(url)
             valid_url = (
@@ -241,6 +295,7 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
             url=url,
             max_active_leases=limit,
             sub2api_proxy_id=proxy_id,
+            source=source,
         ))
         seen.add(ref)
     rotation_state_raw = str(values.get("GROK_PROXY_ROTATION_STATE_FILE") or "").strip()
@@ -270,4 +325,9 @@ def load_proxy_pool(path_value: str, values: Mapping[str, str]) -> ProxyPool:
                 or set(state_payload) - {"version", "next_ref"}
             ):
                 raise ProxyPoolError(f"invalid proxy rotation state: {rotation_state_path}")
-    return ProxyPool(specs, configured=True, rotation_state_path=rotation_state_path)
+    return ProxyPool(
+        specs,
+        configured=True,
+        rotation_state_path=rotation_state_path,
+        schema_version=int(version),
+    )

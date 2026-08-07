@@ -1033,7 +1033,7 @@ def main() -> None:
         action="store_true",
         help="Mark the optional Sub2API auth export as disabled.",
     )
-    p.add_argument("--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "")
+    p.add_argument("--proxy", default="")
     args = p.parse_args()
 
     result = login_with_browser(

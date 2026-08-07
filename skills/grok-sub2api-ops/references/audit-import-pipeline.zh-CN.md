@@ -15,8 +15,9 @@
 cd /root/grok-build-auth
 systemctl show grok-register-bridge \
   -p FragmentPath -p EnvironmentFiles -p ExecStart --no-pager
-systemctl show v2ray-grok-pool \
+systemctl show resin-grok resin-singbox-bridge \
   -p FragmentPath -p EnvironmentFiles -p ExecStart --no-pager
+ss -lnt | rg '172\.17\.0\.1:10833|127\.0\.0\.1:1090[0-7]'
 ```
 
 从发现的 env 文件读取以下变量，但不回显密钥内容：
@@ -26,7 +27,7 @@ SUB2API_BASE / SUB2API_URL
 SUB2API_GROK_GROUP_ID / SUB2API_GROUP
 SUB2API_POSTGRES_CONTAINER / SUB2API_PG_USER / SUB2API_PG_DB
 SUB2API_ADMIN_KEY_FILE / BRIDGE_MANAGEMENT_KEY_FILE
-BRIDGE_PORT
+BRIDGE_PORT / RESIN_BASE_URL / RESIN_PLATFORM_NAME
 ```
 
 再通过 Sub2API 管理元数据或数据库核对：目标 group ID 的 name 为 `grok`，目标账号 platform 为 `grok`。配置缺失或指向不一致时停止写入。

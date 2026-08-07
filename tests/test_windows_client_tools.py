@@ -88,7 +88,7 @@ def test_responses_probe_ignores_environment_proxy(monkeypatch):
         def open(self, request, timeout):
             return Response()
 
-    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:10900")
+    monkeypatch.setenv("HTTPS_PROXY", "socks5://127.0.0.1:19010")
 
     def build_opener(*items):
         handlers.extend(items)
@@ -298,7 +298,7 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
         bridge_base="http://127.0.0.1:8190",
         management_key="secret",
         domain="example.com",
-        proxy="socks5://127.0.0.1:10900",
+        proxy="socks5://127.0.0.1:19010",
         route_dir=tmp_path,
         attempts=20,
         target=3,
@@ -308,8 +308,8 @@ def test_linux_client_runner_splits_targets_and_requires_created(tmp_path):
     assert config["server_client_mode"] is True
     assert config["native_registration_interactions"] is True
     runner_source = (SCRIPTS / "run_linux_client_full.py").read_text(encoding="utf-8")
-    assert 'parser.add_argument("--proxy-url"' in runner_source
-    assert "use either --proxy-ref or --proxy-url" in runner_source
+    assert 'parser.add_argument("--proxy-ref"' in runner_source
+    assert 'parser.add_argument("--proxy-url"' not in runner_source
     assert '"--email-provider"' in runner_source
     assert '"duckmail_domain": duckmail_domain' in runner_source
     assert '"duckmail_api_base": mail_api_base' in runner_source
@@ -349,7 +349,7 @@ def test_cpa_reprobe_loads_sensitive_values_from_config(tmp_path, monkeypatch, c
         config_path = tmp_path / "config.json"
         config_path.write_text(json.dumps({
             "cpa_auth_dir": str(tmp_path / "route" / "cpa_auths"),
-            "proxy": "socks5://127.0.0.1:10900",
+            "proxy": "socks5://127.0.0.1:19010",
             "cpa_remote_base": "http://127.0.0.1:8190",
             "cpa_remote_secret": "secret",
             "cpa_push_proxy": "",
@@ -414,13 +414,13 @@ def test_oauth_device_transport_fallback_preserves_proxy(monkeypatch):
             "https://auth.example/device",
             {"client_id": "client"},
             timeout=12,
-            proxy="http://127.0.0.1:10808",
+            proxy="http://127.0.0.1:18080",
         )
         assert status == 200 and body["device_code"] == "d"
         assert len(calls) == 1
         assert calls[0][1]["proxies"] == {
-            "http": "http://127.0.0.1:10808",
-            "https": "http://127.0.0.1:10808",
+            "http": "http://127.0.0.1:18080",
+            "https": "http://127.0.0.1:18080",
         }
         assert calls[0][1]["timeout"] == 12
         assert calls[0][2] is False
@@ -656,7 +656,7 @@ def test_cpa_export_can_wait_for_permission_propagation(monkeypatch):
         monkeypatch.setattr(cpa_export.time, "sleep", sleeps.append)
         probe, payload = cpa_export._run_preprobe(
             {"access_token": "token", "refresh_token": "refresh"},
-            proxy="socks5://127.0.0.1:10900",
+            proxy="socks5://127.0.0.1:19010",
             cfg={
                 "cpa_preprobe_attempts": 2,
                 "cpa_preprobe_permission_retry_delay_sec": 60,

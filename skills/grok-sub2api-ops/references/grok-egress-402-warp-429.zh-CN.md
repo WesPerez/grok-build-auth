@@ -1,5 +1,9 @@
 # Grok 402 出口恢复、WARP 验证与 429 预绑定
 
+> 状态说明：本文主体是 2026-07-27 的历史事件记录。JP/TW/FR relay、Sub2API proxy 10/11/12 与
+> `v2ray-grok-pool` 已在 2026-08-06 退役。当前生产使用 `resin-grok.service` 的
+> `GrokEU.<account>` 逻辑身份；账号级换出口应删除对应 Resin lease，不得恢复本文的固定 relay。
+
 ## 目录
 
 1. 目标与结论
@@ -20,8 +24,10 @@
 关键结论：
 
 - 同一批账号需要的是稳定、已验证且按账号粘性的出口，不是每次请求随机换 IP。
+- 当前受管 Resin 可以让多个账号共享一个 Sub2 profile `proxy_id`，再把
+  `GrokEU.sub2-{{account_id}}` 展开成账号独立逻辑身份；迁移前的 `GrokEU.shard-N` 只作兼容。
 - Cloudflare WARP 只是一种候选出口技术，不能把“换出口后恢复”写成“WARP 必然修复 spending-limit”。
-- 当前生产恢复池是三个已有账号级恢复证据的区域出口；WARP SJC 只有链路健康 canary 证据，不进入账号批量绑定池。
+- 历史恢复池曾使用三个区域出口；当前生产已迁移到 Resin sticky lease，WARP 仍只作为 canary/特殊恢复候选。
 - 疑似出口型 `402` 可以用单账号、单次指定账号探针验证；成功后再分波绑定。
 - 已有被动证据的真实 `429` 只做出口预绑定，禁止 `/test`、生成请求和 cooldown 清理。完成状态是 `binding_applied`，不是 `quota_recovered`。
 - 真正的 `free-usage-exhausted`、rolling 24-hour 或 included free usage 用尽不会因换 IP 恢复，应保留 reset/cooldown 等待自然到期。
@@ -33,16 +39,16 @@
 | Proxy ID | 名称/区域 | 本机入口 | 用途 |
 |---|---|---|---|
 | 9 | Cloudflare WARP US/SJC | `172.17.0.1:10828` | 仅链路 canary 与出口研究，尚无账号级恢复证据 |
-| 10 | JP/KIX verified relay | `172.17.0.1:10830` | 生产账号粘性出口 |
-| 11 | TW/TPE verified relay | `172.17.0.1:10831` | 生产账号粘性出口 |
-| 12 | FR/CDG verified relay | `172.17.0.1:10832` | 生产账号粘性出口 |
+| 10 | JP/KIX verified relay | `172.17.0.1:10830` | 历史生产出口，已于 2026-08-06 退役 |
+| 11 | TW/TPE verified relay | `172.17.0.1:10831` | 历史生产出口，已于 2026-08-06 退役 |
+| 12 | FR/CDG verified relay | `172.17.0.1:10832` | 历史生产出口，已于 2026-08-06 退役 |
 
-对应服务：
+当前服务状态：
 
-- `grok-warp-egress.service`
-- `grok-jp-egress-relay.service`
-- `grok-tw-egress-relay.service`
-- `grok-fr-egress-relay.service`
+- `grok-warp-egress.service` 仍作为隔离的 canary/恢复入口运行，SOCKS 监听为
+  `172.17.0.1:10828`；`127.0.0.1:19082` 是 wireproxy 的只读 health/info 监听，不是业务代理入口。
+- `grok-jp-egress-relay.service`、`grok-tw-egress-relay.service`、
+  `grok-fr-egress-relay.service` 已退役，不得作为通用池或自动回滚目标恢复。
 
 `proxy_id` 是账号的持久绑定。所谓“随机分配”是计划阶段随机决定某个账号归属 10/11/12 中哪一个，同时保持三个出口总负载均衡；完成后同一账号继续走固定出口。不要为每次请求重新随机代理，否则会增加身份风控、地域漂移和故障定位难度。
 
@@ -124,6 +130,19 @@
 
 只在对象明确为 Grok OAuth 账号、用户授权生产写入且已有恢复点时执行。
 
+### 当前 Resin 账号级 lease
+
+账号的 Admin GET 若代理入口指向 `resin-grok`、snapshot 为 `402`，且 username 是旧字面身份
+`GrokEU.shard-N` 或共享模板 `GrokEU.sub2-{{account_id}}`，使用已安装技能中的
+`scripts/recover_402_resin_lease.py`：
+
+1. 只接收 `402 + retry_after_seconds≈86400` 或明确 spending-limit 语义；任何 `429` 都硬排除。
+2. 旧入口解析 `shard-N`；共享 profile 按真实账号 ID 解析 `sub2-N`。多个账号共享 Sub2 `proxy_id` 不等于共享 Resin lease。
+3. 只删除该逻辑 account 的 sticky lease；不改 `proxy_id`、Platform、subscription 或其他账号 lease。
+4. 每账号 24 小时最多一次指定账号 test，成功后才清 rate limit；失败保留 cooldown 并进入有上限退避。
+
+### 历史固定出口
+
 1. 从被动 snapshot 冻结 `402 + active + schedulable + 目标 Grok 分组 + 非 child + proxy 空` 的候选集。
 2. 通过 Admin API 核验出口 proxy 为 active，并从主机服务和历史证据确认它属于已验证生产出口；不要靠名称猜测。
 3. 先选一个账号做 canary：保存 before，临时 `schedulable=false`，绑定一个已验证区域出口，只执行一次指定账号 Responses test。
@@ -195,10 +214,11 @@ apply-summary.json
 - 目标账号的 `proxy_id` 全部属于锁定的生产 pool，未绑定数为 0。
 - `402=0`；`429` 可大于 0，且 reset/cooldown 未被本次绑定脚本清除。
 - proxy 9 未被批量绑定。
-- JP/TW/FR relay 和 Sub2API proxy 均 active。
+- `resin-grok.service`、受管 subscription 与目标 Platform 可路由节点达到当前门槛；旧 JP/TW/FR relay 端口保持无监听。
 - plan、backup、results 和 final summary 的 hash、权限及数量相互一致。
 
-出口是新的共享依赖。任一 relay 长期故障会影响粘在其上的一组账号，因此应监控 service active、SOCKS listener、Sub2API proxy 状态和被动 402/5xx 增量。监控只用 health/status 和近期被动结果；不要把模型生成请求做成高频心跳。
+出口是共享依赖。应监控 Resin service、subscription 可路由节点、lease 与被动 402/5xx 增量；单账号出口型
+故障只轮换该账号 lease。监控只用 health/status 和近期被动结果；不要把模型生成请求做成高频心跳。
 
 ## 公开资料与证据边界
 

@@ -190,11 +190,9 @@ def doctor() -> list[dict]:
             pool = load_proxy_pool(values.get("GROK_PROXY_POOL_FILE", ""), values)
             if pool.configured:
                 detail = f"已启用 {pool.enabled_count} 个节点，可用租约 {pool.capacity}"
-            elif values.get("HTTPS_PROXY") or values.get("HTTP_PROXY"):
-                detail = "未配置节点池，使用现有单一 sticky 代理"
+                add("注册代理池", True, detail, blocking=False)
             else:
-                detail = "未配置代理，注册任务直连"
-            add("注册代理池", True, detail, blocking=False)
+                add("注册代理池", False, "缺少必需的 Resin v2 节点池；注册会失败关闭")
         except ProxyPoolError as exc:
             add("注册代理池", False, str(exc))
         edge = next((Path(value) for value in (

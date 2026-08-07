@@ -21,12 +21,12 @@
 ## 服务器协议 canary
 
 1. 核对 `private/runtime.env`、Mailu、Sub2API、PostgreSQL 和注册代理池身份。
-2. 运行 `scripts/check_v2ray_isolation.py` 和 `scripts/check_proxy_pool.py`。
+2. 运行 `scripts/check_proxy_pool.py`，并确认 `resin-grok.service` active、旧 `10900-10907` 无监听。
 3. 固定 `--count 1 --workers 1 --failure-policy abort`。
 4. `protocol-yescaptcha` 通过 IMAP 读取验证码并调用已配置的 Turnstile provider。
 5. 检查 manifest、preprobe、精确账号状态、指定账号 postimport test 和分组 postprobe。
 
-服务器协议注册是保留方式。服务器不启动 `clients/windows/grok_register_ttk.py`；外部 Windows 客户端是另一条独立路径。
+服务器协议注册是保留方式。默认服务器不启动 `clients/windows/grok_register_ttk.py`；外部 Windows 客户端是另一条独立路径。用户明确授权 Linux/Xvfb 服务器模拟客户端时，按下节的隔离门禁执行，且不得与服务器协议批次并发。
 
 ## 外部 Windows 客户端
 
@@ -38,7 +38,19 @@
 
 `cpa_*`、`cpa_auths/`、`cpa_pending/` 和 `cpa_cooldown/` 是兼容名称。业务文档和报告使用“Sub2API auth”。
 
+## Linux/Xvfb 服务器模拟客户端
+
+1. 只使用当前仓库 `scripts/run_linux_client_full.py` 和 `clients/windows/grok_register_ttk.py`，不恢复历史 `/tmp` one-shot runner。
+2. 核对 `Xvfb :99`、Edge、客户端 venv、bridge、代理池和无其他注册批次。
+3. 先备份 Sub2API 数据库，运行 1 route/1 success canary。
+4. canary 必须返回本批本地 auth、bridge `action=created`、`probe=passed` 和精确账号 ID；只看数据库增长无效。
+5. 两路批量必须为两个隔离 route、两个代理 ref、每路单浏览器。后台启动记录 systemd unit、PID、run manifest 和日志路径。
+6. 402/429 仍计为可用额度状态；permission、网络和 5xx 保留在 route pending，不删除。
+
 ## OAuth 恢复
+
+批量 revoked、账号突然减少或“删除一组并恢复另一组”时，使用运行时技能中的
+`references/revoked-recovery-fast-path.zh-CN.md` 和正式 `scripts/reconcile_revoked.py`，不要在现场重写处置脚本。
 
 下列证据表示 refresh 已失效：
 
@@ -55,6 +67,15 @@ GROK_OAUTH_TOKEN_REFRESH_FAILED
 3. 更新原 Sub2API 账号，不创建重复账号；执行指定账号 test 后再恢复调度。
 4. 无密码但邮箱可收信时走密码恢复；无任何恢复能力时才列为逐 ID 删除候选。
 5. 旧 auth 或数据库备份不能替代重新登录，但数据库备份必须保留到恢复完成。
+
+关键防错：
+
+- `recover_batch_oauth.py` 面向“从未生成 auth”的批次；已有 revoked auth 会被跳过。
+- remint 后不要使用 `register_and_import.py --resume`，access-token hash 已改变时可能新建重复账号。
+- 显示名可能被排序前缀修改；按唯一 email/sub 锁定原账号并保留原显示名，歧义即停。
+- bridge 候选隔离后先清旧 revoked error，再运行语义 postprobe；通过或明确 402/429 后 helper 立即重新隔离，全部 remint 完成后复用该证据逐号 promote，不重复 Test Connection。
+- 最终官方 Codex `grok-4.5` 烟测使用 `high` effort，并核对 Grok provider/group/account HTTP 200，无 fallback。
+- 若日志为多次 refresh timeout、临时隔离、下一周期 permanent/revoked，标记 `ambiguous_refresh_rotation`：可能是上游已轮换而响应/持久化丢失，但没有 token-version/request ID 对照时不能写成确定根因。
 
 ## 账号状态
 

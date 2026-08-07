@@ -45,10 +45,23 @@ description: 在 grok-build-auth 项目中处理 Grok/xAI OAuth 账号生命周�
 
 用户报告 Grok OAuth 账号批量 `402`、换出口后恢复，或要求真实 `429` 到期后继续走已验证出口时，读取 [grok-egress-402-warp-429.zh-CN.md](references/grok-egress-402-warp-429.zh-CN.md)。先将账号互斥分为出口型 `402`、明确额度 `429`、传输不确定和 OAuth/permission 问题，不混用处理路径。
 
-1. 出口型 `402` 先用一个账号、一个已验证生产出口和唯一一次指定账号 test 做 canary；通过后再分小波。WARP 只是 canary 候选，不能仅凭 WARP 品牌进入批量恢复池。
-2. 已有被动 snapshot/cooldown 的真实 `429` 使用 `scripts/bind_quota_egress.py` 执行 `plan -> apply`。重新冻结候选、随机种子和均衡映射，写入前建立一次 custom-format 恢复点。
-3. 429 路径只允许 GET、临时 schedulable 隔离、PUT `proxy_id`、恢复 schedulable 和 GET 验收；禁止 `/test`、生成请求、DELETE temp、清 rate limit/overload 或宣称额度恢复。
-4. `proxy_id` 是账号粘性绑定；随机只发生在 plan 内，apply 必须使用 plan hash 锁定的映射。单账号失败只回滚该账号 proxy 和 schedulable。
+1. 如果账号已绑定 Resin 入口，使用运行时技能中的 `scripts/recover_402_resin_lease.py` 保留 `proxy_id`，只删除该账号的 sticky lease。脚本同时支持旧字面身份 `GrokEU.shard-N` 和共享 profile 模板 `GrokEU.sub2-{{account_id}}`；后者按真实账号 ID 解析为 `sub2-N`，不能把模板字面量或共享 `proxy_id` 当作共同 lease。402 分支每账号 24 小时最多一次指定账号 test，成功后才清 rate limit，首个失败触发全局退避，并硬排除所有 `429`。
+2. 同一脚本可消费最近的 Sub2API 结构化日志：同账号重复出现指向 `auth.x.ai/oauth2/token` 的 OAuth refresh exhausted 传输错误（EOF、TLS handshake timeout 或 SOCKS server failure），或同一 Resin 逻辑账号在短窗口出现至少三个独立 `502/504` failover 时，只轮换该 sticky lease。共享 profile 的日志身份必须由 `account_id` 还原。该 transport 分支不调用 `/test`、不清 cooldown、不修改 `proxy_id`；即使账号正处于真实 `429`，也只修出口并保留额度状态。没有明确 endpoint 的笼统 refresh timeout 不进入候选；超过全局账号阈值时停止逐号轮换。
+3. 非 Resin 的旧固定出口拓扑才使用“改 `proxy_id` 后 canary”的历史流程；出口型 `402` 先用一个账号、一个已验证生产出口和唯一一次指定账号 test，通过后再分小波。WARP 只是 canary 候选，不能仅凭品牌进入批量恢复池。
+4. 已有被动 snapshot/cooldown 的真实 `429` 使用 `scripts/bind_quota_egress.py` 执行 `plan -> apply`。重新冻结候选、随机种子和均衡映射，写入前建立一次 custom-format 恢复点。
+5. 429 路径只允许 GET、临时 schedulable 隔离、PUT `proxy_id`、恢复 schedulable 和 GET 验收；禁止 `/test`、生成请求、DELETE temp、清 rate limit/overload 或宣称额度恢复。
+6. `proxy_id` 是账号策略绑定；账号级 sticky 身份由 Resin Account 决定。随机只发生在 plan 内，apply 必须使用 plan hash 锁定的映射。单账号失败只回滚该账号 proxy 和 schedulable。
+
+## Refresh-revoked 快速路径
+
+用户报告“Grok 账号突然少一批”“OAuth refresh 失败后暂停”，或已明确要求删除不可恢复账号、remint 有材料账号时，使用运行时技能中的 `scripts/reconcile_revoked.py` 和 `references/revoked-recovery-fast-path.zh-CN.md`。不要重新通读所有注册资料，也不要临时编写删除/remint one-shot。
+
+1. 先用最近的被动审计、数据库 error 和 refresh 日志冻结 revoked ID；不要用全量 Test Connection 生成候选。usage 可能把 status 从 error 清回 active、但保留 `schedulable=false`，因此 UI 状态变化不能改变已锁定集合。
+2. 将 ID 一次分成互斥的 delete/recover 集合。直接 recover 必须有唯一身份映射和完整恢复材料；402/429、网络、5xx、permission 和归属不明项不得进入 delete。
+3. 使用一次 custom-format 恢复点和 helper 的 `validate -> backup -> delete -> 单 ID remint canary -> 串行 remint -> reverify -> status` 顺序。只按唯一 email/sub 锁定原 ID 并保留显示名，歧义即停。
+4. bridge 写入后复用已锁定的 postprobe 证据逐号 promote，不重复账号测试；quota 账号保留当前 cooldown。最终再用官方 Codex CLI 核验 Grok group/provider/account 命中且无 fallback。
+
+`invalid_grant`/revoked 证明 refresh 链被拒绝，但不能单独证明是旧 auth 覆盖、第二刷新器争用、持久化失败、xAI 批量 revoke 或账号封禁。
 
 ## 批次归档与源文件收口
 

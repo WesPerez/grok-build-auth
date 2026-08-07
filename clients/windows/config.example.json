@@ -10,7 +10,7 @@
   "email_provider": "cloudflare",
   "duckmail_api_base": "",
   "defaultDomains": "<mail-domain>",
-  "proxy": "http://127.0.0.1:10808",
+  "proxy": "",
   "register_count": 1,
   "max_concurrency": 1,
   "target_successes": 0,

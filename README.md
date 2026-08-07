@@ -61,7 +61,7 @@ chmod 600 .env
 | `TEMPMAIL_API_KEY` | `-e tempmail` | Tempmail.lol API key |
 | `CLOUDFLARE_API_TOKEN`、`CLOUDFLARE_ACCOUNT_ID`、`CLOUDFLARE_D1_DB_ID`、`ALIAS_MAIL_DOMAINS` | `-e cloudflare` | 自有 Cloudflare D1 别名邮箱 |
 | `IMAP_SERVER`、`IMAP_USERNAME`、`IMAP_PASSWORD`、`IMAP_EMAIL` | `-e imap` | 自有 IMAP 邮箱 |
-| `HTTPS_PROXY`、`HTTP_PROXY` | 可选 | 本次注册和 OAuth 使用的代理 |
+| `GROK_PROXY_POOL_FILE` | 必填 | version 2 Resin 注册身份清单；正式注册不允许单出口环境变量或直连旁路 |
 | `CLIPROXYAPI_AUTH_DIR` | 可选 | Sub2API auth 输出目录；变量名为历史 CLIProxyAPI 兼容键 |
 
 运行：
@@ -153,7 +153,7 @@ pytest -q
 ├── web_console.py
 ├── clients/windows/              # 脱敏后的 Windows 浏览器客户端
 ├── bridge/                       # 环境变量驱动的 bridge 源码
-├── skills/grok-sub2api-ops/      # 可复用 Codex 操作技能
+├── skills/grok-sub2api-ops/      # 可复用技能的仓库镜像；生产运行副本位于 /root/.codex/skills，变更需同步
 ├── private.example/             # 无秘密模板
 ├── xconsole_client/             # 协议与后端实现
 └── docs/research/               # 研究记录，不作为生产操作入口

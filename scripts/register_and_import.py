@@ -801,7 +801,7 @@ def run_preimport_auth_probes(
 
 def build_preprobe_proxy_map(
     auth_paths: list[Path], attempts: list[dict[str, Any]],
-    proxy_pool: Any, legacy_proxy: str = "",
+    proxy_pool: Any,
 ) -> dict[str, str]:
     auth_names = {path.name for path in auth_paths}
     proxy_by_file: dict[str, str] = {}
@@ -822,8 +822,6 @@ def build_preprobe_proxy_map(
             if selected is not None:
                 attempt["preprobe_proxy_ref"] = selected.ref
                 proxy_by_file[auth_file.name] = selected.url
-        elif legacy_proxy:
-            proxy_by_file[auth_file.name] = legacy_proxy
     return proxy_by_file
 
 
@@ -1044,6 +1042,12 @@ def main() -> int:
         proxy_pool = load_proxy_pool(config.get("GROK_PROXY_POOL_FILE", ""), config)
     except ProxyPoolError as exc:
         raise BatchError(str(exc)) from exc
+    if (
+        not proxy_pool.configured
+        or proxy_pool.schema_version != 2
+        or any(spec.source != "resin" for spec in proxy_pool.specs)
+    ):
+        raise BatchError("registration requires a version=2 Resin proxy pool")
     bind_proxy_after_import = config.get("GROK_BIND_SUB2API_PROXY_AFTER_IMPORT", "false").lower() in {
         "1", "true", "yes", "on",
     }
@@ -1124,9 +1128,7 @@ def main() -> int:
                 "enabled_nodes": proxy_pool.enabled_count,
                 "configured_nodes": configured_proxy_nodes,
                 "postimport_stickiness": bind_proxy_after_import,
-                "mode": "pool" if proxy_pool.configured else (
-                    "legacy-single" if config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") else "direct"
-                ),
+                "mode": "resin",
             },
         }
         if proxy_health is not None:
@@ -1177,10 +1179,6 @@ def main() -> int:
                 env.update({"IMAP_EMAIL": email, "IMAP_USERNAME": email, "CLIPROXYAPI_AUTH_DIR": str(attempt_auth_dir)})
                 if lease:
                     env["GROK_ATTEMPT_PROXY_URL"] = lease.url
-                else:
-                    legacy_proxy = config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") or ""
-                    if legacy_proxy:
-                        env["GROK_ATTEMPT_PROXY_URL"] = legacy_proxy
                 stage_map = {
                     "cookie + scrape OK": "email-verification", "email verified": "turnstile",
                     "Turnstile ": "account-creation", "account created": "sso",
@@ -1318,9 +1316,8 @@ def main() -> int:
         return 0 if not failures else 1
 
     set_manifest_stage(manifest, manifest_path, "upstream-preprobe")
-    legacy_proxy = config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") or ""
     proxy_by_file = build_preprobe_proxy_map(
-        auth_paths, manifest.get("attempts") or [], proxy_pool, legacy_proxy,
+        auth_paths, manifest.get("attempts") or [], proxy_pool,
     )
     preprobe = run_preimport_auth_probes(
         auth_paths,

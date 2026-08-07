@@ -42,7 +42,12 @@ def main() -> int:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     config = batch_module.load_env(private_dir / "runtime.env")
     proxy_pool = batch_module.load_proxy_pool(config.get("GROK_PROXY_POOL_FILE", ""), config)
-    legacy_proxy = config.get("HTTPS_PROXY") or config.get("HTTP_PROXY") or ""
+    if (
+        not proxy_pool.configured
+        or proxy_pool.schema_version != 2
+        or any(spec.source != "resin" for spec in proxy_pool.specs)
+    ):
+        raise RuntimeError("OAuth recovery requires a version=2 Resin proxy pool")
     recovered: list[Path] = []
 
     for attempt in manifest.get("attempts") or []:
@@ -70,11 +75,9 @@ def main() -> int:
             continue
         auth_dir = batch_dir / "auth" / email.split("@", 1)[0]
         proxy_ref = str(attempt.get("proxy_ref") or "")
-        proxy = (
-            proxy_pool.url_for(proxy_ref)
-            if proxy_pool.configured and proxy_ref and proxy_ref != "direct"
-            else legacy_proxy
-        )
+        if not proxy_ref or proxy_ref == "direct":
+            raise RuntimeError("OAuth recovery manifest has no Resin proxy identity")
+        proxy = proxy_pool.url_for(proxy_ref)
         last_error: Exception | None = None
         for number in range(1, max(1, args.attempts) + 1):
             try:

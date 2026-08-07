@@ -356,14 +356,14 @@ def test_preprobe_proxy_map_falls_back_when_original_node_is_unhealthy(tmp_path)
     }), encoding="utf-8")
     proxy_config.chmod(0o600)
     healthy_pool = MODULE.load_proxy_pool(str(proxy_config), {
-        "NODE_B": "socks5://127.0.0.1:10901",
+        "NODE_B": "socks5://127.0.0.1:19001",
         "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "false",
     })
     attempts = [{"auth_file": str(auth), "proxy_ref": "node-a"}]
 
     mapping = MODULE.build_preprobe_proxy_map([auth], attempts, healthy_pool)
 
-    assert mapping == {auth.name: "socks5://127.0.0.1:10901"}
+    assert mapping == {auth.name: "socks5://127.0.0.1:19001"}
     assert attempts[0]["preprobe_proxy_fallback_from"] == "node-a"
     assert attempts[0]["preprobe_proxy_ref"] == "node-b"
 
@@ -555,6 +555,74 @@ def test_proxy_pool_leases_refs_without_exposing_urls(tmp_path):
     assert pool.acquire().ref == first.ref
 
 
+def test_proxy_pool_builds_authenticated_resin_url_from_private_token(tmp_path):
+    token_file = tmp_path / "resin-proxy.token"
+    token_file.write_text("token/with?reserved\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 2,
+        "proxies": [{
+            "ref": "register-01",
+            "enabled": True,
+            "resin": {
+                "scheme": "socks5h",
+                "host": "172.17.0.1",
+                "port": 10833,
+                "username": "GrokEU.register-node-01",
+                "token_file": str(token_file),
+            },
+        }],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+
+    pool = MODULE.load_proxy_pool(str(config), {
+        "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "false",
+    })
+
+    assert pool.specs[0].url == (
+        "socks5h://GrokEU.register-node-01:token%2Fwith%3Freserved@172.17.0.1:10833"
+    )
+    assert pool.specs[0].source == "resin"
+
+
+def test_proxy_pool_version_two_rejects_legacy_url_env(tmp_path):
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 2,
+        "proxies": [{"ref": "node-safe", "url_env": "NODE"}],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+
+    with pytest.raises(MODULE.ProxyPoolError, match="requires a Resin declaration"):
+        MODULE.load_proxy_pool(str(config), {"NODE": "socks5://127.0.0.1:18080"})
+
+
+def test_proxy_pool_rejects_duplicate_resin_logical_identity(tmp_path):
+    token_file = tmp_path / "resin-proxy.token"
+    token_file.write_text("token\n", encoding="utf-8")
+    token_file.chmod(0o600)
+    resin = {
+        "scheme": "socks5h",
+        "host": "172.17.0.1",
+        "port": 10833,
+        "username": "GrokEU.register-node-01",
+        "token_file": str(token_file),
+    }
+    config = tmp_path / "proxies.json"
+    config.write_text(json.dumps({
+        "version": 2,
+        "proxies": [
+            {"ref": "node-a", "resin": resin},
+            {"ref": "node-b", "resin": resin},
+        ],
+    }), encoding="utf-8")
+    config.chmod(0o600)
+
+    with pytest.raises(MODULE.ProxyPoolError, match="reuses Resin logical identity"):
+        MODULE.load_proxy_pool(str(config), {})
+
+
 def test_proxy_pool_configured_empty_fails_closed(tmp_path):
     config = tmp_path / "proxies.json"
     config.write_text(json.dumps({"version": 1, "proxies": []}), encoding="utf-8")
@@ -590,7 +658,7 @@ def test_proxy_pool_rejects_unsafe_ref_and_url(tmp_path):
         MODULE.load_proxy_pool(str(config), {"NODE": "file:///etc/passwd"})
 
 
-def test_proxy_pool_requires_sub2api_proxy_id_by_default(tmp_path):
+def test_proxy_pool_requires_sub2api_proxy_id_when_stickiness_enabled(tmp_path):
     config = tmp_path / "proxies.json"
     config.write_text(json.dumps({
         "version": 1,
@@ -600,7 +668,7 @@ def test_proxy_pool_requires_sub2api_proxy_id_by_default(tmp_path):
 
     with pytest.raises(MODULE.ProxyPoolError, match="post-import stickiness"):
         MODULE.load_proxy_pool(str(config), {
-            "NODE": "socks5://127.0.0.1:10900",
+            "NODE": "socks5://127.0.0.1:19000",
             "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "true",
         })
 
@@ -614,7 +682,7 @@ def test_proxy_pool_allows_missing_sub2api_proxy_id_only_with_explicit_flag(tmp_
     config.chmod(0o600)
 
     pool = MODULE.load_proxy_pool(str(config), {
-        "NODE": "socks5://127.0.0.1:10900",
+        "NODE": "socks5://127.0.0.1:19000",
         "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "true",
         "GROK_ALLOW_MISSING_SUB2API_PROXY_IDS": "true",
     })
@@ -631,7 +699,7 @@ def test_proxy_pool_registration_only_mode_allows_missing_proxy_id(tmp_path):
     }), encoding="utf-8")
     config.chmod(0o600)
     pool = MODULE.load_proxy_pool(str(config), {
-        "NODE": "socks5://127.0.0.1:10900",
+        "NODE": "socks5://127.0.0.1:19000",
         "GROK_BIND_SUB2API_PROXY_AFTER_IMPORT": "false",
     })
     assert pool.specs[0].sub2api_proxy_id is None
@@ -650,8 +718,8 @@ def test_proxy_pool_rotation_persists_across_process_instances(tmp_path):
     }), encoding="utf-8")
     config.chmod(0o600)
     values = {
-        "NODE_A": "socks5://127.0.0.1:10900",
-        "NODE_B": "socks5://127.0.0.1:10901",
+        "NODE_A": "socks5://127.0.0.1:19000",
+        "NODE_B": "socks5://127.0.0.1:19001",
         "GROK_PROXY_ROTATION_STATE_FILE": str(state),
     }
 
@@ -680,7 +748,7 @@ def test_proxy_pool_rotation_write_failure_does_not_leak_lease(tmp_path, monkeyp
     }), encoding="utf-8")
     config.chmod(0o600)
     pool = MODULE.load_proxy_pool(str(config), {
-        "NODE_A": "socks5://127.0.0.1:10900",
+        "NODE_A": "socks5://127.0.0.1:19000",
         "GROK_PROXY_ROTATION_STATE_FILE": str(state),
     })
     monkeypatch.setattr(pool, "_write_rotation_cursor", lambda cursor: (_ for _ in ()).throw(OSError("disk full")))
@@ -700,7 +768,7 @@ def test_proxy_pool_rejects_rotation_state_path_collisions(tmp_path):
     }), encoding="utf-8")
     config.chmod(0o600)
     values = {
-        "NODE_A": "socks5://127.0.0.1:10900",
+        "NODE_A": "socks5://127.0.0.1:19000",
         "GROK_PROXY_ROTATION_STATE_FILE": str(config),
     }
     with pytest.raises(MODULE.ProxyPoolError, match="must differ"):

@@ -138,7 +138,7 @@ GROK_BROWSER_PROXY_URL=
 GROK_BROWSER_HEADED=true
 ```
 
-没有代理池时，`HTTPS_PROXY`/`HTTP_PROXY` 作为注册、OAuth 和 preprobe 的单一出口。两者都为空会直连，生产使用前必须明确接受这个结果。
+正式服务器注册强制要求 `GROK_PROXY_POOL_FILE` 指向 version 2 Resin 清单；缺失清单、旧 `url_env` 条目或空池都会失败关闭，不允许通过 `HTTPS_PROXY`/`HTTP_PROXY` 或直连旁路继续。
 
 启用代理池时应保持 `GROK_BROWSER_PROXY_URL` 为空，让每个 attempt 的 lease 代理生效。非空全局浏览器代理会覆盖真实浏览器出口，但 manifest 仍记录 lease；若又显式开启导入后粘性，还会造成记录的 ProxyID 与真实注册出口不一致。
 
@@ -155,11 +155,17 @@ chmod 600 private/proxies.json
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "proxies": [
     {
       "ref": "node-01",
-      "url_env": "GROK_PROXY_NODE_1",
+      "resin": {
+        "scheme": "socks5h",
+        "host": "172.17.0.1",
+        "port": 10833,
+        "username": "GrokEU.register-node-01",
+        "token_file": "/etc/resin-grok/proxy.token"
+      },
       "enabled": true,
       "max_active_leases": 1
     }
@@ -167,15 +173,14 @@ chmod 600 private/proxies.json
 }
 ```
 
-实际 URL 写入 `runtime.env`：
+`runtime.env` 只保存清单和轮询状态路径，不再保存每个节点的完整代理 URL：
 
 ```dotenv
 GROK_PROXY_POOL_FILE=/absolute/path/private/proxies.json
 GROK_PROXY_ROTATION_STATE_FILE=/absolute/path/private/proxy-rotation.json
-GROK_PROXY_NODE_1=socks5://127.0.0.1:<port>
 ```
 
-支持 `http`、`https`、`socks5`、`socks5h`。默认 `GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=false`：代理 lease 只用于注册、OAuth 和导入前 auth preprobe，导入后 Sub2API 正常调用不依赖注册节点。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
+Resin 声明支持 `socks5`、`socks5h`，认证 token 必须来自非符号链接且权限不宽于 `0600` 的 `token_file`。每个 enabled 条目必须使用唯一 `Platform.Account` 逻辑身份。默认 `GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=false`：注册 lease 只用于注册、OAuth 和导入前 auth preprobe；导入后的生产调用由 Sub2API 共享 profile 在运行时展开为 `GrokEU.sub2-{{account_id}}`。首次共享 profile 迁移完成前，旧 `GrokEU.shard-*` 仅作为 lease 继承来源。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
 
 跨进程状态文件只持久化轮询游标；`max_active_leases` 是单进程并发上限。生产入口依靠全局 batch lock 阻止多个 `register_and_import.py` 批次同时运行，不要绕过该锁并行启动多个注册进程。
 
@@ -200,34 +205,30 @@ python3 scripts/check_proxy_pool.py \
 
 独立运行 `check_proxy_pool.py` 时，任一节点成功率低于 2/3、TLS 校验失败、出口漂移或不同 ref 实际同出口会整体失败，适合完整池审计。批次编排器会排除不健康或重复出口节点，只要至少一个健康节点仍可继续；manifest 会记录每个节点的脱敏原因。不要把论坛节点凭据、完整代理 URL 或出口 IP 写进仓库和公开日志。
 
-### 4.4 主 V2Ray 与 Grok 代理池隔离
+### 4.4 Resin 注册身份与旧 V2Ray 池退役
 
-服务器上的公共代理和 Grok 注册代理池是两个独立服务：
-
-| 服务 | 配置 | 监听范围 | 用途 |
-|---|---|---|---|
-| `v2ray.service` | 从 `systemctl cat v2ray.service` 发现 | 以主配置实际 inbound 为准 | 其他客户端和服务器日常代理 |
-| `v2ray-grok-pool.service` | 从 `systemctl cat v2ray-grok-pool.service` 发现 | 以专用配置实际 loopback inbound 为准 | grok-build-auth 注册、OAuth 和 preprobe 代理池 |
-
-严禁在 `v2ray.service.d/*.conf` 中把主服务 `ExecStart` 覆盖为 Grok 专用代理池配置。这会替换主服务的全部 inbound，其他客户端会立即断线。
+Grok 注册、OAuth 和 preprobe 统一走 `resin-grok.service` 的稳定入口 `172.17.0.1:10833`。注册清单使用 `GrokEU.register-node-*`，已导入的 Sub2API Grok 账号使用 `GrokEU.sub2-{{account_id}}`；两者逻辑身份和 sticky lease 相互独立，但 Resin 可能把多个逻辑身份分配到同一物理节点或出口，不能描述成物理独占。
 
 只读检查：
 
 ```bash
-python3 scripts/check_v2ray_isolation.py
+python3 scripts/check_proxy_pool.py \
+  --private-dir /root/grok-build-auth/private \
+  --attempts 3 \
+  --timeout 10
+systemctl is-active resin-grok.service
+ss -ltn | grep -E ':1090[0-7]\b' || true
 ```
 
 正确结果必须同时满足：
 
-- `v2ray.service` 的 `ExecStart` 指向 `/etc/v2ray/config.json`。
-- `v2ray-grok-pool.service` 指向 `/etc/v2ray/grok_pool.json`。
-- 主服务配置声明的全部既有 inbound 仍存在。
-- 代理池配置声明的全部 inbound 只能绑定 loopback；禁止 Docker 网关、`0.0.0.0` 或公网监听。
-- 每个本机 inbound 必须按端口严格路由到对应 `proxy-01` 至 `proxy-08`。
-- 注册专用模式下 Sub2API 账号 `proxy_id` 应为空，节点故障不会影响生产调用。
-- 两份配置均通过 `v2ray test`。
+- `private/proxies.json` 的 enabled 条目均为 Resin 声明，且用户名唯一。
+- 每个 enabled 身份通过 CONNECT/TLS 和小流量出口检查；故障身份在清单中 disabled，不回退直连。
+- `10900-10907` 无监听，活动 systemd 依赖中不再出现旧注册池。
+- `resin-grok.service` 不依赖旧 V2Ray unit；服务器公共 `v2ray.service`、443、KCP 等入口不受影响。
+- 导入后账号由 Sub2API 的共享 `proxy_id -> GrokEU.sub2-{{account_id}}` 路径运行，不复用注册身份。
 
-如发现主服务 drop-in 指向 `grok_pool.json`，先保存现场并确认配置有效，再删除该精确 drop-in、执行 `systemctl daemon-reload`，分别重启两个服务。不要删除 `/etc/v2ray/config.json`，也不要把代理池合并进公共服务。
+旧 unit/config 仅保存在 root-only 恢复目录，不能重新放回活动 systemd 或代理菜单，除非明确执行回滚。
 
 ### 4.5 运行服务器流程
 
