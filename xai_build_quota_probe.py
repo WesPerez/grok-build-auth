@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Probe Grok Build/CLI free usage quota from CLIProxyAPI xAI auth files.
+"""Probe Grok Build/CLI free usage quota from Sub2API xAI auth files.
 
 This does NOT print tokens. It sends a tiny non-streaming request to the
 Grok Build endpoint and reads quota signals from response headers or 429 body.
@@ -20,6 +20,7 @@ from typing import Any
 from urllib.parse import urljoin
 
 import requests
+from xconsole_client.security import validate_cliproxyapi_base_url
 
 
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
@@ -59,7 +60,7 @@ def load_auth_files(auth_dir: Path, include_disabled: bool) -> list[Path]:
 
 
 def build_url(base_url: str) -> str:
-    base = (base_url or DEFAULT_BASE_URL).rstrip("/") + "/"
+    base = validate_cliproxyapi_base_url(base_url).rstrip("/") + "/"
     return urljoin(base, "responses")
 
 
@@ -134,7 +135,7 @@ def summarize_response(resp: requests.Response) -> dict[str, Any]:
     return out
 
 
-def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[str, Any]:
+def probe(path: Path, timeout: float, proxy: str = "") -> dict[str, Any]:
     auth = json.loads(path.read_text(encoding="utf-8"))
     token = str(auth.get("access_token") or "").strip()
     if not token:
@@ -159,11 +160,16 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
         "max_output_tokens": 8,
     }
     # Build/CLI free quota lives on cli-chat-proxy.grok.com, not api.x.ai paid API.
-    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL) if use_auth_base_url else DEFAULT_BASE_URL
-    if "api.x.ai" in base_url:
-        base_url = DEFAULT_BASE_URL
-    url = build_url(base_url)
-    resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+    url = build_url(DEFAULT_BASE_URL)
+    session = requests.Session()
+    session.trust_env = False
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+    resp = session.post(
+        url, headers=headers, json=body, timeout=timeout,
+        allow_redirects=False, proxies=proxies,
+    )
+    if 300 <= resp.status_code < 400:
+        raise RuntimeError("redirect refused for token-bearing request")
     summary = summarize_response(resp)
     summary.update(
         {
@@ -179,22 +185,17 @@ def probe(path: Path, timeout: float, use_auth_base_url: bool = False) -> dict[s
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Probe xAI/Grok Build free quota from auth JSON files")
-    parser.add_argument("--auth-dir", required=True, help="CLIProxyAPI auth directory")
+    parser.add_argument("--auth-dir", required=True, help="Sub2API auth directory")
     parser.add_argument("--include-disabled", action="store_true", help="Also probe disabled auth files")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--json", action="store_true", help="Print JSON instead of a table")
-    parser.add_argument(
-        "--use-auth-base-url",
-        action="store_true",
-        help="Use each auth file's base_url instead of forcing the Grok Build endpoint",
-    )
     args = parser.parse_args()
 
     auth_dir = Path(args.auth_dir)
     results = []
     for path in load_auth_files(auth_dir, include_disabled=args.include_disabled):
         try:
-            results.append(probe(path, timeout=args.timeout, use_auth_base_url=args.use_auth_base_url))
+            results.append(probe(path, timeout=args.timeout))
         except Exception as exc:  # keep probing other accounts
             results.append({"file": path.name, "error": f"{type(exc).__name__}: {exc}"})
 

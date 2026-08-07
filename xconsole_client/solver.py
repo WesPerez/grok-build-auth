@@ -57,6 +57,8 @@ class YesCaptchaSolver:
         self._timeout = timeout
         self._poll_interval = poll_interval
         self._debug = debug
+        self._session = requests.Session()
+        self._session.trust_env = False
 
     def _create_task(self, task: dict) -> str:
         """Create a task and return the taskId. Raises on error."""
@@ -68,7 +70,7 @@ class YesCaptchaSolver:
             print(f"  [YesCaptcha] POST {self._endpoint}/createTask")
             print(f"    task type: {task.get('type')}")
 
-        resp = requests.post(
+        resp = self._session.post(
             f"{self._endpoint}/createTask",
             json=payload,
             timeout=30,
@@ -101,7 +103,7 @@ class YesCaptchaSolver:
 
         deadline = time.time() + self._timeout
         while time.time() < deadline:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._endpoint}/getTaskResult",
                 json=payload,
                 timeout=30,

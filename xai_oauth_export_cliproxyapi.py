@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Export an existing xAI OAuth record to CLIProxyAPI auth format.
+"""Export an existing xAI OAuth record as Sub2API auth with a CLIProxyAPI-compatible schema.
 
 Example:
 
     python xai_oauth_export_cliproxyapi.py --cliproxyapi-auth-dir ./cliproxyapi_auth
 
-If --record is omitted, the newest oauth_output/xai_oauth_*.json is used.
+This migration helper requires an explicit source record path.
 """
 from __future__ import annotations
 
@@ -20,26 +20,19 @@ from xconsole_client.xai_oauth import (
 )
 
 
-def newest_oauth_record() -> Path:
-    records = sorted(Path("oauth_output").glob("xai_oauth_*.json"))
-    if not records:
-        raise FileNotFoundError("no oauth_output/xai_oauth_*.json records found")
-    return records[-1]
-
-
 def main() -> None:
-    p = argparse.ArgumentParser(description="Export xAI OAuth JSON to CLIProxyAPI auth JSON")
-    p.add_argument("--record", default=None, help="Path to oauth_output/xai_oauth_*.json; defaults to newest")
+    p = argparse.ArgumentParser(description="Export xAI OAuth JSON to Sub2API auth JSON")
+    p.add_argument("--record", required=True, help="Explicit path to a legacy OAuth JSON record")
     p.add_argument(
         "--cliproxyapi-auth-dir",
         required=True,
-        help="CLIProxyAPI auth dir, e.g. ./cliproxyapi_auth",
+        help="Sub2API auth dir, e.g. ./cliproxyapi_auth",
     )
     p.add_argument("--cliproxyapi-base-url", default=CLIPROXYAPI_GROK_BASE_URL)
     p.add_argument("--disabled", action="store_true", help="Write exported auth as disabled")
     args = p.parse_args()
 
-    record_path = Path(args.record) if args.record else newest_oauth_record()
+    record_path = Path(args.record)
     source = json.loads(record_path.read_text(encoding="utf-8"))
     token = source.get("token") if isinstance(source.get("token"), dict) else source
     userinfo = source.get("userinfo") if isinstance(source.get("userinfo"), dict) else {}

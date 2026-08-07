@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import secrets
+import sys
 import threading
 import time
 import webbrowser
@@ -32,6 +33,15 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
+from .security import (
+    format_loopback_host,
+    mask_email,
+    redact_text,
+    secure_json_write,
+    set_restrictive_umask,
+    validate_cliproxyapi_base_url,
+    validate_loopback_host,
+)
 
 
 ISSUER = "https://auth.x.ai"
@@ -216,7 +226,7 @@ def exchange_code_for_token(
         proxies=proxies,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"token exchange failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"token exchange failed: HTTP {resp.status_code}")
     token = resp.json()
     now = int(time.time())
     if "expires_in" in token and "expires_at" not in token:
@@ -248,7 +258,7 @@ def refresh_access_token(
         proxies=proxies,
     )
     if resp.status_code != 200:
-        raise RuntimeError(f"refresh failed: HTTP {resp.status_code}: {resp.text[:500]}")
+        raise RuntimeError(f"refresh failed: HTTP {resp.status_code}")
     token = resp.json()
     now = int(time.time())
     if "expires_in" in token and "expires_at" not in token:
@@ -272,7 +282,7 @@ def fetch_userinfo(access_token: str, *, timeout: float = 30.0, proxy: str = "")
         proxies=proxies,
     )
     if resp.status_code != 200:
-        return {"_error": f"HTTP {resp.status_code}", "_body": resp.text[:300]}
+        return {"_error": f"HTTP {resp.status_code}"}
     return resp.json()
 
 
@@ -284,7 +294,7 @@ def save_oauth_record(
     output_dir: Optional[str | Path] = None,
 ) -> Path:
     target = Path(output_dir) if output_dir else default_output_dir()
-    target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
 
     id_payload = parse_jwt_payload(str(token.get("id_token") or ""))
     email = ""
@@ -311,8 +321,7 @@ def save_oauth_record(
         "expires_at": token.get("expires_at", None),
         "scope": token.get("scope", ""),
     }
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    return secure_json_write(path, record)
 
 
 def _safe_email_for_filename(email: str) -> str:
@@ -344,6 +353,7 @@ def build_cliproxyapi_auth_record(
     to xAI API-credit billing and can return 402 even when Grok CLI works.
     """
 
+    base_url = validate_cliproxyapi_base_url(base_url)
     id_payload = parse_jwt_payload(str(token.get("id_token") or "")) or {}
     email = ""
     if userinfo:
@@ -393,7 +403,7 @@ def save_cliproxyapi_auth_record(
     base_url: str = CLIPROXYAPI_GROK_BASE_URL,
     headers: Optional[Dict[str, str]] = None,
 ) -> Path:
-    """Write a CLIProxyAPI-ready ``xai-<email>.json`` auth file."""
+    """Write a Sub2API-ready ``xai-<email>.json`` auth file."""
 
     record = build_cliproxyapi_auth_record(
         token,
@@ -404,7 +414,7 @@ def save_cliproxyapi_auth_record(
         headers=headers,
     )
     target = Path(auth_dir)
-    target.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
     email = str(record.get("email") or "")
     safe = _safe_email_for_filename(email)
     # Avoid "xai-xai..." when the address local-part already starts with "xai".
@@ -414,8 +424,7 @@ def save_cliproxyapi_auth_record(
     else:
         fname = f"xai-{safe}"
     path = target / f"{fname}.json"
-    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
-    return path
+    return secure_json_write(path, record)
 
 
 def _start_pkce_callback_server(
@@ -426,6 +435,7 @@ def _start_pkce_callback_server(
     port: int,
 ) -> tuple[ThreadingHTTPServer, _CallbackState, str, str, str, str]:
     """Start local callback server and return (server, sink, auth_url, redirect_uri, state, verifier)."""
+    host = validate_loopback_host(host)
     state = secrets.token_hex(16)
     nonce = secrets.token_hex(16)
     verifier = generate_code_verifier()
@@ -433,7 +443,7 @@ def _start_pkce_callback_server(
     sink = _CallbackState()
     server = ThreadingHTTPServer((host, int(port)), _make_callback_handler(state, sink))
     actual_port = int(server.server_address[1])
-    redirect_uri = f"http://{host}:{actual_port}/callback"
+    redirect_uri = f"http://{format_loopback_host(host)}:{actual_port}/callback"
     auth_url = build_authorization_url(
         client_id=client_id,
         redirect_uri=redirect_uri,
@@ -467,7 +477,7 @@ def _finalize_oauth_code(
         proxy=proxy,
     )
     userinfo = fetch_userinfo(str(token.get("access_token") or ""), proxy=proxy)
-    path = save_oauth_record(token, userinfo=userinfo, client_id=client_id, output_dir=output_dir)
+    path = None
     cliproxy_path: Optional[Path] = None
     if cliproxyapi_auth_dir:
         cliproxy_path = save_cliproxyapi_auth_record(
@@ -650,6 +660,7 @@ def login_with_playwright(
 
     try:
         from playwright.sync_api import sync_playwright
+        from .registration_backends import _edge_executable, _playwright_proxy
     except ImportError as exc:
         raise RuntimeError(
             "playwright is required for automated OAuth. "
@@ -662,9 +673,12 @@ def login_with_playwright(
     )
     deadline = time.time() + max(30.0, float(timeout))
     try:
-        launch_kwargs: Dict[str, Any] = {"headless": headless}
+        launch_kwargs: Dict[str, Any] = {
+            "headless": headless,
+            "executable_path": _edge_executable(),
+        }
         if proxy:
-            launch_kwargs["proxy"] = {"server": proxy}
+            launch_kwargs["proxy"] = _playwright_proxy(proxy)
 
         with sync_playwright() as p:
             browser = p.chromium.launch(**launch_kwargs)
@@ -681,23 +695,15 @@ def login_with_playwright(
                 if session_cookies:
                     cookie_list = []
                     for name, value in session_cookies.items():
-                        if not name or value is None:
+                        if name != "sso" or value is None:
                             continue
-                        cookie_list.append(
-                            {
-                                "name": str(name),
-                                "value": str(value),
-                                "domain": ".x.ai",
-                                "path": "/",
-                            }
-                        )
-                        # also accounts host
                         cookie_list.append(
                             {
                                 "name": str(name),
                                 "value": str(value),
                                 "domain": "accounts.x.ai",
                                 "path": "/",
+                                "secure": True,
                             }
                         )
                     if cookie_list:
@@ -752,6 +758,137 @@ def login_with_playwright(
         server.server_close()
 
 
+def _device_browser_terminal_kind(exc: BaseException) -> str:
+    """Reduce a device-flow exception to a non-secret operational category."""
+    low = str(exc or "").lower()
+    if "access_denied" in low or "access denied" in low:
+        return "access_denied"
+    if "expired_token" in low or "expired token" in low:
+        return "expired_token"
+    if "timed out" in low or "timeout" in low or "waiting for user approval" in low:
+        return "approval_timeout"
+    if "cancelled" in low or "canceled" in low:
+        return "cancelled"
+    if any(value in low for value in ("invalid credential", "invalid password", "sign-in rejected")):
+        return "credentials_rejected"
+    if any(value in low for value in ("proxy", "socks", "tls", "eof", "connection")):
+        return "transport_error"
+    if "browser" in low or "chromium" in low or "edge" in low:
+        return "browser_error"
+    return "runtime_error"
+
+
+def login_with_device_browser(
+    email: str,
+    password: str,
+    *,
+    cliproxyapi_auth_dir: Optional[str | Path] = None,
+    cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
+    cliproxyapi_disabled: bool = False,
+    headless: bool = False,
+    timeout: float = 240.0,
+    proxy: str = "",
+    debug: bool = False,
+) -> OAuthLoginResult:
+    """Mint OAuth through xAI's device-code flow and a real Edge session."""
+    windows_dir = Path(__file__).resolve().parent.parent / "clients" / "windows"
+    if not (windows_dir / "oidc_mint" / "oauth_device.py").is_file():
+        raise RuntimeError("device browser OAuth client is unavailable")
+
+    inserted = str(windows_dir) not in sys.path
+    if inserted:
+        sys.path.insert(0, str(windows_dir))
+    try:
+        from oidc_mint import mint_with_browser
+    except Exception as exc:
+        raise RuntimeError("device browser OAuth dependencies are unavailable") from exc
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(str(windows_dir))
+            except ValueError:
+                pass
+
+    logged_stages: set[str] = set()
+
+    def safe_log(message: str) -> None:
+        if not debug:
+            return
+        low = str(message or "").lower()
+        stage = ""
+        if "device done" in low:
+            stage = "device_done"
+        elif "token poll success" in low:
+            stage = "token_received"
+        elif "consent/authorize page detected" in low:
+            stage = "device_consent"
+        elif "login attempt" in low:
+            stage = "device_login"
+        elif "standalone chromium started" in low:
+            stage = "browser_started"
+        elif "request_device_code" in low and "failed" in low:
+            stage = "device_code_request_failed"
+        elif "browser confirm warning" in low:
+            stage = "browser_confirm_warning"
+        if stage and stage not in logged_stages:
+            logged_stages.add(stage)
+            print(f"device-browser stage={stage}")
+
+    try:
+        tokens = mint_with_browser(
+            email=email,
+            password=password,
+            proxy=proxy or None,
+            headless=headless,
+            browser_timeout_sec=timeout,
+            poll_log=safe_log,
+            force_standalone=True,
+            reuse_browser=False,
+        )
+    except Exception as exc:
+        terminal = _device_browser_terminal_kind(exc)
+        if debug:
+            print(f"device-browser terminal={terminal}")
+        raise RuntimeError(f"device browser OAuth terminal={terminal}") from exc
+    token = {
+        key: value
+        for key, value in dict(tokens or {}).items()
+        if key in {"access_token", "refresh_token", "id_token", "token_type", "expires_in", "scope"}
+    }
+    if not token.get("access_token") or not token.get("refresh_token"):
+        raise RuntimeError("device browser OAuth did not return complete tokens")
+    if token.get("expires_in") is not None:
+        try:
+            token["expires_at"] = int(time.time()) + int(token["expires_in"])
+        except (TypeError, ValueError):
+            pass
+
+    userinfo = fetch_userinfo(str(token["access_token"]), timeout=30.0, proxy=proxy)
+    id_payload = parse_jwt_payload(str(token.get("id_token") or "")) or {}
+    identity_email = str(userinfo.get("email") or id_payload.get("email") or "").strip().lower()
+    identity_subject = str(userinfo.get("sub") or id_payload.get("sub") or "").strip()
+    if identity_email != str(email or "").strip().lower() or not identity_subject:
+        raise RuntimeError("device browser OAuth identity does not match the requested account")
+
+    clip_path = None
+    if cliproxyapi_auth_dir:
+        clip_path = save_cliproxyapi_auth_record(
+            token,
+            userinfo=userinfo,
+            auth_dir=cliproxyapi_auth_dir,
+            redirect_uri="",
+            disabled=cliproxyapi_disabled,
+            base_url=cliproxyapi_base_url,
+        )
+    return OAuthLoginResult(
+        token=token,
+        userinfo=userinfo,
+        id_token_payload=id_payload,
+        cliproxyapi_path=clip_path,
+        redirect_uri="",
+    )
+
+
 def complete_build_oauth(
     email: str,
     password: str,
@@ -765,6 +902,8 @@ def complete_build_oauth(
     interactive_fallback: bool = False,
     yescaptcha_key: Optional[str] = None,
     protocol: bool = True,
+    device_browser_fallback: bool = False,
+    playwright_fallback: bool = False,
     debug: bool = False,
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
@@ -773,9 +912,13 @@ def complete_build_oauth(
 
     Preference order:
       1) Pure HTTP protocol (reuse signup cookies, else CreateSession+YesCaptcha)
-      2) Playwright auto-login (if protocol=False or protocol fails)
-      3) Interactive system-browser fallback (if interactive_fallback=True)
+      2) Official device-code flow in a headed Edge session (when selected)
+      3) Playwright authorization-code login (when selected)
+      4) Interactive system-browser fallback (if interactive_fallback=True)
     """
+    if device_browser_fallback and playwright_fallback:
+        raise ValueError("device_browser_fallback and playwright_fallback are mutually exclusive")
+
     key = (yescaptcha_key or os.environ.get("YESCAPTCHA_API_KEY") or "").strip()
     errors: list[str] = []
 
@@ -796,7 +939,30 @@ def complete_build_oauth(
             )
         except Exception as exc:
             errors.append(f"protocol OAuth failed: {exc}")
-            print(f"Protocol OAuth failed ({exc})")
+            print(f"Protocol OAuth failed ({redact_text(exc)})")
+            if not playwright_fallback:
+                if not device_browser_fallback:
+                    raise RuntimeError("protocol OAuth failed; browser fallbacks are disabled") from exc
+
+    if device_browser_fallback:
+        try:
+            return login_with_device_browser(
+                email,
+                password,
+                cliproxyapi_auth_dir=cliproxyapi_auth_dir,
+                cliproxyapi_base_url=cliproxyapi_base_url,
+                headless=headless,
+                timeout=timeout,
+                proxy=proxy,
+                debug=debug,
+            )
+        except Exception as exc:
+            errors.append(f"device browser OAuth failed: {exc}")
+            if not playwright_fallback:
+                raise RuntimeError("device browser OAuth failed") from exc
+
+    if not playwright_fallback:
+        raise RuntimeError("Playwright fallback is disabled")
 
     try:
         return login_with_playwright(
@@ -825,7 +991,7 @@ def complete_build_oauth(
 
 
 def default_cliproxyapi_auth_dir() -> Path:
-    """Resolve CLIProxyAPI auth directory.
+    """Resolve the Sub2API auth directory from the historical compatibility setting.
 
     Order:
       1. ``CLIPROXYAPI_AUTH_DIR`` environment variable
@@ -838,6 +1004,7 @@ def default_cliproxyapi_auth_dir() -> Path:
 
 
 def main() -> None:
+    set_restrictive_umask()
     import argparse
 
     p = argparse.ArgumentParser(description="xAI/Grok OAuth PKCE login")
@@ -852,21 +1019,21 @@ def main() -> None:
         "--cliproxyapi-auth-dir",
         default=None,
         help=(
-            "Also write CLIProxyAPI-ready xai-<email>.json into this auth dir. "
+            "Also write Sub2API-ready xai-<email>.json into this auth dir. "
             "The exported record defaults to Grok CLI chat proxy, not api.x.ai credits."
         ),
     )
     p.add_argument(
         "--cliproxyapi-base-url",
         default=CLIPROXYAPI_GROK_BASE_URL,
-        help="Base URL for the optional CLIProxyAPI auth export.",
+        help="Base URL for the optional Sub2API auth export.",
     )
     p.add_argument(
         "--cliproxyapi-disabled",
         action="store_true",
-        help="Mark the optional CLIProxyAPI auth export as disabled.",
+        help="Mark the optional Sub2API auth export as disabled.",
     )
-    p.add_argument("--proxy", default=os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or "")
+    p.add_argument("--proxy", default="")
     args = p.parse_args()
 
     result = login_with_browser(
@@ -884,10 +1051,7 @@ def main() -> None:
     )
     print("xAI OAuth login successful")
     if result.email:
-        print(f"email: {result.email}")
-    print(f"access_token: {result.access_token[:24]}...")
-    if result.refresh_token:
-        print(f"refresh_token: {result.refresh_token[:24]}...")
+        print(f"email: {mask_email(result.email)}")
     if result.path:
         print(f"saved: {result.path}")
     if result.cliproxyapi_path:

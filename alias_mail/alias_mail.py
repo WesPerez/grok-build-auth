@@ -9,7 +9,6 @@ No secrets are hardcoded. Configure via environment variables:
   CLOUDFLARE_D1_DB_ID
   ALIAS_MAIL_DOMAINS          comma-separated domains you control
   ALIAS_EXTRA_DOMAINS         optional extra allowed domains
-  CLOUDFLARE_MCP_READ_ALL_TOKEN   alternate token name
 """
 
 from __future__ import annotations
@@ -150,10 +149,10 @@ class CF:
 
 def env_token() -> str:
     _require_cloudflare_config()
-    token = _env("CLOUDFLARE_API_TOKEN") or _env("CLOUDFLARE_MCP_READ_ALL_TOKEN")
+    token = _env("CLOUDFLARE_API_TOKEN")
     if not token:
         raise SystemExit(
-            "Missing CLOUDFLARE_API_TOKEN (or CLOUDFLARE_MCP_READ_ALL_TOKEN). "
+            "Missing CLOUDFLARE_API_TOKEN. "
             "See .env.example."
         )
     return token

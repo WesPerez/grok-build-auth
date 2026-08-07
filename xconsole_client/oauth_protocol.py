@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Protocolized xAI OAuth login (no browser) for Grok Build / CLIProxyAPI.
+"""Protocolized xAI OAuth login (no browser) for Grok Build / Sub2API.
 
 After account signup (or with email/password), this module:
 
@@ -8,7 +8,7 @@ After account signup (or with email/password), this module:
   3. Solves Cloudflare Turnstile via YesCaptcha
   4. Calls auth_mgmt.AuthManagement/CreateSession (gRPC-web)
   5. Follows cookieSetterUrl + OAuth redirects to capture authorization code
-  6. Exchanges code for tokens and exports CLIProxyAPI Grok Build auth JSON
+  6. Exchanges code for tokens and exports Sub2API Grok Build auth JSON
 
 CreateSessionRequest wire layout (reverse-engineered 2026-07):
 
@@ -24,11 +24,14 @@ from __future__ import annotations
 
 import re
 import secrets
+from html.parser import HTMLParser
+import json
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 from . import grpcweb
 from .solver import YesCaptchaSolver
+from .security import redact_text, sanitize_url
 from .xai_oauth import (
     AUTHORIZATION_ENDPOINT,
     CLIPROXYAPI_GROK_BASE_URL,
@@ -46,8 +49,271 @@ TURNSTILE_SITEKEY = "0x4AAAAAAAhr9JGVDZbrZOo0"
 CREATE_SESSION_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateSession"
 CREATE_COOKIE_SETTER_RPC = "https://accounts.x.ai/auth_mgmt.AuthManagement/CreateCookieSetterLink"
 ACCOUNTS_ORIGIN = "https://accounts.x.ai"
+SESSION_COOKIE_NAMES = frozenset({"sso", "sso-rw", "sso_jwt", "cf_clearance", "__cf_bm"})
+SESSION_COOKIE_DOMAINS = (".x.ai", "accounts.x.ai", "auth.x.ai")
 # Observed Next.js server action for the consent Allow button (may change on deploy).
 SUBMIT_OAUTH2_CONSENT_ACTION = "4005315a1d7e426de592990bb54bb37471f39dd6d2"
+
+
+class _ConsentFormParser(HTMLParser):
+    _FIELDS = frozenset({
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "state",
+        "code_challenge",
+        "code_challenge_method",
+        "nonce",
+        "principal_type",
+        "principal_id",
+        "referrer",
+    })
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, str] = {}
+        self.script_chunks: list[str] = []
+        self.deployment_id = ""
+        self._inside_script = False
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
+        if tag.lower() == "html":
+            values = {str(key).lower(): "" if value is None else str(value) for key, value in attrs}
+            self.deployment_id = values.get("data-dpl-id", "")
+            return
+        if tag.lower() == "script":
+            self._inside_script = True
+            return
+        if tag.lower() != "input":
+            return
+        values = {str(key).lower(): "" if value is None else str(value) for key, value in attrs}
+        name = values.get("name", "")
+        if name in self._FIELDS:
+            self.values[name] = values.get("value", "")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script":
+            self._inside_script = False
+
+    def handle_data(self, data: str) -> None:
+        if self._inside_script and "self.__next_f.push(" in data:
+            self.script_chunks.append(data)
+
+
+def _flight_strings(script_chunks: list[str]) -> list[str]:
+    values: list[str] = []
+
+    def collect(value: Any) -> None:
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+
+    marker = "self.__next_f.push("
+    decoder = json.JSONDecoder()
+    for script in script_chunks:
+        offset = 0
+        while True:
+            start = script.find(marker, offset)
+            if start < 0:
+                break
+            start += len(marker)
+            try:
+                value, consumed = decoder.raw_decode(script[start:])
+            except json.JSONDecodeError:
+                offset = start
+                continue
+            collect(value)
+            offset = start + consumed
+    return values
+
+
+def extract_consent_form_values(page_html: str) -> dict[str, str]:
+    parser = _ConsentFormParser()
+    parser.feed(page_html or "")
+    parser.close()
+    values = dict(parser.values)
+    key_map = {
+        "clientId": "client_id",
+        "redirectUri": "redirect_uri",
+        "scope": "scope",
+        "state": "state",
+        "codeChallenge": "code_challenge",
+        "codeChallengeMethod": "code_challenge_method",
+        "nonce": "nonce",
+        "principalType": "principal_type",
+        "principalId": "principal_id",
+        "referrer": "referrer",
+        "principal_type": "principal_type",
+        "principal_id": "principal_id",
+    }
+    for chunk in _flight_strings(parser.script_chunks):
+        variants = [chunk]
+        for _ in range(2):
+            normalized = variants[-1].replace('\\"', '"').replace('\\\\', '\\')
+            if normalized == variants[-1]:
+                break
+            variants.append(normalized)
+        for variant in variants:
+            for source, target in key_map.items():
+                if values.get(target):
+                    continue
+                match = re.search(rf'"{re.escape(source)}"\s*:\s*"([^"\\]*)"', variant)
+                if match and match.group(1):
+                    values[target] = match.group(1)
+    return values
+
+
+def consent_principal_is_valid(principal_type: str, principal_id: str) -> bool:
+    normalized = (principal_type or "").strip()
+    return bool(normalized and (normalized.lower() == "user" or (principal_id or "").strip()))
+
+
+def _prepare_flight_router_state(tree: Any) -> list[Any]:
+    """Mirror Next.js prepareFlightRouterStateForRequest for JSON Flight data."""
+    if not isinstance(tree, list) or len(tree) < 2 or not isinstance(tree[1], dict):
+        raise ValueError("invalid Flight router state")
+
+    segment = tree[0]
+    if isinstance(segment, str):
+        if segment.startswith("__PAGE__?"):
+            segment = "__PAGE__"
+    elif isinstance(segment, list) and len(segment) >= 3:
+        segment = [segment[0], segment[1], segment[2], None]
+    else:
+        raise ValueError("invalid Flight router segment")
+
+    children = {
+        str(key): _prepare_flight_router_state(value)
+        for key, value in tree[1].items()
+    }
+    prepared: list[Any] = [segment, children]
+
+    refresh = tree[3] if len(tree) > 3 else "$undefined"
+    if refresh not in (None, False, "", 0, "$undefined"):
+        prepared.extend([None, refresh])
+
+    if len(tree) > 4 and tree[4] != "$undefined":
+        while len(prepared) < 4:
+            prepared.append(None)
+        prepared.append(tree[4])
+    return prepared
+
+
+def extract_consent_router_state_tree(page_html: str) -> str:
+    """Return the URL-encoded router tree used by the current consent page."""
+    parser = _ConsentFormParser()
+    parser.feed(page_html or "")
+    parser.close()
+    decoder = json.JSONDecoder()
+
+    for chunk in _flight_strings(parser.script_chunks):
+        variants = [chunk]
+        for _ in range(2):
+            normalized = variants[-1].replace('\\"', '"').replace('\\\\', '\\')
+            if normalized == variants[-1]:
+                break
+            variants.append(normalized)
+        for variant in variants:
+            for match in re.finditer(r'"f"\s*:\s*', variant):
+                try:
+                    flight, _ = decoder.raw_decode(variant[match.end():])
+                    tree = flight[0][0]
+                    prepared = _prepare_flight_router_state(tree)
+                except (IndexError, TypeError, ValueError, json.JSONDecodeError):
+                    continue
+                compact = json.dumps(prepared, ensure_ascii=False, separators=(",", ":"))
+                return quote(compact, safe="")
+    return ""
+
+
+def extract_next_deployment_id(page_html: str) -> str:
+    parser = _ConsentFormParser()
+    parser.feed(page_html or "")
+    parser.close()
+    value = parser.deployment_id.strip()
+    return value if re.fullmatch(r"[A-Za-z0-9._-]{1,200}", value) else ""
+
+
+def build_consent_action_request(
+    *,
+    page_url: str,
+    action_id: str,
+    router_state_tree: str,
+    action_args: list[Any],
+    deployment_id: str = "",
+) -> tuple[str, dict[str, str], bytes]:
+    """Build the browser-equivalent Next.js Server Action request."""
+    parsed = urlparse(page_url)
+    if parsed.scheme != "https" or parsed.hostname != "accounts.x.ai":
+        raise ValueError("consent action target must be accounts.x.ai over HTTPS")
+    if parsed.path.rstrip("/") != "/oauth2/consent":
+        raise ValueError("consent action target path is invalid")
+    if not re.fullmatch(r"[a-f0-9]{40,44}", action_id, re.I):
+        raise ValueError("consent action ID is invalid")
+    if not router_state_tree:
+        raise ValueError("consent router state is missing")
+
+    canonical_url = parsed._replace(fragment="").geturl()
+    body = json.dumps(action_args, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    headers = {
+        "accept": "text/x-component",
+        "content-type": "text/plain;charset=UTF-8",
+        "next-action": action_id,
+        "next-router-state-tree": router_state_tree,
+        "origin": ACCOUNTS_ORIGIN,
+        "referer": canonical_url,
+        "sec-fetch-site": "same-origin",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-dest": "empty",
+    }
+    if deployment_id:
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,200}", deployment_id):
+            raise ValueError("Next.js deployment ID is invalid")
+        headers["x-deployment-id"] = deployment_id
+    return canonical_url, headers, body
+
+
+def extract_consent_action_error(response_text: str) -> str:
+    variants = [response_text or ""]
+    for _ in range(3):
+        normalized = variants[-1].replace('\\"', '"').replace('\\\\', '\\')
+        if normalized == variants[-1]:
+            break
+        variants.append(normalized)
+    for variant in variants:
+        match = re.search(r'"error"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', variant)
+        if not match:
+            continue
+        value = match.group(1)
+        try:
+            return json.loads(f'"{value}"')
+        except json.JSONDecodeError:
+            return value
+    return ""
+
+
+def classify_consent_action_error(server_error: str) -> str:
+    response_low = (server_error or "").lower()
+    if any(word in response_low for word in ("unauthorized", "unauthenticated", "sign in", "session")):
+        return "session"
+    if "access denied" in response_low or "authorization denied" in response_low:
+        return "authorization"
+    if "principal" in response_low:
+        return "principal"
+    if "scope" in response_low:
+        return "scope"
+    if "redirect" in response_low:
+        return "redirect"
+    if "client" in response_low:
+        return "client"
+    if "action" in response_low or "csrf" in response_low:
+        return "action"
+    return "unclassified"
 
 
 def _enc_msg(field_no: int, raw: bytes) -> bytes:
@@ -183,24 +449,41 @@ class ProtocolOAuthClient:
             kwargs["proxies"] = {"http": proxy, "https": proxy}
         self._s = creq.Session(**kwargs)
 
-    def load_cookies(self, cookies: Dict[str, str]) -> None:
-        """Inject pre-existing accounts.x.ai session cookies (e.g. post-signup)."""
+    def load_cookies(self, cookies) -> None:
+        """Inject pre-existing accounts.x.ai session cookies (e.g. post-signup).
+
+        Accepts:
+          - Dict[str, str]: name -> value
+          - list[dict]: Playwright-style [{name: ..., value: ...}, ...]
+        """
         if not cookies:
             return
-        for name, value in cookies.items():
-            try:
-                # Prefer domain-scoped cookies for accounts.x.ai
-                self._s.cookies.set(name, value, domain="accounts.x.ai")
-            except Exception:
+        cookie_dict: Dict[str, str] = {}
+        if isinstance(cookies, list):
+            for c in cookies:
+                n = c.get("name") if isinstance(c, dict) else getattr(c, "name", None)
+                v = c.get("value") if isinstance(c, dict) else getattr(c, "value", None)
+                if n and v is not None:
+                    cookie_dict[str(n)] = str(v)
+        elif isinstance(cookies, dict):
+            cookie_dict = {str(k): str(v) for k, v in cookies.items() if v is not None}
+        else:
+            return
+        loaded_names: set[str] = set()
+        for name, value in cookie_dict.items():
+            if name not in SESSION_COOKIE_NAMES:
+                continue
+            for domain in SESSION_COOKIE_DOMAINS:
                 try:
-                    self._s.cookies.set(name, value)
+                    self._s.cookies.set(name, value, domain=domain)
                 except Exception:
                     pass
-        self._log(f"loaded {len(cookies)} cookies into OAuth session")
+            loaded_names.add(name)
+        self._log(f"loaded allowlisted session cookies: {sorted(loaded_names)}")
 
     def _log(self, msg: str) -> None:
         if self.debug:
-            print(f"  [oauth-protocol] {msg}")
+            print(f"  [oauth-protocol] {redact_text(msg)}")
 
     def _get(self, url: str, *, allow_redirects: bool = True, headers: Optional[Dict[str, str]] = None):
         h = {
@@ -212,16 +495,67 @@ class ProtocolOAuthClient:
         return self._s.get(url, headers=h, allow_redirects=allow_redirects, timeout=45)
 
     def _set_sso_cookie(self, jwt_token: str) -> None:
-        """Attach accounts.x.ai session JWT as the ``sso`` cookie used by AuthManagement."""
+        """Attach the session JWT to the xAI auth hosts used during OAuth."""
         if not jwt_token:
             return
-        try:
-            self._s.cookies.set("sso", jwt_token, domain="accounts.x.ai")
-        except Exception:
+        for name in ("sso", "sso-rw"):
+            for domain in SESSION_COOKIE_DOMAINS:
+                try:
+                    self._s.cookies.set(name, jwt_token, domain=domain)
+                except Exception:
+                    pass
+
+    @staticmethod
+    def _find_consent_action_id(source: str) -> Optional[str]:
+        """Find the server action bound to submitOAuth2Consent in HTML or JS."""
+        if not source or "submitOAuth2Consent" not in source:
+            return None
+        patterns = (
+            r'createServerReference\)\("([a-f0-9]{40,44})"[^)]{0,500}submitOAuth2Consent',
+            r'"([a-f0-9]{40,44})".{0,500}submitOAuth2Consent',
+            r'submitOAuth2Consent.{0,500}"([a-f0-9]{40,44})"',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, source, re.I | re.S)
+            if match:
+                return match.group(1)
+        return None
+
+    def _resolve_consent_action_id(self, page_url: str, page_html: str) -> str:
+        """Resolve the deployment-specific consent action from live Next.js assets."""
+        inline = self._find_consent_action_id(page_html)
+        if inline:
+            self._log(f"consent action resolved from HTML: {inline[:16]}...")
+            return inline
+
+        script_urls: list[str] = []
+        seen: set[str] = set()
+        for raw in re.findall(r'<script[^>]+src=["\']([^"\']+\.js(?:\?[^"\']*)?)["\']', page_html, re.I):
+            url = urljoin(page_url, raw.replace("&amp;", "&"))
+            if url in seen:
+                continue
+            seen.add(url)
+            script_urls.append(url)
+        self._log(f"searching {len(script_urls)} consent JS chunks")
+        for url in script_urls:
+            self._log(f"consent script candidate {sanitize_url(url)}")
+
+        for url in script_urls:
             try:
-                self._s.cookies.set("sso", jwt_token)
+                response = self._get(url, headers={"accept": "*/*"})
             except Exception:
-                pass
+                continue
+            if response.status_code != 200:
+                continue
+            action_id = self._find_consent_action_id(response.text or "")
+            if action_id:
+                self._log(
+                    f"consent action resolved from {sanitize_url(url)}: {action_id[:16]}..."
+                )
+                return action_id
+
+        self._log("live consent action was not found; using compatibility fallback")
+        return SUBMIT_OAUTH2_CONSENT_ACTION
 
     def create_cookie_setter_link(
         self,
@@ -327,7 +661,7 @@ class ProtocolOAuthClient:
             }
 
         self._set_sso_cookie(session_jwt)
-        self._log(f"CreateSession OK session_jwt={session_jwt[:24]}...")
+        self._log("CreateSession OK")
         return {
             "ok": True,
             "error": None,
@@ -469,6 +803,35 @@ class ProtocolOAuthClient:
             raise RuntimeError(f"authorization failed: missing code in {url[:200]}")
         return code
 
+    def _code_from_consent_redirect(
+        self,
+        response: Any,
+        *,
+        page_url: str,
+        redirect_uri: str,
+        state: str,
+    ) -> Optional[str]:
+        """Resolve a consent action Location without assuming it is the callback.
+
+        Next.js server actions may return an intermediate 303 before the OAuth
+        callback.  The old path only accepted a Location that already contained
+        ``code=`` and incorrectly failed otherwise.
+        """
+        action_redirect = (
+            response.headers.get("x-action-redirect")
+            or response.headers.get("X-Action-Redirect")
+            or ""
+        )
+        location = action_redirect.split(";", 1)[0] if action_redirect else (
+            response.headers.get("location") or response.headers.get("Location") or ""
+        )
+        if not location:
+            return None
+        target = urljoin(page_url, location)
+        if "code=" in target:
+            return self._code_from_url(target, state)
+        return self._follow_for_code(target, redirect_uri=redirect_uri, state=state)
+
     def login(
         self,
         email: str,
@@ -534,7 +897,7 @@ class ProtocolOAuthClient:
                 success = str(cfg.get("success_url") or "")
             if token:
                 self._set_sso_cookie(token)
-                self._log(f"applied set-cookie token as sso ({token[:16]}...)")
+                self._log("applied allowlisted set-cookie token")
             # Hit the set-cookie endpoint so domain cookies are written.
             resp = self._get(setter_url, allow_redirects=False)
             loc = resp.headers.get("location") or resp.headers.get("Location") or ""
@@ -548,56 +911,71 @@ class ProtocolOAuthClient:
 
         def _submit_oauth2_consent(page_url: str, page_html: str = "") -> str:
             """POST Next.js submitOAuth2Consent server action; return authorization code."""
-            import json as _json
-
-            action_id = SUBMIT_OAUTH2_CONSENT_ACTION
-            # Prefer live action id from page chunks if present.
-            m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"[^)]*submitOAuth2Consent', page_html)
-            if not m:
-                m = re.search(r'createServerReference\)\("([a-f0-9]{40,44})"', page_html)
-            if m:
-                action_id = m.group(1)
-
-            # Router state tree for consent page (URL-encoded JSON).
-            from urllib.parse import quote as _quote
-            router_tree = (
-                '["",{"children":["(app)",{"children":["(auth)",{"children":["oauth2",'
-                '{"children":["consent",{"children":["__PAGE__",{}]}]}]}]}]},'
-                '"$undefined","$undefined",16]'
+            action_id = self._resolve_consent_action_id(page_url, page_html)
+            form = extract_consent_form_values(page_html)
+            self._log(f"consent fields: {','.join(sorted(form)) or 'none'}")
+            principal_type = str(form.get("principal_type") or "").strip()
+            principal_id = str(form.get("principal_id") or "").strip()
+            if not consent_principal_is_valid(principal_type, principal_id):
+                raise RuntimeError("consent page is missing its principal identity")
+            selected_scope = str(form.get("scope") or " ".join(scopes)).strip()
+            scope_items = selected_scope.split()
+            self._log(
+                "consent value profile: "
+                f"principal_type={principal_type} "
+                f"principal_id_present={bool(principal_id)} "
+                f"scope_count={len(scope_items)} "
+                f"scope_matches_default={scope_items == list(scopes)} "
+                f"referrer_present={bool(str(form.get('referrer') or '').strip())}"
             )
-            payload = [{
+
+            router_state_tree = extract_consent_router_state_tree(page_html)
+            if not router_state_tree:
+                raise RuntimeError("consent page is missing its live Flight router state")
+            deployment_id = extract_next_deployment_id(page_html)
+            self._log(
+                "consent request runtime: "
+                "router_state=flight "
+                f"deployment_id_present={bool(deployment_id)} next_url_present=False"
+            )
+
+            action_args = [{
                 "action": "allow",
-                "clientId": client_id,
-                "redirectUri": redirect_uri,
-                "scope": " ".join(scopes),
-                "state": state,
-                "codeChallenge": challenge,
-                "codeChallengeMethod": "S256",
-                "nonce": nonce,
-                "principalType": "User",
-                "principalId": "",
-                "referrer": "",
+                "clientId": form.get("client_id") or client_id,
+                "redirectUri": form.get("redirect_uri") or redirect_uri,
+                "scope": selected_scope,
+                "state": form.get("state") or state,
+                "codeChallenge": form.get("code_challenge") or challenge,
+                "codeChallengeMethod": form.get("code_challenge_method") or "S256",
+                "nonce": form.get("nonce") or nonce,
+                "principalType": principal_type,
+                "principalId": principal_id,
+                "referrer": form.get("referrer") or "",
             }]
-            body = _json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            headers = {
-                "accept": "text/x-component",
-                "content-type": "text/plain;charset=UTF-8",
-                "next-action": action_id,
-                "next-router-state-tree": _quote(router_tree, safe=""),
-                "origin": ACCOUNTS_ORIGIN,
-                "referer": page_url,
-                "sec-fetch-site": "same-origin",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-dest": "empty",
-            }
+            target_url, headers, body = build_consent_action_request(
+                page_url=page_url,
+                action_id=action_id,
+                router_state_tree=router_state_tree,
+                action_args=action_args,
+                deployment_id=deployment_id,
+            )
             self._log(f"submitOAuth2Consent action={action_id[:16]}...")
-            resp = self._s.post(page_url.split("?")[0] if "consent" in page_url else page_url,
-                                headers=headers, data=body, timeout=45)
-            # Some deployments post to the consent path with query string:
-            if resp.status_code >= 400 or (resp.text and "error" in resp.text[:200].lower() and "code" not in resp.text):
-                resp = self._s.post(page_url, headers=headers, data=body, timeout=45)
+            # Next.js posts once to the current canonical URL, including OAuth
+            # query parameters. Replaying a Server Action can duplicate effects.
+            resp = self._s.post(target_url, headers=headers, data=body, timeout=45)
             text = resp.text or ""
-            self._log(f"consent action HTTP {resp.status_code} body={text[:180]!r}")
+            has_code = bool(re.search(r'"code"\s*:\s*"[^"]+"|code=[A-Za-z0-9._~\-]+', text))
+            has_success = bool(re.search(r'"success"\s*:\s*true', text, re.I))
+            self._log(
+                f"consent action HTTP {resp.status_code} "
+                f"success={has_success} code_present={has_code}"
+            )
+            if not has_success and not has_code:
+                server_error = extract_consent_action_error(text)
+                if server_error:
+                    self._log(f"consent server error: {redact_text(server_error)[:180]}")
+                error_kind = classify_consent_action_error(server_error)
+                self._log(f"consent response error kind={error_kind}")
             # Response may be RSC flight text containing JSON with code.
             m = re.search(r'"code"\s*:\s*"([^"]+)"', text)
             if m:
@@ -606,9 +984,14 @@ class ProtocolOAuthClient:
             if m and "error" not in m.group(0):
                 return m.group(1)
             # Or redirect header
-            loc = resp.headers.get("location") or resp.headers.get("Location") or ""
-            if "code=" in loc:
-                return self._code_from_url(urljoin(page_url, loc), state)
+            redirected_code = self._code_from_consent_redirect(
+                resp,
+                page_url=page_url,
+                redirect_uri=redirect_uri,
+                state=state,
+            )
+            if redirected_code:
+                return redirected_code
             raise RuntimeError(f"submitOAuth2Consent failed HTTP {resp.status_code}: {text[:300]}")
 
         def _complete_via_cookie_setter(label: str) -> str:
@@ -713,7 +1096,7 @@ def login_with_protocol(
     session_cookies: Optional[Dict[str, str]] = None,
     auth_client: Any = None,
 ) -> OAuthLoginResult:
-    """Convenience wrapper: protocol OAuth + optional CLIProxyAPI Build export.
+    """Convenience wrapper: protocol OAuth + optional Sub2API auth export.
 
     If *auth_client* (XConsoleAuthClient) is provided after signup, its live
     curl_cffi session is reused so accounts.x.ai cookies stay attached.

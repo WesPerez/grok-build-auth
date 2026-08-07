@@ -1,0 +1,17 @@
+{
+  "version": 2,
+  "proxies": [
+    {
+      "ref": "node-01",
+      "resin": {
+        "scheme": "socks5h",
+        "host": "172.17.0.1",
+        "port": 10833,
+        "username": "GrokEU.register-node-01",
+        "token_file": "/etc/resin-grok/proxy.token"
+      },
+      "enabled": true,
+      "max_active_leases": 1
+    }
+  ]
+}

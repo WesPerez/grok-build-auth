@@ -1,0 +1,17 @@
+[Unit]
+Description=Grok Batch Registration Web Console
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/grok-build-auth
+EnvironmentFile=/root/grok-build-auth/private/console.env
+ExecStart=/root/grok-build-auth/start_web_console.sh --host ${GROK_CONSOLE_HOST} --port ${GROK_CONSOLE_PORT}
+Restart=on-failure
+RestartSec=3
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

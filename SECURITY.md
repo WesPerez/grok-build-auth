@@ -13,18 +13,25 @@ This repository **must not** contain:
 - Temp mailbox API keys  
 - OAuth access / refresh / id tokens  
 - SSO JWTs, account passwords, or personal emails  
+- Mailu, Sub2API, bridge, reverse-proxy, or Basic Auth credentials
+- authenticated proxy URLs and production database backups
 
 Use a local `.env` (see `.env.example`) or shell environment variables.
 
 **Never commit:**
 
 - `.env`  
+- `private/`
+- external-client `config.json` files containing live credentials
 - `sso_output/`  
 - `oauth_output/`  
 - `accounts_output/`  
 - `cliproxyapi_auth/`  
+- batch results, logs, bundles, manifests, and backups
 
-If a secret was ever committed to a fork or mirror, **rotate it immediately**.
+If a secret was ever committed to a fork or mirror, **rotate or revoke it
+immediately before rewriting history**. Deleting the working-tree file does not
+remove the secret from Git history.
 
 ## Reporting a vulnerability
 

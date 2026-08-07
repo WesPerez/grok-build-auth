@@ -11,6 +11,11 @@ venv/
 
 # Secrets & local env
 .env
+/private/
+/var/
+sub2api-bundle*.json
+*.dump
+*.backup
 .env.*
 !.env.example
 
@@ -19,6 +24,10 @@ sso_output/
 oauth_output/
 accounts_output/
 cliproxyapi_auth/
+clients/windows/config.json
+clients/windows/cpa_auths/
+clients/windows/accounts_*.txt
+clients/windows/mail_credentials.txt
 
 # alias_mail runtime state
 .alias_domain_health.json
@@ -39,3 +48,8 @@ Thumbs.db
 *.swp
 .idea/
 .vscode/
+
+# Windows client runtime side dirs / batch logs
+clients/windows/cpa_pending/
+clients/windows/cpa_cooldown/
+clients/windows/run_logs/

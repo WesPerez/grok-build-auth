@@ -36,8 +36,10 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from . import config as C
+from .security import redact_text, sanitize_url
 
 
 # --------------------------------------------------------------------------- #
@@ -181,7 +183,7 @@ class SSOExtractor:
             return None
 
         if self.debug:
-            print(f"  [sso] JWT URL: {sso_url[:80]}...")
+            print(f"  [sso] JWT URL: {sanitize_url(sso_url)}")
 
         # 2. decode the JWT to find the next hop (grokusercontent)
         jwt = _extract_jwt_from_url(sso_url)
@@ -192,7 +194,7 @@ class SSOExtractor:
 
         success_url = self._resolve_success_url(jwt)
         if self.debug:
-            print(f"  [sso] success_url: {success_url[:80]}...")
+            print(f"  [sso] success_url: {sanitize_url(success_url)}")
 
         # 3. hit the grokusercontent endpoint (retry once on transport errors)
         headers = self._base_headers()
@@ -236,14 +238,14 @@ class SSOExtractor:
                     _time.sleep(0.4)
         if last_exc is not None:
             if self.debug:
-                print(f"  [sso] request failed: {last_exc}")
+                print(f"  [sso] request failed: {redact_text(last_exc)}")
             return None
 
         # 4. prefer Set-Cookie header, then cookie jar
         token = parse_sso_from_set_cookies(set_cookies or []) or self._read_sso_from_jar()
 
         # 5. persist if requested
-        if token and (save or email):
+        if token and save:
             path = save_sso(token, email=email, password=password,
                             output_dir=output_dir)
             if self.debug:
@@ -260,8 +262,18 @@ class SSOExtractor:
         if payload:
             cfg = payload.get("config", {})
             url = cfg.get("success_url")
-            if isinstance(url, str) and url.startswith("https://"):
-                return url
+            if isinstance(url, str):
+                parsed = urlparse(url)
+                if (
+                    parsed.scheme == "https"
+                    and parsed.hostname == "auth.grokusercontent.com"
+                    and parsed.username is None
+                    and parsed.password is None
+                    and parsed.port in (None, 443)
+                    and parsed.path == "/set-cookie"
+                    and not parsed.fragment
+                ):
+                    return url
         return self.GROKUSERCONTENT_SET_COOKIE
 
     def _read_sso_from_jar(self) -> Optional[str]:
@@ -273,7 +285,7 @@ class SSOExtractor:
                 if name == "sso":
                     val = str(getattr(cookie, "value", ""))
                     if self.debug:
-                        print(f"  [sso] extracted: {val[:60]}...")
+                        print("  [sso] extracted in memory")
                     return val
         return None
 

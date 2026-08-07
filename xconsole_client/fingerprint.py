@@ -22,6 +22,7 @@ from __future__ import annotations
 import gzip
 import io
 from typing import Dict, List, Optional, Tuple
+from .security import sanitize_url
 
 try:
     from curl_cffi import requests as cc_requests  # type: ignore
@@ -72,6 +73,7 @@ class FingerprintTransport:
             impersonate=impersonate,
             http_version=http_version,
             ja3=DEFAULT_JA3,
+            proxies={"http": proxy, "https": proxy} if proxy else None,
         )
         # Make sure default Accept-Encoding is exactly the Chrome order.
         self._session.headers["accept-encoding"] = accept_encoding
@@ -119,7 +121,7 @@ class FingerprintTransport:
         set_cookies = _split_set_cookie(raw_sc) if raw_sc else []
         hdrs = {k.lower(): v for k, v in resp.headers.items()}
         if self._debug:
-            print(f"  <- {status} {method} {url}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, "
+            print(f"  <- {status} {method} {sanitize_url(url)}  ({len(raw)} bytes, {len(set_cookies)} set-cookie, "
                   f"impersonate={self._impersonate}, http={self._http_version})")
         return status, hdrs, set_cookies, raw
 
