@@ -51,7 +51,7 @@ DEFAULT_CONFIG = {
     "mail_credentials_file": "",
     "success_records_file": "",
     "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36",
-    # ===== Sub2API auth 导出 / 免费 Grok 4.5（OIDC，非 Web SSO）=====
+    # ===== Sub2API auth 导出 / 免费 Grok 4.6（OIDC，非 Web SSO）=====
     # 注册成功后走设备码 OIDC 铸造 token，写出 Sub2API 的 xai-<email>.json，并可
     # 推送到远端 Sub2API bridge 导入。免费号用 cli-chat-proxy，Sub2API 请求 grok 时
     # 自带 x-grok-client-version 头，不会 426。SSO cookie 不能替代 OIDC。

@@ -491,7 +491,7 @@ def _probe_auth_once(auth_data, timeout=45):
     access_token = str(auth_data.get("access_token") or "").strip()
     marker = "bridge-" + secrets.token_urlsafe(18)
     body = json.dumps({
-        "model": "grok-4.5",
+        "model": "grok-4.6",
         "input": f"Reply exactly: {marker}",
         "stream": False,
         "max_output_tokens": 64,
@@ -575,7 +575,7 @@ def probe_auth_direct(auth_data, timeout=45, attempts=3, retry_delay=2):
 def test_sub2api_account_result(account_id):
     url = f"{SUB2API_BASE}/api/v1/admin/accounts/{account_id}/test"
     body = json.dumps({
-        "model_id": "grok-4.5",
+        "model_id": "grok-4.6",
         "prompt": "Reply exactly: bridge-account-ok",
         "mode": "responses",
     }).encode()

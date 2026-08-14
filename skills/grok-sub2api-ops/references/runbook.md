@@ -74,7 +74,7 @@ GROK_OAUTH_TOKEN_REFRESH_FAILED
 - remint 后不要使用 `register_and_import.py --resume`，access-token hash 已改变时可能新建重复账号。
 - 显示名可能被排序前缀修改；按唯一 email/sub 锁定原账号并保留原显示名，歧义即停。
 - bridge 候选隔离后先清旧 revoked error，再运行语义 postprobe；通过或明确 402/429 后 helper 立即重新隔离，全部 remint 完成后复用该证据逐号 promote，不重复 Test Connection。
-- 最终官方 Codex `grok-4.5` 烟测使用 `high` effort，并核对 Grok provider/group/account HTTP 200，无 fallback。
+- 最终官方 Codex `grok-4.6` 烟测使用 `high` effort，并核对 Grok provider/group/account HTTP 200，无 fallback。
 - 若日志为多次 refresh timeout、临时隔离、下一周期 permanent/revoked，标记 `ambiguous_refresh_rotation`：可能是上游已轮换而响应/持久化丢失，但没有 token-version/request ID 对照时不能写成确定根因。
 
 ## 账号状态

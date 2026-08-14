@@ -161,10 +161,10 @@ chmod 600 private/proxies.json
       "ref": "node-01",
       "resin": {
         "scheme": "socks5h",
-        "host": "172.17.0.1",
-        "port": 10833,
-        "username": "GrokEU.register-node-01",
-        "token_file": "/etc/resin-grok/proxy.token"
+        "host": "proxy.internal",
+        "port": 10834,
+        "username": "AppsGlobal.register-node-01",
+        "token_file": "/etc/resin-apps/proxy.token"
       },
       "enabled": true,
       "max_active_leases": 1
@@ -180,7 +180,7 @@ GROK_PROXY_POOL_FILE=/absolute/path/private/proxies.json
 GROK_PROXY_ROTATION_STATE_FILE=/absolute/path/private/proxy-rotation.json
 ```
 
-Resin 声明支持 `socks5`、`socks5h`，认证 token 必须来自非符号链接且权限不宽于 `0600` 的 `token_file`。每个 enabled 条目必须使用唯一 `Platform.Account` 逻辑身份。默认 `GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=false`：注册 lease 只用于注册、OAuth 和导入前 auth preprobe；导入后的生产调用由 Sub2API 共享 profile 在运行时展开为 `GrokEU.sub2-{{account_id}}`。首次共享 profile 迁移完成前，旧 `GrokEU.shard-*` 仅作为 lease 继承来源。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
+Resin 声明支持 `socks5`、`socks5h`，认证 token 必须来自非符号链接且权限不宽于 `0600` 的 `token_file`。每个 enabled 条目必须使用唯一 `Platform.Account` 逻辑身份。默认 `GROK_BIND_SUB2API_PROXY_AFTER_IMPORT=false`：注册 lease 只用于注册、OAuth 和导入前 auth preprobe；导入后的生产调用由 Sub2API 共享 profile 在运行时展开为 `AppsGlobal.sub2-{{account_id}}`。轮询状态文件必须位于受限目录并保持 `0600`；它保存下一个节点，使连续运行的单账号批次也会按节点顺序轮询，而不是每次重新从 `node-01` 开始。
 
 跨进程状态文件只持久化轮询游标；`max_active_leases` 是单进程并发上限。生产入口依靠全局 batch lock 阻止多个 `register_and_import.py` 批次同时运行，不要绕过该锁并行启动多个注册进程。
 
@@ -207,7 +207,7 @@ python3 scripts/check_proxy_pool.py \
 
 ### 4.4 Resin 注册身份与旧 V2Ray 池退役
 
-Grok 注册、OAuth 和 preprobe 统一走 `resin-grok.service` 的稳定入口 `172.17.0.1:10833`。注册清单使用 `GrokEU.register-node-*`，已导入的 Sub2API Grok 账号使用 `GrokEU.sub2-{{account_id}}`；两者逻辑身份和 sticky lease 相互独立，但 Resin 可能把多个逻辑身份分配到同一物理节点或出口，不能描述成物理独占。
+Grok 注册、OAuth 和 preprobe 统一走 `resin-apps.service` 的稳定入口 `proxy.internal:10834`。注册清单使用 `AppsGlobal.register-node-*`，已导入的 Sub2API Grok 账号使用 `AppsGlobal.sub2-{{account_id}}`；两者逻辑身份和 sticky lease 相互独立，但 Resin 可能把多个逻辑身份分配到同一物理节点或出口，不能描述成物理独占。
 
 只读检查：
 
@@ -216,7 +216,7 @@ python3 scripts/check_proxy_pool.py \
   --private-dir /root/grok-build-auth/private \
   --attempts 3 \
   --timeout 10
-systemctl is-active resin-grok.service
+systemctl is-active resin-apps.service
 ss -ltn | grep -E ':1090[0-7]\b' || true
 ```
 
@@ -225,7 +225,7 @@ ss -ltn | grep -E ':1090[0-7]\b' || true
 - `private/proxies.json` 的 enabled 条目均为 Resin 声明，且用户名唯一。
 - 每个 enabled 身份通过 CONNECT/TLS 和小流量出口检查；故障身份在清单中 disabled，不回退直连。
 - `10900-10907` 无监听，活动 systemd 依赖中不再出现旧注册池。
-- `resin-grok.service` 不依赖旧 V2Ray unit；服务器公共 `v2ray.service`、443、KCP 等入口不受影响。
+- `resin-apps.service` 不依赖旧 V2Ray unit；服务器公共 `v2ray.service`、443、KCP 等入口不受影响。
 - 导入后账号由 Sub2API 的共享 `proxy_id -> GrokEU.sub2-{{account_id}}` 路径运行，不复用注册身份。
 
 旧 unit/config 仅保存在 root-only 恢复目录，不能重新放回活动 systemd 或代理菜单，除非明确执行回滚。
@@ -644,7 +644,7 @@ curl -sS https://<sub2api-domain>/v1/responses \
   -H 'Authorization: Bearer <grok-group-api-key>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model":"grok-4.5",
+    "model":"grok-4.6",
     "input":"Reply exactly: OK",
     "max_output_tokens":8,
     "store":false
@@ -658,7 +658,7 @@ curl -sS -N https://<sub2api-domain>/v1/responses \
   -H 'Authorization: Bearer <grok-group-api-key>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model":"grok-4.5",
+    "model":"grok-4.6",
     "input":"Reply exactly: OK",
     "max_output_tokens":8,
     "store":false,
@@ -666,7 +666,7 @@ curl -sS -N https://<sub2api-domain>/v1/responses \
   }'
 ```
 
-验收：非流式应为 HTTP 200、`status=completed` 且有输出；流式应出现 `response.output_text.delta` 和 `response.completed`。上游可能报告实际模型 `grok-4.5-build-free`。
+验收：非流式应为 HTTP 200、`status=completed` 且有输出；流式应出现 `response.output_text.delta` 和 `response.completed`。上游返回的实际模型名可能带构建后缀，以响应字段为准。
 
 ## 7. Sub2API Grok 路由和账号轮询
 

@@ -567,9 +567,9 @@ def test_proxy_pool_builds_authenticated_resin_url_from_private_token(tmp_path):
             "enabled": True,
             "resin": {
                 "scheme": "socks5h",
-                "host": "172.17.0.1",
-                "port": 10833,
-                "username": "GrokEU.register-node-01",
+                "host": "proxy.internal",
+                "port": 10834,
+                "username": "AppsGlobal.register-node-01",
                 "token_file": str(token_file),
             },
         }],
@@ -581,7 +581,7 @@ def test_proxy_pool_builds_authenticated_resin_url_from_private_token(tmp_path):
     })
 
     assert pool.specs[0].url == (
-        "socks5h://GrokEU.register-node-01:token%2Fwith%3Freserved@172.17.0.1:10833"
+        "socks5h://AppsGlobal.register-node-01:token%2Fwith%3Freserved@proxy.internal:10834"
     )
     assert pool.specs[0].source == "resin"
 
@@ -604,9 +604,9 @@ def test_proxy_pool_rejects_duplicate_resin_logical_identity(tmp_path):
     token_file.chmod(0o600)
     resin = {
         "scheme": "socks5h",
-        "host": "172.17.0.1",
-        "port": 10833,
-        "username": "GrokEU.register-node-01",
+        "host": "proxy.internal",
+        "port": 10834,
+        "username": "AppsGlobal.register-node-01",
         "token_file": str(token_file),
     }
     config = tmp_path / "proxies.json"

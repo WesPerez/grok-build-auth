@@ -92,7 +92,7 @@ Sub2API account
 1. **全量结构核验，无生成**：账号 status/schedulable、凭据字段、subject 唯一性、官方 base、唯一目标组、唯一逻辑 proxy、proxy active。
 2. **全量即时调度核验，无生成**：分别统计 429、overload、temp-unschedulable，并按 revoked、额度、传输分类。
 3. **代理池验证，不使用账号**：运行 CONNECT/TLS/trace 报告，确认 `grok.com` 与 `auth.x.ai` 都通过且安全阈值满足。
-4. **一个官方客户端烟测**：使用当前官方 Codex CLI、`grok-4.5` 和 `high`，输入自然的小型结构任务；从服务端日志确认 Grok group/provider/account HTTP 200 且没有 Router fallback。
+4. **一个官方客户端烟测**：使用当前官方 Codex CLI、`grok-4.6` 和 `high`，输入自然的小型结构任务；从服务端日志确认 Grok group/provider/account HTTP 200 且没有 Router fallback。
 
 即使用户提出“每个账号最小测试”，也应先判断目标层级。每小时全节点主动探测和每 3 小时双目标池复测已经覆盖代理连通性；对数百账号逐号生成只会新增额度消耗、429 和风控噪声。节点实际替换后以新槽双目标验证、Resin egress/健康反馈和后续真实 refresh 成功收口；只有明确出口型 402 的既有流程才做一次指定账号 canary，真实 429 始终零探针。
 

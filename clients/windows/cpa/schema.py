@@ -19,7 +19,7 @@ CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
 ISSUER = "https://auth.x.ai"
 TOKEN_ENDPOINT = "https://auth.x.ai/oauth2/token"
 REDIRECT_URI = "http://127.0.0.1:56121/callback"
-# 免费 Grok 4.5 (Build) 走 cli-chat-proxy；付费 API 用 https://api.x.ai/v1
+# 免费 Grok 4.6 (Build) 走 cli-chat-proxy；付费 API 用 https://api.x.ai/v1
 CLI_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 API_BASE_URL = "https://api.x.ai/v1"
 DEFAULT_BASE_URL = CLI_BASE_URL

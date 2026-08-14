@@ -5,7 +5,7 @@ xai-<email>.json → 推送到远端 hardened bridge。
 - 远端推送：POST config['cpa_remote_base'] + /v0/management/auth-files?name=...
   认证 X-Management-Key: config['cpa_remote_secret']
 
-免费 Grok 4.5 用 base_url=cli-chat-proxy；Sub2API 请求 grok 时自带
+免费 Grok 4.6 用 base_url=cli-chat-proxy；Sub2API 请求 grok 时自带
 x-grok-client-version 头，免费号不会 426。
 
 客户端 preprobe（默认开启）：

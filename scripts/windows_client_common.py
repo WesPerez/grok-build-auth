@@ -94,7 +94,7 @@ def password_from_env(name: str, *, prompt: bool = True) -> str:
 
 
 def responses_probe(
-    base_url: str, api_key: str, *, model: str = "grok-4.5", timeout: float = 60,
+    base_url: str, api_key: str, *, model: str = "grok-4.6", timeout: float = 60,
 ) -> dict[str, Any]:
     url = base_url.rstrip("/") + "/v1/responses"
     payload = json.dumps({

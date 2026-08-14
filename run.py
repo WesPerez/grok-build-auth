@@ -6,7 +6,7 @@
   2) 提取 SSO
   3) xAI OAuth PKCE（含 grok-cli:access）
   4) 导出 Sub2API auth：cli-chat-proxy.grok.com + grok-cli headers
-     → 可直接用 grok-4.5 走 Build/CLI 编码通道
+     → 可直接用 grok-4.6 走 Build/CLI 编码通道
 
 环境变量（按需设置）:
     YESCAPTCHA_API_KEY     YesCaptcha API key (Turnstile 打码)

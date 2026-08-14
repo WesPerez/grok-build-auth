@@ -155,7 +155,7 @@ def probe(path: Path, timeout: float, proxy: str = "") -> dict[str, Any]:
                 headers[k] = v
 
     body = {
-        "model": "grok-4.5",
+        "model": "grok-4.6",
         "input": "Reply exactly: OK",
         "max_output_tokens": 8,
     }

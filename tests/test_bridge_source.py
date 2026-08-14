@@ -83,7 +83,7 @@ def test_bridge_probe_parses_sse(monkeypatch, tmp_path):
 
         def read(self, limit):
             return (
-                b'data: {"type":"test_start","model":"grok-4.5"}\n\n'
+                b'data: {"type":"test_start","model":"grok-4.6"}\n\n'
                 b'data: {"type":"content","text":"OK"}\n\n'
                 b'data: {"type":"test_complete","success":true}\n\n'
             )

@@ -867,7 +867,7 @@ def run_postimport_group_probe(config: dict[str, str], timeout: float = 60.0) ->
     request = urllib.request.Request(
         url,
         data=json.dumps({
-            "model": "grok-4.5",
+            "model": "grok-4.6",
             "input": "Reply exactly: IMPORT_OK",
             "max_output_tokens": 64,
             "store": False,
@@ -909,7 +909,7 @@ def run_postimport_account_probes(
         request = urllib.request.Request(
             config["SUB2API_URL"].rstrip("/") + f"/api/v1/admin/accounts/{account_id}/test",
             data=json.dumps({
-                "model_id": "grok-4.5",
+                "model_id": "grok-4.6",
                 "prompt": "Reply exactly: ACCOUNT_IMPORT_OK",
                 "mode": "responses",
             }).encode(),

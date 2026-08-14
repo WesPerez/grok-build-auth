@@ -104,7 +104,7 @@ def account_test(base_url: str, key: str, account: dict[str, Any], timeout: floa
     request = urllib.request.Request(
         f"{base_url.rstrip('/')}/api/v1/admin/accounts/{account_id}/test",
         data=json.dumps({
-            "model_id": "grok-4.5",
+            "model_id": "grok-4.6",
             "prompt": "Reply exactly: SUB2API_GROK_AUDIT_OK",
             "mode": "responses",
         }).encode(),

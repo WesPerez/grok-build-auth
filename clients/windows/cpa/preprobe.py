@@ -60,7 +60,7 @@ def probe_auth(auth: dict[str, Any], *, proxy: str = "", timeout: float = 45) ->
             URL,
             headers={**HEADERS, "Authorization": f"Bearer {token}"},
             json={
-                "model": "grok-4.5",
+                "model": "grok-4.6",
                 "input": f"Reply exactly: {marker}",
                 "max_output_tokens": 64,
                 "store": False,
