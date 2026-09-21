@@ -36,6 +36,7 @@ python3 scripts/reauthorize_grok2api_account.py --account-id <ID> \
 地址只转换为同一主机、端口、认证身份的 HTTP CONNECT 地址；先验证该入口支持 HTTP，
 不会换出口或直连回退。该模式要求调用 Python 已安装 Playwright 和 Edge，遇到验证码
 或未完成回调时停止，不触发新注册。浏览器资料和授权文件均不得进入 Git 或临时回收目录。
+`YESCAPTCHA_API_KEY` 只由协议模式使用；浏览器模式的计划和执行均不要求该密钥。
 
 生成后按 Grok2API 导入规则校验 `sub` 与 team：team 优先取显式字段，否则从 ID token
 （缺省时 access token）的 `team_id` 读取。身份不符时保留私有材料并停止，不能放宽匹配。

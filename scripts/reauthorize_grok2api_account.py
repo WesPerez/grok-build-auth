@@ -239,7 +239,8 @@ def main() -> int:
         if pool.schema_version != 2 or any(spec.source != "resin" for spec in pool.specs):
             raise RecoveryError("resin_v2_pool_required")
         proxy = pool.url_for(material["proxy_ref"])
-        if not config.get("YESCAPTCHA_API_KEY"):
+        captcha_key = config.get("YESCAPTCHA_API_KEY", "")
+        if args.method == "protocol" and not captcha_key:
             raise RecoveryError("captcha_key_missing")
         summary = {"account_id": args.account_id, "status": "plan_ready",
             "method": args.method,
@@ -250,7 +251,7 @@ def main() -> int:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 # Recheck after acquiring the operation lock.
                 target = load_target(args.database, args.account_id)
-                summary = execute(args, target, material, proxy, config["YESCAPTCHA_API_KEY"])
+                summary = execute(args, target, material, proxy, captcha_key)
         print(json.dumps(summary))
         return 0 if summary["status"] in ("plan_ready", "exported_identity_verified") else 1
     except RecoveryError as exc:

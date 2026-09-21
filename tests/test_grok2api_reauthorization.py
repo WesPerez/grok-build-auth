@@ -103,6 +103,46 @@ def test_browser_proxy_preserves_resin_endpoint_and_account():
         module.browser_proxy_url("socks5h://127.0.0.1:10834")
 
 
+@pytest.mark.parametrize("method", ["protocol", "browser"])
+@pytest.mark.parametrize("execute", [False, True])
+def test_cli_captcha_requirement_depends_on_selected_method(monkeypatch, tmp_path, capsys, method, execute):
+    from xconsole_client import proxy_pool
+
+    target = {"auth_status": "reauthRequired", "refresh_permanent": 1,
+              "last_refresh_error": "invalid_grant", "email": "test@example.invalid",
+              "user_id": "user1", "team_id": "",
+              "identity_key": module.hashlib.sha256(b"grok_build|user|user1|").hexdigest()}
+    monkeypatch.setattr(module, "load_target", lambda *args: target)
+    monkeypatch.setattr(module, "find_material", lambda *args: {"proxy_ref": "proxy01"})
+    monkeypatch.setattr(module, "load_env", lambda *args: {})
+    monkeypatch.setattr(module.os, "umask", lambda mask: 0o077)
+    monkeypatch.setattr(proxy_pool, "load_proxy_pool", lambda *args: types.SimpleNamespace(
+        schema_version=2, specs=[types.SimpleNamespace(source="resin")],
+        url_for=lambda ref: "socks5h://AppsGlobal.test:synthetic@127.0.0.1:10834"))
+    calls = []
+
+    def fake_execute(args, current, material, proxy, captcha_key):
+        calls.append((args.method, captcha_key))
+        return {"status": "exported_identity_verified"}
+
+    monkeypatch.setattr(module, "execute", fake_execute)
+    argv = ["reauthorize_grok2api_account.py", "--account-id", "1",
+            "--private-dir", str(tmp_path), "--method", method]
+    if execute:
+        argv += ["--execute", "--expected-identity", target["identity_key"],
+                 "--backup", str(tmp_path / "backup.db"),
+                 "--output-dir", str(tmp_path / "runs" / "recovery")]
+    monkeypatch.setattr(sys, "argv", argv)
+    assert module.main() == (0 if method == "browser" else 1)
+    summary = json.loads(capsys.readouterr().out)
+    if method == "protocol":
+        assert summary["reason"] == "captcha_key_missing"
+        assert calls == []
+    else:
+        assert summary["status"] == ("exported_identity_verified" if execute else "plan_ready")
+        assert calls == ([("browser", "")] if execute else [])
+
+
 def test_browser_recovery_owns_a_new_private_profile(monkeypatch, tmp_path):
     from xconsole_client import xai_oauth, registration_backends
 
