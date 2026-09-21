@@ -644,7 +644,7 @@ curl -sS https://<sub2api-domain>/v1/responses \
   -H 'Authorization: Bearer <grok-group-api-key>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model":"grok-4.6",
+    "model":"grok-4.7",
     "input":"Reply exactly: OK",
     "max_output_tokens":8,
     "store":false
@@ -658,7 +658,7 @@ curl -sS -N https://<sub2api-domain>/v1/responses \
   -H 'Authorization: Bearer <grok-group-api-key>' \
   -H 'Content-Type: application/json' \
   -d '{
-    "model":"grok-4.6",
+    "model":"grok-4.7",
     "input":"Reply exactly: OK",
     "max_output_tokens":8,
     "store":false,

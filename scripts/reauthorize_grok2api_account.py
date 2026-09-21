@@ -128,6 +128,25 @@ def write_private_json(path: Path, data: dict) -> None:
         stream.write("\n")
 
 
+def authorization_failure_code(exc: Exception) -> str:
+    # Classify locally; exception messages can include passwords, token-bearing
+    # URLs, or upstream response bodies and must never leave this function.
+    message = str(exc).split("; prior:", 1)[0].lower()
+    if "captcha" in message or "turnstile" in message:
+        return "login_challenge_failed"
+    if message.startswith("createsession failed:"):
+        return "password_session_failed"
+    if "consent" in message:
+        return "oauth_consent_failed"
+    if "state mismatch" in message:
+        return "oauth_state_mismatch"
+    if "redirect" in message or "missing code" in message:
+        return "oauth_redirect_incomplete"
+    if isinstance(exc, TimeoutError):
+        return "oauth_timeout"
+    return "oauth_flow_failed"
+
+
 def execute(args, target: dict, material: dict, proxy: str, captcha_key: str) -> dict:
     require_revoked(target)
     if args.expected_identity != target["identity_key"]:
@@ -158,7 +177,7 @@ def execute(args, target: dict, material: dict, proxy: str, captcha_key: str) ->
                 output_dir=str(output / "native"), cliproxyapi_auth_dir=str(output / "auth"))
     except Exception as exc:
         summary = {"account_id": args.account_id, "status": "reauthorization_failed",
-                   "error_type": type(exc).__name__}
+                   "error_type": type(exc).__name__, "reason": authorization_failure_code(exc)}
         write_private_json(output / "result.json", summary)
         return summary
     for path in (oauth.path, oauth.cliproxyapi_path):

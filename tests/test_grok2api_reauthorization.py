@@ -79,3 +79,15 @@ def test_team_identity_uses_token_claims_like_grok2api_import():
     del auth["id_token"]
     with pytest.raises(module.RecoveryError, match="new_team_mismatch"):
         module.validate_auth(auth, target)
+
+
+@pytest.mark.parametrize("message,code", [
+    ("CreateSession failed: upstream rejected secret@example.invalid; prior: old consent", "password_session_failed"),
+    ("CreateSession failed: Turnstile rejected secret-token", "login_challenge_failed"),
+    ("submitOAuth2Consent failed HTTP 403: secret-token", "oauth_consent_failed"),
+    ("authorization failed: state mismatch", "oauth_state_mismatch"),
+    ("OAuth redirect chain stalled at https://example.invalid/?code=secret-token", "oauth_redirect_incomplete"),
+    ("unexpected secret@example.invalid secret-token", "oauth_flow_failed"),
+])
+def test_authorization_failures_export_only_fixed_reason_codes(message, code):
+    assert module.authorization_failure_code(RuntimeError(message)) == code

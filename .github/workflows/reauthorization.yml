@@ -1,15 +1,37 @@
-name: Verify targeted Grok reauthorization
+name: Verify Grok account operations
 
 on:
   push:
     paths:
       - scripts/reauthorize_grok2api_account.py
+      - scripts/register_and_import.py
+      - scripts/windows_client_common.py
+      - scripts/audit_grok_accounts.py
+      - clients/windows/cpa/preprobe.py
+      - xconsole_client/**
+      - requirements.txt
       - tests/test_grok2api_reauthorization.py
+      - tests/test_batch_orchestrator.py
+      - tests/test_windows_client_tools.py
+      - tests/test_grok_account_audit.py
+      - tests/test_bridge_source.py
+      - tests/test_cpa_state.py
       - .github/workflows/reauthorization.yml
   pull_request:
     paths:
       - scripts/reauthorize_grok2api_account.py
+      - scripts/register_and_import.py
+      - scripts/windows_client_common.py
+      - scripts/audit_grok_accounts.py
+      - clients/windows/cpa/preprobe.py
+      - xconsole_client/**
+      - requirements.txt
       - tests/test_grok2api_reauthorization.py
+      - tests/test_batch_orchestrator.py
+      - tests/test_windows_client_tools.py
+      - tests/test_grok_account_audit.py
+      - tests/test_bridge_source.py
+      - tests/test_cpa_state.py
       - .github/workflows/reauthorization.yml
 
 permissions:
@@ -23,5 +45,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest
-      - run: python -m pytest -q tests/test_grok2api_reauthorization.py -p no:cacheprovider
+      - run: python -m pip install pytest -r requirements.txt
+      - run: >-
+          python -m pytest -q -p no:cacheprovider
+          tests/test_grok2api_reauthorization.py
+          tests/test_batch_orchestrator.py
+          tests/test_windows_client_tools.py
+          tests/test_grok_account_audit.py
+          tests/test_bridge_source.py
+          tests/test_cpa_state.py

@@ -27,6 +27,8 @@ python3 scripts/reauthorize_grok2api_account.py --account-id <ID> \
 输出目录必须是尚不存在的 `private/runs` 子目录。原生 token 与兼容 auth 都存入该目录，
 目录权限 0700、文件 0600。协议失败不重试、不切浏览器；超时或中断后先检查这个目录，
 不可把不确定结果当成零副作用后自动重放。进程输出只包含账号 ID、状态、固定分类及 hash。
+失败摘要的 `reason` 区分登录挑战、密码会话、授权同意、回调和超时阶段；这些分类
+用于定位流程，不能单凭 `password_session_failed` 就认定密码错误或账号被封禁。
 
 生成后按 Grok2API 导入规则校验 `sub` 与 team：team 优先取显式字段，否则从 ID token
 （缺省时 access token）的 `team_id` 读取。身份不符时保留私有材料并停止，不能放宽匹配。
