@@ -18,7 +18,7 @@ from pathlib import Path
 import shlex
 import sqlite3
 import sys
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
@@ -142,9 +142,19 @@ def authorization_failure_code(exc: Exception) -> str:
         return "oauth_state_mismatch"
     if "redirect" in message or "missing code" in message:
         return "oauth_redirect_incomplete"
-    if isinstance(exc, TimeoutError):
+    if isinstance(exc, TimeoutError) or "timed out" in message or "timeout" in message:
         return "oauth_timeout"
     return "oauth_flow_failed"
+
+
+def browser_proxy_url(proxy: str) -> str:
+    # Resin accepts HTTP CONNECT on the same authenticated proxy endpoint.
+    # Chromium cannot authenticate SOCKS5; retain host, port and account name.
+    parts = urlsplit(proxy)
+    if parts.scheme not in ("http", "https", "socks5", "socks5h") or not parts.hostname or not parts.username:
+        raise RecoveryError("browser_proxy_invalid")
+    scheme = "http" if parts.scheme in ("socks5", "socks5h") else parts.scheme
+    return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
 
 
 def execute(args, target: dict, material: dict, proxy: str, captcha_key: str) -> dict:
@@ -167,17 +177,24 @@ def execute(args, target: dict, material: dict, proxy: str, captcha_key: str) ->
     output.mkdir(mode=0o700, parents=True)
     write_private_json(output / "plan.json", {"account_id": args.account_id,
         "identity_sha256": target["identity_key"], "status": "reauthorizing"})
-    from xconsole_client.oauth_protocol import login_with_protocol
     # Both native tokens and compatible exports must stay in this private run.
-    # No browser fallback and no outer retries: an uncertain request is reviewed.
+    # Exactly one selected method; no automatic fallback or outer retries.
     try:
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            oauth = login_with_protocol(material["email"], material["password"],
-                proxy=proxy, yescaptcha_key=captcha_key, debug=False,
-                output_dir=str(output / "native"), cliproxyapi_auth_dir=str(output / "auth"))
+            if args.method == "browser":
+                from xconsole_client.xai_oauth import login_with_playwright
+                oauth = login_with_playwright(material["email"], material["password"],
+                    proxy=browser_proxy_url(proxy), headless=True, timeout=180,
+                    output_dir=str(output / "native"), cliproxyapi_auth_dir=str(output / "auth"),
+                    browser_profile_dir=output / "browser-profile")
+            else:
+                from xconsole_client.oauth_protocol import login_with_protocol
+                oauth = login_with_protocol(material["email"], material["password"],
+                    proxy=proxy, yescaptcha_key=captcha_key, debug=False,
+                    output_dir=str(output / "native"), cliproxyapi_auth_dir=str(output / "auth"))
     except Exception as exc:
         summary = {"account_id": args.account_id, "status": "reauthorization_failed",
-                   "error_type": type(exc).__name__, "reason": authorization_failure_code(exc)}
+                   "method": args.method, "error_type": type(exc).__name__, "reason": authorization_failure_code(exc)}
         write_private_json(output / "result.json", summary)
         return summary
     for path in (oauth.path, oauth.cliproxyapi_path):
@@ -202,6 +219,7 @@ def main() -> int:
     parser.add_argument("--database", type=Path, default=Path("/var/lib/docker/volumes/grok2api_grok2api-data/_data/backend.db"))
     parser.add_argument("--private-dir", type=Path, default=Path("/root/grok-build-auth/private"))
     parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--method", choices=("protocol", "browser"), default="protocol")
     parser.add_argument("--expected-identity")
     parser.add_argument("--backup", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -224,6 +242,7 @@ def main() -> int:
         if not config.get("YESCAPTCHA_API_KEY"):
             raise RecoveryError("captcha_key_missing")
         summary = {"account_id": args.account_id, "status": "plan_ready",
+            "method": args.method,
             "identity_sha256": target["identity_key"], "unique_material": True,
             "resin_proxy_resolved": bool(proxy), "import_performed": False}
         if args.execute:

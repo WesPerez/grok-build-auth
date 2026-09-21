@@ -648,6 +648,7 @@ def login_with_playwright(
     cliproxyapi_base_url: str = CLIPROXYAPI_GROK_BASE_URL,
     cliproxyapi_disabled: bool = False,
     session_cookies: Optional[Dict[str, str]] = None,
+    browser_profile_dir: Optional[str | Path] = None,
 ) -> OAuthLoginResult:
     """Complete xAI OAuth with Playwright.
 
@@ -681,16 +682,28 @@ def login_with_playwright(
             launch_kwargs["proxy"] = _playwright_proxy(proxy)
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(**launch_kwargs)
-            try:
-                context = browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/148.0.0.0 Safari/537.36"
-                    ),
-                    viewport={"width": 1280, "height": 900},
+            context_options = {
+                "user_agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/148.0.0.0 Safari/537.36"
+                ),
+                "viewport": {"width": 1280, "height": 900},
+            }
+            if browser_profile_dir is not None:
+                profile = Path(browser_profile_dir).resolve()
+                # An explicit recovery profile must never reuse a user's login.
+                profile.mkdir(mode=0o700, parents=True, exist_ok=False)
+                context = p.chromium.launch_persistent_context(
+                    str(profile), **launch_kwargs, **context_options,
                 )
+                browser = context
+            else:
+                browser = p.chromium.launch(**launch_kwargs)
+                context = None
+            try:
+                if context is None:
+                    context = browser.new_context(**context_options)
                 # Inject signup session cookies before hitting authorize.
                 if session_cookies:
                     cookie_list = []

@@ -25,10 +25,17 @@ python3 scripts/reauthorize_grok2api_account.py --account-id <ID> \
 ```
 
 输出目录必须是尚不存在的 `private/runs` 子目录。原生 token 与兼容 auth 都存入该目录，
-目录权限 0700、文件 0600。协议失败不重试、不切浏览器；超时或中断后先检查这个目录，
+目录权限 0700、文件 0600。所选方法失败后不重试、不自动切换方法；超时或中断后先检查这个目录，
 不可把不确定结果当成零副作用后自动重放。进程输出只包含账号 ID、状态、固定分类及 hash。
 失败摘要的 `reason` 区分登录挑战、密码会话、授权同意、回调和超时阶段；这些分类
 用于定位流程，不能单凭 `password_session_failed` 就认定密码错误或账号被封禁。
+
+默认 `--method protocol`。已审查协议失败且未生成授权时，可在新的输出目录显式使用
+`--method browser` 对同一账号做一次 Edge 登录。浏览器使用新的私有 `browser-profile`
+目录，拒绝复用已有 profile；退出时关闭自身浏览器，保留私有恢复资料。Resin 的 SOCKS
+地址只转换为同一主机、端口、认证身份的 HTTP CONNECT 地址；先验证该入口支持 HTTP，
+不会换出口或直连回退。该模式要求调用 Python 已安装 Playwright 和 Edge，遇到验证码
+或未完成回调时停止，不触发新注册。浏览器资料和授权文件均不得进入 Git 或临时回收目录。
 
 生成后按 Grok2API 导入规则校验 `sub` 与 team：team 优先取显式字段，否则从 ID token
 （缺省时 access token）的 `team_id` 读取。身份不符时保留私有材料并停止，不能放宽匹配。

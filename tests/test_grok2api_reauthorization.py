@@ -3,6 +3,9 @@ from __future__ import annotations
 import importlib.util
 import base64
 import json
+import contextlib
+import sys
+import types
 from pathlib import Path
 import pytest
 
@@ -91,3 +94,48 @@ def test_team_identity_uses_token_claims_like_grok2api_import():
 ])
 def test_authorization_failures_export_only_fixed_reason_codes(message, code):
     assert module.authorization_failure_code(RuntimeError(message)) == code
+
+
+def test_browser_proxy_preserves_resin_endpoint_and_account():
+    assert module.browser_proxy_url("socks5h://AppsGlobal.test:synthetic@127.0.0.1:10834") == "http://AppsGlobal.test:synthetic@127.0.0.1:10834"
+    assert module.browser_proxy_url("https://AppsGlobal.test:synthetic@proxy.example.invalid:443") == "https://AppsGlobal.test:synthetic@proxy.example.invalid:443"
+    with pytest.raises(module.RecoveryError, match="browser_proxy_invalid"):
+        module.browser_proxy_url("socks5h://127.0.0.1:10834")
+
+
+def test_browser_recovery_owns_a_new_private_profile(monkeypatch, tmp_path):
+    from xconsole_client import xai_oauth, registration_backends
+
+    calls = []
+    profile = tmp_path / "private" / "browser-profile"
+    page = types.SimpleNamespace(goto=lambda *args, **kwargs: None)
+    browser = types.SimpleNamespace(new_page=lambda: page, close=lambda: calls.append("closed"))
+
+    def launch_persistent(path, **kwargs):
+        assert Path(path) == profile
+        assert profile.stat().st_mode & 0o077 == 0
+        assert kwargs["headless"] is True
+        assert kwargs["proxy"]["server"] == "http://127.0.0.1:10834"
+        assert kwargs["proxy"]["username"] == "AppsGlobal.test"
+        calls.append("launched")
+        return browser
+
+    api = types.ModuleType("playwright.sync_api")
+    api.sync_playwright = lambda: contextlib.nullcontext(types.SimpleNamespace(
+        chromium=types.SimpleNamespace(launch_persistent_context=launch_persistent)))
+    monkeypatch.setitem(sys.modules, "playwright", types.ModuleType("playwright"))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", api)
+    monkeypatch.setattr(registration_backends, "_edge_executable", lambda: "/synthetic/edge")
+    server = types.SimpleNamespace(shutdown=lambda: None, server_close=lambda: None)
+    sink = types.SimpleNamespace(event=types.SimpleNamespace(is_set=lambda: True))
+    monkeypatch.setattr(xai_oauth, "_start_pkce_callback_server", lambda **kwargs: (
+        server, sink, "https://accounts.x.ai/authorize", "http://127.0.0.1/callback", "state", "verifier"))
+    monkeypatch.setattr(xai_oauth, "_wait_oauth_code", lambda *args: "synthetic-code")
+    sentinel = object()
+    monkeypatch.setattr(xai_oauth, "_finalize_oauth_code", lambda **kwargs: sentinel)
+    kwargs = {"proxy": "http://AppsGlobal.test:synthetic@127.0.0.1:10834", "browser_profile_dir": profile}
+    assert xai_oauth.login_with_playwright("test@example.invalid", "synthetic", **kwargs) is sentinel
+    assert calls == ["launched", "closed"]
+    with pytest.raises(FileExistsError):
+        xai_oauth.login_with_playwright("test@example.invalid", "synthetic", **kwargs)
+    assert calls == ["launched", "closed"]
