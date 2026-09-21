@@ -26,8 +26,9 @@ from xconsole_client.security import validate_cliproxyapi_base_url
 DEFAULT_BASE_URL = "https://cli-chat-proxy.grok.com/v1"
 DEFAULT_HEADERS = {
     "X-XAI-Token-Auth": "xai-grok-cli",
-    "x-grok-client-version": "0.2.93",
+    "x-grok-client-version": "1.0.40",
     "x-grok-client-identifier": "grok-shell",
+    "x-grok-client-mode": "headless",
 }
 
 
@@ -145,7 +146,7 @@ def probe(path: Path, timeout: float, proxy: str = "") -> dict[str, Any]:
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "grok-cli/0.2.93",
+        "User-Agent": "grok-shell/1.0.40",
         **DEFAULT_HEADERS,
     }
     extra = auth.get("headers")

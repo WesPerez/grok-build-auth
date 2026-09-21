@@ -169,7 +169,9 @@ def test_direct_probe_requires_assistant_marker_and_full_headers(monkeypatch, tm
     headers = {key.lower(): value for key, value in captured["request"].header_items()}
     assert headers["x-xai-token-auth"] == "xai-grok-cli"
     assert headers["x-grok-client-identifier"] == "grok-shell"
-    assert headers["user-agent"] == "grok-cli/0.2.93"
+    assert headers["user-agent"] == "grok-shell/1.0.40"
+    assert headers["x-grok-client-version"] == "1.0.40"
+    assert headers["x-grok-client-mode"] == "headless"
     request_body = json.loads(captured["request"].data)
     assert request_body["max_output_tokens"] >= 64
 

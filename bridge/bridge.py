@@ -505,9 +505,10 @@ def _probe_auth_once(auth_data, timeout=45):
             "Accept": "application/json",
             "Content-Type": "application/json",
             "X-XAI-Token-Auth": "xai-grok-cli",
-            "x-grok-client-version": "0.2.93",
+            "x-grok-client-version": "1.0.40",
             "x-grok-client-identifier": "grok-shell",
-            "User-Agent": "grok-cli/0.2.93",
+            "x-grok-client-mode": "headless",
+            "User-Agent": "grok-shell/1.0.40",
         },
         method="POST",
     )

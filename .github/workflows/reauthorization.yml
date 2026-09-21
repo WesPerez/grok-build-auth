@@ -18,6 +18,7 @@ on:
       - tests/test_grok_account_audit.py
       - tests/test_bridge_source.py
       - tests/test_cpa_state.py
+      - tests/test_oauth_protocol.py
       - .github/workflows/reauthorization.yml
   pull_request:
     paths:
@@ -36,6 +37,7 @@ on:
       - tests/test_grok_account_audit.py
       - tests/test_bridge_source.py
       - tests/test_cpa_state.py
+      - tests/test_oauth_protocol.py
       - .github/workflows/reauthorization.yml
 
 permissions:
@@ -58,3 +60,4 @@ jobs:
           tests/test_grok_account_audit.py
           tests/test_bridge_source.py
           tests/test_cpa_state.py
+          tests/test_oauth_protocol.py

@@ -20,9 +20,9 @@
 生产/配额探针（`xai_build_quota_probe.py`）使用：
 
 ```text
-User-Agent: grok-cli/0.2.93
+User-Agent: grok-shell/1.0.40
 X-XAI-Token-Auth: xai-grok-cli
-x-grok-client-version: 0.2.93
+x-grok-client-version: 1.0.40
 x-grok-client-identifier: grok-shell
 ```
 

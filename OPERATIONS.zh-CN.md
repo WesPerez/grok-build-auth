@@ -674,7 +674,7 @@ Sub2API 已原生处理 Grok CLI OAuth Responses 请求：
 
 - OAuth 账号默认并只需使用官方 `https://cli-chat-proxy.grok.com/v1`。
 - 出站请求由当前调度账号生成 `Authorization: Bearer <access_token>`。
-- 固定补齐 `grok-cli/0.2.93` User-Agent、`X-XAI-Token-Auth`、客户端版本和客户端标识。
+- 补齐 `grok-shell/1.0.40` User-Agent、`X-XAI-Token-Auth`、1.0.40 客户端版本、客户端标识及 headless 模式。
 - 对 `grok-4.5*` 历史 `input` 中 `type=reasoning` 且 `content=null` 的项目只删除该空字段。
 - 流式和非流式响应共用同一原生请求构造，不依赖独立 sidecar。
 

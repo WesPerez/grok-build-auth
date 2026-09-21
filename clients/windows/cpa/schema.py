@@ -2,7 +2,7 @@
 internal/auth/xai/token.go 的 TokenStorage 结构。
 
 生成的 xai-<email>.json 可被兼容实现直接加载；Sub2API 请求 grok 时会
-自带 x-grok-client-version 头（xai_executor.go 硬编码 0.2.93），免费 Build 账号
+自带 x-grok-client-version 头；当前探针使用 Build 1.0.40，免费 Build 账号
 不会 426。
 """
 
